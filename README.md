@@ -150,11 +150,12 @@ stops entirely with `visual.reduced_motion = true`.
 
 ![The menu bar](docs/images/menu.png)
 
-File, Edit, View, Profiles and Help, laid out after Konsole's. Tap **Alt**
-(Option) to open it from the keyboard: arrows move, Enter runs, the
-underlined letter jumps, Esc closes. Alt+key chords still go to the shell.
-Hide or show the bar with **Ctrl+Shift+M** (View → Show Menubar, or
-`window.menu_bar = false`); tapping Alt still opens it while it's hidden.
+File, Edit, View, Profiles and Help, laid out after Konsole's. The bar is
+hidden until you tap **Alt** (Option); it opens over the terminal and hides
+again when you pick something, press Esc or click elsewhere. Arrows move,
+Enter runs, the underlined letter jumps. Alt+key chords still go to the
+shell and don't show the bar. To keep it on screen, use **Ctrl+Shift+M**
+(View → Show Menubar) or set `window.menu_bar = true`.
 
 The menus are data (`crates/seraphim-config/src/menu.toml`), so you can
 add your own from the config. An item runs an action, types text into the

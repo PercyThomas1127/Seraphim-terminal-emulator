@@ -29,9 +29,10 @@ columns = 100
 rows = 30
 # Space around the text grid, in logical pixels.
 padding = 6.0
-# Show the menu bar (File, Edit, View, Profiles, Help). Toggle it with
-# Ctrl+Shift+M; tap Alt (Option) to open it, even while hidden.
-menu_bar = true
+# The menu bar (File, Edit, View, Profiles, Help) is hidden until you tap
+# Alt (Option), and hides again when you're done. true keeps it on screen
+# (toggle at runtime with Ctrl+Shift+M).
+menu_bar = false
 
 [terminal]
 # Lines of history kept per session.

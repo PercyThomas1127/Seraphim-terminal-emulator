@@ -90,7 +90,7 @@ impl Default for WindowOptions {
             cli_font_family: None,
             cli_font_size: None,
             cli_preset: None,
-            menu_bar: true,
+            menu_bar: false,
             menus: seraphim_config::builtin_menu(),
         }
     }

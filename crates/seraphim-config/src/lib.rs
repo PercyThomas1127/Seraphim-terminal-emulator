@@ -337,8 +337,9 @@ pub struct Window {
     pub columns: u16,
     pub rows: u16,
     pub padding: f32,
-    /// Show the menu bar (toggle with Ctrl+Shift+M; tap Alt/Option to use
-    /// it while hidden).
+    /// Keep the menu bar on screen. Off by default: the bar appears when
+    /// Alt/Option is tapped and hides when the menu closes (Ctrl+Shift+M
+    /// toggles at runtime).
     pub menu_bar: bool,
 }
 
@@ -393,7 +394,7 @@ impl Default for Font {
 
 impl Default for Window {
     fn default() -> Self {
-        Window { columns: 100, rows: 30, padding: 6.0, menu_bar: true }
+        Window { columns: 100, rows: 30, padding: 6.0, menu_bar: false }
     }
 }
 
