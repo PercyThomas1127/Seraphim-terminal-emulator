@@ -1,9 +1,11 @@
 //! Seraphim terminal.
 //!
 //! ```text
-//! seraphim [--config PATH] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [-e PROGRAM [ARGS...]]
+//! seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY]
+//!          [--font-size PT] [--cols N] [--rows N] [-e PROGRAM [ARGS...]]
 //!     Open a window running PROGRAM (default: your shell). Settings come from
-//!     ~/.config/seraphim/config.toml, then these options.
+//!     ~/.config/seraphim/config.toml, then these options. --preset picks a
+//!     background preset (built-in "heavens", presets/NAME.toml, or "none").
 //!
 //! seraphim --print-default-config
 //!     Print the documented default configuration file.
@@ -22,6 +24,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod actions;
+mod interaction;
 mod profile;
 mod window;
 
@@ -134,16 +137,18 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
     // --config and --profile must be known before anything else applies.
     let mut config_path = seraphim_config::Config::default_path();
     let mut profile: Option<String> = None;
+    let mut preset: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--config" => config_path = Some(it.next().ok_or("--config needs a PATH")?.into()),
             "--profile" => profile = Some(it.next().ok_or("--profile needs a NAME")?.clone()),
+            "--preset" => preset = Some(it.next().ok_or("--preset needs a NAME")?.clone()),
             "-e" | "--" => break,
             _ => {}
         }
     }
-    let mut o = match profile::load(config_path.as_deref(), profile.as_deref()) {
+    let mut o = match profile::load(config_path.as_deref(), profile.as_deref(), preset.as_deref()) {
         Ok((o, warnings)) => {
             for w in warnings {
                 eprintln!("seraphim: {w}");
@@ -158,6 +163,7 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
         }
     };
     o.config_path = config_path;
+    o.cli_preset = preset;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -169,6 +175,9 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
             }
             "--profile" => {
                 value("--profile")?;
+            }
+            "--preset" => {
+                value("--preset")?;
             }
             "--font" => {
                 o.font_family = Some(value("--font")?);
@@ -199,7 +208,7 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),

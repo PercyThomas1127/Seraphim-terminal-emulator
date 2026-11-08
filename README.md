@@ -84,7 +84,7 @@ Applications may set the clipboard with OSC 52; reading it requires
 ![Seraphim visual engine](docs/images/visual.png)
 
 Layers behind the text — solid colors, gradients, PNG images and WGSL
-shaders (built-in `aurora` and `starfield`, or your own) — are declared in
+shaders (built-in `aurora`, `starfield` and `heavens`, or your own) — are declared in
 the config:
 
 ```toml
@@ -101,6 +101,44 @@ blend = "screen"
 opacity = 0.75
 params = { speed = 0.3, hue = 0.78 }
 ```
+
+**Presets** bundle a scene with its interactions. The built-in `heavens`
+preset is an animated sky (aurora, nebula or starfield) with two moods. It
+turns red in a root shell, and a wave of light rises when you install
+something:
+
+```bash
+cargo run --release -p seraphim -- --preset heavens
+```
+
+![The heavens preset: calm, install wave, root](docs/images/moods.png)
+
+A preset is an ordinary TOML file of `[[background]]` layers and `[[on]]`
+rules. Copy one to `~/.config/seraphim/presets/<name>.toml`, or write your
+own, and select it with `preset = "<name>"`. Rules animate any layer
+property when an event arrives on the bus:
+
+```toml
+[[background]]
+id = "glow"
+kind = "shader"
+shader = "glow.wgsl"                # in ~/.config/seraphim/shaders/
+palette = { tint = "theme.bright.5" }   # color(C_tint) in WGSL
+
+[[on]]
+event = "command.completed"
+when = { exit_code = 1 }
+layer = "glow"
+param = "pulse"                     # p(P_pulse) in WGSL
+from = 1.0
+to = 0.0
+duration_ms = 600
+easing = "ease-out"
+```
+
+To tweak a preset's layer, give a `[[background]]` the same `id` in your
+config, e.g. `params = { style = 2 }` for the nebula. See ADR 0008 for the
+design and the Lua/CSS authoring plan.
 
 Profiles in `~/.config/seraphim/profiles/<name>.toml` override any part of
 the config; switch with `--profile NAME` or **Ctrl+Shift+P** at runtime

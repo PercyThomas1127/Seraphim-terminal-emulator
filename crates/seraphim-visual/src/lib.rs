@@ -29,6 +29,8 @@ pub struct BuiltinShader {
     pub source: &'static str,
     /// Parameters and their defaults.
     pub params: &'static [(&'static str, f32)],
+    /// Named colors (`color(C_<name>)` in WGSL) and their defaults.
+    pub colors: &'static [(&'static str, Rgba)],
 }
 
 /// Built-in shader layers.
@@ -37,13 +39,42 @@ pub const BUILTIN_SHADERS: &[BuiltinShader] = &[
         name: "aurora",
         source: include_str!("shaders/aurora.wgsl"),
         params: &[("speed", 0.3), ("intensity", 0.8), ("hue", 0.78), ("spread", 1.0)],
+        colors: &[],
     },
     BuiltinShader {
         name: "starfield",
         source: include_str!("shaders/starfield.wgsl"),
         params: &[("density", 0.5), ("speed", 1.0), ("twinkle", 1.5), ("size", 1.0)],
+        colors: &[],
+    },
+    BuiltinShader {
+        name: "heavens",
+        source: include_str!("shaders/heavens.wgsl"),
+        params: &[
+            ("style", 1.0),
+            ("intensity", 0.6),
+            ("speed", 1.0),
+            ("alert", 0.0),
+            ("install", 1.0),
+        ],
+        colors: &[
+            ("base", rgb(0x14, 0x12, 0x1f)),
+            ("accent0", rgb(0xf5, 0xa6, 0xd0)),
+            ("accent1", rgb(0x89, 0xa8, 0xff)),
+            ("accent2", rgb(0x7f, 0xe0, 0xe8)),
+            ("alert0", rgb(0xff, 0x3b, 0x4e)),
+            ("alert1", rgb(0xff, 0x9a, 0x3c)),
+            ("surge", rgb(0xff, 0xd9, 0x8a)),
+        ],
     },
 ];
+
+type Params = &'static [(&'static str, f32)];
+type Colors = &'static [(&'static str, Rgba)];
+
+const fn rgb(r: u8, g: u8, b: u8) -> Rgba {
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+}
 
 const PRELUDE: &str = include_str!("shaders/prelude.wgsl");
 const MAX_PARAMS: usize = 16;
@@ -143,11 +174,20 @@ pub struct LayerSpec {
     pub blend: Blend,
     /// Shader parameters (name, value); built-ins have defaults.
     pub params: Vec<(String, f32)>,
+    /// Shader colors (name, value), read with `color(C_<name>)`.
+    pub colors: Vec<(String, Rgba)>,
 }
 
 impl LayerSpec {
     pub fn new(id: impl Into<String>, kind: LayerKind) -> Self {
-        LayerSpec { id: id.into(), kind, opacity: 1.0, blend: Blend::Normal, params: Vec::new() }
+        LayerSpec {
+            id: id.into(),
+            kind,
+            opacity: 1.0,
+            blend: Blend::Normal,
+            params: Vec::new(),
+            colors: Vec::new(),
+        }
     }
 }
 
@@ -438,6 +478,7 @@ impl VisualEngine {
         let mut data: Uniforms = bytemuck::Zeroable::zeroed();
         let mut texture = None;
         let mut params: Vec<(String, f32)> = Vec::new();
+        let mut colors: Vec<(String, Rgba)> = Vec::new();
         let body: String = match &spec.kind {
             LayerKind::Solid(c) => {
                 data.colors[0] = *c;
@@ -470,34 +511,26 @@ impl VisualEngine {
                 data.info[2] = *fit as u32 as f32;
                 include_str!("shaders/image.wgsl").into()
             }
-            LayerKind::Shader { name, source } => match source {
-                Some(src) => {
-                    params = spec.params.clone();
-                    src.clone()
-                }
-                None => {
-                    let builtin =
-                        BUILTIN_SHADERS.iter().find(|b| b.name == name).ok_or_else(|| {
-                            let names: Vec<&str> = BUILTIN_SHADERS.iter().map(|b| b.name).collect();
-                            format!("unknown shader {name:?} (built-in: {})", names.join(", "))
-                        })?;
-                    let (src, defaults) = (builtin.source, builtin.params);
-                    params = defaults.iter().map(|(n, v)| (n.to_string(), *v)).collect();
-                    for (n, v) in &spec.params {
-                        match params.iter_mut().find(|(k, _)| k == n) {
-                            Some(slot) => slot.1 = *v,
-                            None => {
-                                let known: Vec<&str> = defaults.iter().map(|d| d.0).collect();
-                                return Err(format!(
-                                    "shader {name:?} has no parameter {n:?} (it has: {})",
-                                    known.join(", ")
-                                ));
-                            }
-                        }
+            LayerKind::Shader { name, source } => {
+                let (src, param_defaults, color_defaults): (&str, Params, Colors) = match source {
+                    Some(src) => (src.as_str(), &[], &[]),
+                    None => {
+                        let b =
+                            BUILTIN_SHADERS.iter().find(|b| b.name == name).ok_or_else(|| {
+                                let names: Vec<&str> =
+                                    BUILTIN_SHADERS.iter().map(|b| b.name).collect();
+                                format!("unknown shader {name:?} (built-in: {})", names.join(", "))
+                            })?;
+                        (b.source, b.params, b.colors)
                     }
-                    src.to_string()
-                }
-            },
+                };
+                let custom = source.is_some();
+                params = with_defaults(param_defaults, &spec.params, custom)
+                    .map_err(|n| no_such(name, "parameter", n, param_defaults))?;
+                colors = with_defaults(color_defaults, &spec.colors, custom)
+                    .map_err(|n| no_such(name, "color", n, color_defaults))?;
+                src.to_string()
+            }
         };
         if params.len() > MAX_PARAMS {
             return Err(format!("at most {MAX_PARAMS} shader parameters"));
@@ -508,6 +541,16 @@ impl VisualEngine {
                 return Err(format!("parameter name {n:?} must be letters, digits or _"));
             }
             consts.push_str(&format!("const P_{n}: u32 = {i}u;\n"));
+        }
+        if colors.len() > MAX_STOPS {
+            return Err(format!("at most {MAX_STOPS} shader colors"));
+        }
+        for (i, (n, c)) in colors.iter().enumerate() {
+            if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || n.is_empty() {
+                return Err(format!("color name {n:?} must be letters, digits or _"));
+            }
+            consts.push_str(&format!("const C_{n}: u32 = {i}u;\n"));
+            data.colors[i] = *c;
         }
         let source = format!("{PRELUDE}\n{consts}\n{body}");
         let uses_time = body.contains("u.time");
@@ -580,6 +623,32 @@ impl VisualEngine {
             leaving: false,
         })
     }
+}
+
+/// Defaults overridden by `values`. A custom shader takes `values` as they
+/// are; a built-in rejects names it does not have (returned as the error).
+fn with_defaults<T: Copy>(
+    defaults: &[(&str, T)],
+    values: &[(String, T)],
+    custom: bool,
+) -> Result<Vec<(String, T)>, String> {
+    if custom {
+        return Ok(values.to_vec());
+    }
+    let mut out: Vec<(String, T)> = defaults.iter().map(|(n, v)| (n.to_string(), *v)).collect();
+    for (n, v) in values {
+        match out.iter_mut().find(|(k, _)| k == n) {
+            Some(slot) => slot.1 = *v,
+            None => return Err(n.clone()),
+        }
+    }
+    Ok(out)
+}
+
+fn no_such<T>(shader: &str, what: &str, name: String, defaults: &[(&str, T)]) -> String {
+    let known: Vec<&str> = defaults.iter().map(|d| d.0).collect();
+    let known = if known.is_empty() { "none".to_string() } else { known.join(", ") };
+    format!("shader {shader:?} has no {what} {name:?} (it has: {known})")
 }
 
 /// Keep the useful part of a wgpu/naga validation error.

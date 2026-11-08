@@ -1833,6 +1833,7 @@ dependencies = [
  "seraphim-session",
  "seraphim-terminal",
  "seraphim-visual",
+ "toml",
  "wgpu",
  "winit",
 ]

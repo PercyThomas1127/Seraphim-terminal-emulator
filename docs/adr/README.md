@@ -13,3 +13,5 @@ to be confirmed when the subsystem is built), or **Superseded**.
 | [0004](0004-gpu-backend.md) | winit + wgpu, one instanced pipeline + glyph atlas | §18.4 | Accepted for Phase I (hardware measurements pending) |
 | [0005](0005-scripting.md) | Lua-first (mlua), off the render thread; Wasm for isolated extensions | §18.1, §8 | Proposed |
 | [0006](0006-declarative-scenes-and-ui.md) | TOML declares scenes/bindings, Lua defines behaviour; UI API reserved early | §18.2, §18.3 | Proposed |
+| [0007](0007-visual-engine.md) | Fullscreen shader layers behind the text, time-based animation, crossfades | §5, §6 | Accepted |
+| [0008](0008-presets-and-interactions.md) | Presets as data; `[[on]]` event rules; Lua and CSS compile to the same layers and rules | §5.3, §11.4, §18.2 | Accepted |

@@ -55,7 +55,6 @@
 * Kitty graphics protocol / Sixel / inline images (spec §4.2) — needs the
   APC pre-filter from ADR 0002.
 * Image formats beyond PNG, image blur, video and animated images.
-* Reactive bindings (`[[bind]]`, ADR 0006) and event-triggered animations:
-  they need the Event Bus → Visual Engine bridge and come with Phase III
-  scripting.
+* Continuous bindings (`[[bind]]`, ADR 0006). Event-triggered animations
+  are done: see ADR 0008.
 * Live file watching (reload is manual, Ctrl+Shift+R).

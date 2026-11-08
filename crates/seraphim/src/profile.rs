@@ -9,15 +9,25 @@ use seraphim_visual::{Blend, Fit, LayerKind, LayerSpec};
 
 use crate::window::WindowOptions;
 
-/// Load the layered configuration (`profile` overrides the file's own).
+/// Load the layered configuration (`profile` and `preset` override the
+/// files' own). Without a configuration path, built-in defaults (plus the
+/// preset, if any).
 pub fn load(
     config_path: Option<&Path>,
     profile: Option<&str>,
+    preset: Option<&str>,
 ) -> Result<(WindowOptions, Vec<String>), String> {
     let Some(path) = config_path else {
-        return Ok(options_from_config(&Config::default(), None, "default"));
+        let Some(preset) = preset else {
+            return Ok(options_from_config(&Config::default(), None, "default"));
+        };
+        // No file: a path that does not exist layers just the preset.
+        let none = Path::new("/nonexistent/seraphim/config.toml");
+        let loaded =
+            Config::load_layered_with(none, None, Some(preset)).map_err(|e| e.to_string())?;
+        return Ok(options_from_config(&loaded.config, None, &loaded.profile));
     };
-    let loaded = Config::load_layered(path, profile).map_err(|e| e.to_string())?;
+    let loaded = Config::load_layered_with(path, profile, preset).map_err(|e| e.to_string())?;
     Ok(options_from_config(&loaded.config, path.parent(), &loaded.profile))
 }
 
@@ -40,7 +50,7 @@ pub fn options_from_config(
     theme.bold_is_bright = k.bold_is_bright;
     theme.ansi[..8].copy_from_slice(&k.normal);
     theme.ansi[8..].copy_from_slice(&k.bright);
-    let (layers, warnings) = layers(c, config_dir);
+    let (layers, warnings) = layers(c, config_dir, &theme);
     let o = WindowOptions {
         font_family: c.font.family.clone(),
         font_size: c.font.size,
@@ -56,16 +66,18 @@ pub fn options_from_config(
         grapheme_clustering: c.terminal.grapheme_clustering,
         visual: c.visual.clone(),
         layers,
+        rules: c.on.iter().map(crate::interaction::Rule::from_config).collect(),
         profile: profile.to_owned(),
         config_path: None,
         cli_font_family: None,
         cli_font_size: None,
+        cli_preset: None,
     };
     (o, warnings)
 }
 
 /// `[[background]]` entries as visual-engine layers.
-fn layers(c: &Config, config_dir: Option<&Path>) -> (Vec<LayerSpec>, Vec<String>) {
+fn layers(c: &Config, config_dir: Option<&Path>, theme: &Theme) -> (Vec<LayerSpec>, Vec<String>) {
     let dir = config_dir.map(Path::to_path_buf).unwrap_or_default();
     let mut out = Vec::new();
     let mut warnings = Vec::new();
@@ -106,7 +118,75 @@ fn layers(c: &Config, config_dir: Option<&Path>) -> (Vec<LayerSpec>, Vec<String>
             opacity: b.opacity,
             blend: Blend::parse(&b.blend).unwrap_or_default(),
             params: b.params.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            colors: b
+                .palette
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), resolve_color(v, theme)?)))
+                .collect(),
         });
     }
     (out, warnings)
+}
+
+/// A palette color: `#rrggbb[aa]` or a theme color such as
+/// `theme.background` or `theme.bright.5` (see
+/// [`seraphim_config::is_color_ref`]).
+pub fn resolve_color(s: &str, theme: &Theme) -> Option<[f32; 4]> {
+    if s.starts_with('#') {
+        return parse_rgba(s);
+    }
+    let r = s.strip_prefix("theme.")?;
+    let rgb = match r {
+        "foreground" => theme.foreground,
+        "background" => theme.background,
+        "cursor" => theme.cursor,
+        "selection" => theme.selection_bg,
+        _ => {
+            let (base, i) = if let Some(i) = r.strip_prefix("normal.") {
+                (0, i)
+            } else {
+                (8, r.strip_prefix("bright.")?)
+            };
+            let i: usize = i.parse().ok().filter(|i| *i < 8)?;
+            theme.ansi[base + i]
+        }
+    };
+    Some([rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0, 1.0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_follows_the_theme() {
+        let t = Theme::default();
+        let f = |c: u8| c as f32 / 255.0;
+        let bg = t.background;
+        assert_eq!(
+            resolve_color("theme.background", &t),
+            Some([f(bg[0]), f(bg[1]), f(bg[2]), 1.0])
+        );
+        let b5 = t.ansi[13];
+        assert_eq!(resolve_color("theme.bright.5", &t), Some([f(b5[0]), f(b5[1]), f(b5[2]), 1.0]));
+        assert_eq!(resolve_color("#ff000080", &t), Some([1.0, 0.0, 0.0, 128.0 / 255.0]));
+        assert_eq!(resolve_color("theme.bright.8", &t), None);
+    }
+
+    #[test]
+    fn heavens_preset_becomes_a_layer() {
+        let dir = std::env::temp_dir().join(format!("seraphim-preset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "preset = \"heavens\"\ntheme = \"daylight\"\n").unwrap();
+        let (o, warnings) = load(Some(&path), None, None).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(o.layers.len(), 1);
+        let sky = &o.layers[0];
+        assert_eq!(sky.id, "sky");
+        let base = sky.colors.iter().find(|(n, _)| n == "base").unwrap().1;
+        assert_eq!(Some(base), resolve_color("theme.background", &o.theme), "theme-relative");
+        assert_eq!(o.rules.len(), 4);
+        assert_eq!(o.visual.max_fps, 30);
+    }
 }

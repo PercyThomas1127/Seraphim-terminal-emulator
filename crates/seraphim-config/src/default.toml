@@ -4,13 +4,18 @@
 # ~/.config/seraphim/config.toml). Every setting is optional; this file
 # lists the defaults. Command-line options override it.
 #
-# Layering: theme colors < this file < the active profile.
+# Layering: preset < theme colors < this file < the active profile.
+#   preset   = a background scene with its interactions: built-in "heavens"
+#              (animated sky that reacts to root shells and installs), or
+#              presets/<name>.toml (a file of [[background]], [[on]] and
+#              [visual] keys, written exactly like the ones below)
 #   theme    = built-in "celestial", "monochrome", "daylight", or
 #              themes/<name>.toml (a file of [colors] keys)
 #   profile  = profiles/<name>.toml, any subset of these settings; switch at
 #              runtime with Ctrl+Shift+P, reload files with Ctrl+Shift+R.
 # theme = "celestial"
 # profile = "work"
+# preset = "heavens"
 
 [font]
 # Family name; when unset, the first installed of JetBrains Mono, Fira Code,
@@ -74,9 +79,13 @@ window_opacity = 1.0
 transition_ms = 400
 
 # Background layers, bottom first. Kinds: solid, gradient, image (PNG),
-# shader (built-in "aurora", "starfield", or a .wgsl file implementing
+# shader (built-in "aurora", "starfield", "heavens", or a .wgsl file in
+# shaders/ implementing
 #   fn shade(uv: vec2<f32>, px: vec2<f32>) -> vec4<f32>
-# with u.time, u.resolution and p(P_<name>) for the params below).
+# with u.time, u.resolution, p(P_<name>) for the params below and
+# color(C_<name>) for the palette colors: "#rrggbb[aa]", "theme.background",
+# "theme.foreground", "theme.cursor", "theme.selection", "theme.normal.0"-"7"
+# or "theme.bright.0"-"7").
 # Every layer takes opacity (0-1) and blend ("normal", "add", "multiply",
 # "screen").
 #
@@ -103,3 +112,28 @@ transition_ms = 400
 # path = "~/Pictures/wallpaper.png"
 # fit = "cover"
 # opacity = 0.3
+#
+# [[background]]
+# id = "glow"
+# kind = "shader"
+# shader = "glow.wgsl"
+# params = { pulse = 0.0 }
+# palette = { tint = "theme.bright.5" }
+
+# Interaction rules: when an event is published on the bus, animate a
+# layer's shader parameter (or "opacity"). `when` matches the event's data;
+# strings are globs and a list matches any entry. `from` jumps there first,
+# for one-shot effects. easing: linear, ease, ease-in, ease-out,
+# ease-in-out, ease-out-expo, ease-out-back, spring or instant.
+# Events include session.privileged {root}, command.started {command},
+# command.completed {exit_code, duration_ms}, terminal.bell, shell.prompt,
+# session.cwd.changed {cwd} and terminal.title.changed {title}.
+#
+# [[on]]
+# event = "terminal.bell"
+# layer = "glow"
+# param = "pulse"
+# from = 1.0
+# to = 0.0
+# duration_ms = 600
+# easing = "ease-out"

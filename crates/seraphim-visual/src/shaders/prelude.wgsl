@@ -3,7 +3,8 @@
 // returning straight (non-premultiplied) RGBA in sRGB space. `uv` is 0..1
 // across the window (origin top-left), `px` the pixel position.
 // Available: u.time (seconds), u.resolution (pixels), p(i) parameters
-// (named constants P_<name> are generated from the configuration).
+// (named constants P_<name> are generated from the configuration) and
+// color(C_<name>) colors.
 
 struct Layer {
     resolution: vec2<f32>,
@@ -24,6 +25,11 @@ struct Layer {
 
 fn p(i: u32) -> f32 {
     return u.params[i / 4u][i % 4u];
+}
+
+// A named shader color: color(C_<name>), straight RGBA.
+fn color(i: u32) -> vec4<f32> {
+    return u.colors[i];
 }
 
 fn stop(i: u32) -> f32 {

@@ -1,0 +1,58 @@
+# Heavens: an animated sky with moods. A preset is an ordinary file of
+# [[background]] layers and [[on]] rules (plus optional [visual] settings);
+# your own go in presets/<name>.toml next to config.toml and work the same
+# way. Override any of this from config.toml: a [[background]] with the
+# same id merges into the layer below, e.g.
+#
+#   [[background]]
+#   id = "sky"
+#   params = { style = 2 }        # 1 aurora, 2 nebula, 3 starfield
+
+[visual]
+max_fps = 30
+
+[[background]]
+id = "sky"
+kind = "shader"
+shader = "heavens"
+params = { style = 1, intensity = 0.6, speed = 1.0 }
+# Colors follow the theme; any "#rrggbb" works too.
+palette = { base = "theme.background", accent0 = "theme.bright.5", accent1 = "theme.normal.4", accent2 = "theme.normal.6" }
+
+# Root shell: the sky turns red and the edges breathe. Detected from
+# process credentials, never from terminal output.
+[[on]]
+event = "session.privileged"
+when = { root = true }
+layer = "sky"
+param = "alert"
+to = 1.0
+duration_ms = 900
+
+[[on]]
+event = "session.privileged"
+when = { root = false }
+layer = "sky"
+param = "alert"
+to = 0.0
+duration_ms = 900
+
+# Installing software: a wave of light rises up the window.
+[[on]]
+event = "command.started"
+when = { command = ["*gabriel bestow *", "*apt install *", "*apt-get install *", "*dnf install *", "*pacman -S*", "*brew install *", "*cargo install *", "*flatpak install *"] }
+layer = "sky"
+param = "install"
+from = 0.0
+to = 1.0
+duration_ms = 2600
+easing = "linear"
+
+[[on]]
+event = "gabriel.install.started"
+layer = "sky"
+param = "install"
+from = 0.0
+to = 1.0
+duration_ms = 2600
+easing = "linear"

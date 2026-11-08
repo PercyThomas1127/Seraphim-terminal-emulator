@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use seraphim_events::EventBus;
+
+use crate::interaction::Interactions;
 use seraphim_render::{FontConfig, Fonts, Renderer, Theme, View};
 use seraphim_session::{ClipboardRequest, Command, Notifier, Session, SessionConfig};
 use seraphim_terminal::input::{
@@ -50,12 +52,16 @@ pub struct WindowOptions {
     pub visual: seraphim_config::Visual,
     /// Background layers, bottom first.
     pub layers: Vec<seraphim_visual::LayerSpec>,
+    /// `[[on]]` interaction rules driving the layers from bus events.
+    pub rules: Vec<crate::interaction::Rule>,
     /// Active profile name ("default" for none).
     pub profile: String,
     pub config_path: Option<std::path::PathBuf>,
     /// Command-line overrides, re-applied on reload and profile switches.
     pub cli_font_family: Option<String>,
     pub cli_font_size: Option<f32>,
+    /// `--preset`, kept across profile switches.
+    pub cli_preset: Option<String>,
 }
 
 impl Default for WindowOptions {
@@ -73,10 +79,12 @@ impl Default for WindowOptions {
             grapheme_clustering: true,
             visual: Default::default(),
             layers: Vec::new(),
+            rules: Vec::new(),
             profile: "default".into(),
             config_path: None,
             cli_font_family: None,
             cli_font_size: None,
+            cli_preset: None,
         }
     }
 }
@@ -202,7 +210,7 @@ struct Active {
     gpu: Gpu,
     renderer: Renderer,
     session: Session,
-    _bus: EventBus,
+    bus: EventBus,
     clipboards: Clipboards,
     modifiers: ModifiersState,
     mouse: MouseState,
@@ -221,6 +229,18 @@ struct Active {
     /// A profile switch or reload requested by a shortcut; applied by `App`,
     /// which owns the configuration.
     pending: Option<ProfileRequest>,
+    /// `[[on]]` rules, fed from the bus.
+    interactions: Interactions,
+    /// The compositor says no part of the window is visible.
+    occluded: bool,
+}
+
+impl Active {
+    /// The animation clock runs only while someone can see it.
+    fn update_pause(&mut self) {
+        let unfocused = !self.focused && !self.visual_cfg.animate_unfocused;
+        self.visual.set_paused(unfocused || self.occluded);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,8 +319,11 @@ impl App {
             let _ = proxy.send_event(UserEvent::Wake);
         }));
         let command = o.command.clone().unwrap_or_else(Command::default_shell);
+        // Subscribe before the session starts: it reports privilege at once.
+        const SESSION_ID: u64 = 1;
+        let interactions = Interactions::new(o.rules.clone(), &bus, SESSION_ID);
         let session = Session::spawn(
-            1,
+            SESSION_ID,
             SessionConfig {
                 command,
                 cols,
@@ -327,7 +350,7 @@ impl App {
             gpu,
             renderer,
             session,
-            _bus: bus,
+            bus,
             clipboards: Clipboards::new(),
             modifiers: ModifiersState::empty(),
             mouse: MouseState::default(),
@@ -343,6 +366,8 @@ impl App {
             visual_cfg: o.visual.clone(),
             last_frame: Instant::now(),
             pending: None,
+            interactions,
+            occluded: false,
         })
     }
 
@@ -366,7 +391,11 @@ impl App {
                 all[i].clone()
             }
         };
-        let (mut o, warnings) = match crate::profile::load(path.as_deref(), Some(&name)) {
+        let (mut o, warnings) = match crate::profile::load(
+            path.as_deref(),
+            Some(&name),
+            self.options.cli_preset.as_deref(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 // Keep the current look; say why.
@@ -384,6 +413,7 @@ impl App {
         o.config_path = path;
         o.cli_font_family = self.options.cli_font_family.clone();
         o.cli_font_size = self.options.cli_font_size;
+        o.cli_preset = self.options.cli_preset.clone();
         if o.cli_font_family.is_some() {
             o.font_family = o.cli_font_family.clone();
         }
@@ -413,7 +443,8 @@ impl App {
             eprintln!("seraphim: window_opacity takes effect after a restart (transparency is set when the window opens)");
         }
         a.visual_cfg = o.visual.clone();
-        a.visual.set_paused(!a.focused && !a.visual_cfg.animate_unfocused);
+        a.update_pause();
+        a.interactions.replace(o.rules.clone(), &a.bus, &mut a.visual);
         let scale = a.scale;
         self.options = o;
         if font_changed {
@@ -427,7 +458,7 @@ impl App {
             }
         }
         let a = self.active.as_mut().unwrap();
-        a._bus.publisher("visual").publish(
+        a.bus.publisher("visual").publish(
             "visual.profile.changed",
             Some(a.session.id()),
             seraphim_events::json!({ "profile": self.options.profile }),
@@ -886,9 +917,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 a.window.request_redraw();
             }
+            WindowEvent::Occluded(occluded) => {
+                a.occluded = occluded;
+                a.update_pause();
+                if !occluded {
+                    a.window.request_redraw();
+                }
+            }
             WindowEvent::Focused(focused) => {
                 a.focused = focused;
-                a.visual.set_paused(!focused && !a.visual_cfg.animate_unfocused);
+                a.update_pause();
                 a.reset_blink();
                 let bytes = encode_focus(focused, a.session.terminal().modes());
                 if !bytes.is_empty() {
@@ -958,6 +996,16 @@ impl ApplicationHandler<UserEvent> for App {
             } else {
                 wake = Some(since + SYNC_TIMEOUT);
             }
+        }
+
+        // Interaction rules react to bus events (published by the session
+        // thread, which also wakes this loop).
+        let (acted, warnings) = a.interactions.pump(&mut a.visual);
+        for w in warnings {
+            eprintln!("seraphim: {w}");
+        }
+        if acted {
+            a.window.request_redraw();
         }
 
         // Animated background: draw frames at up to max_fps while it moves.

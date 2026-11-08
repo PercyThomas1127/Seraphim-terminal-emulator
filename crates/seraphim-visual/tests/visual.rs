@@ -263,3 +263,128 @@ fn paused_and_reduced_motion_stop_frames() {
     r.v.set_opacity("a", 0.25, Transition::tween(5.0));
     assert!(!r.v.animating());
 }
+
+mod heavens {
+    use super::*;
+
+    fn sky(style: f32) -> LayerSpec {
+        LayerSpec {
+            params: vec![("style".into(), style)],
+            ..LayerSpec::new("sky", LayerKind::Shader { name: "heavens".into(), source: None })
+        }
+    }
+
+    fn frame(r: &mut Rig, t: f64) -> Image {
+        r.v.set_fixed_time(Some(t));
+        let mut term = Terminal::new(48, 16);
+        term.advance(b"seraphim\x1b[?25l");
+        let (width, height) = r.h.size_for(&term, 4.0);
+        let view = View { width, height, padding: 4.0, focused: true, cursor_on: true };
+        r.v.prepare(width, height);
+        let v = &r.v;
+        r.h.render_with(&term, view, &mut |pass| v.render(pass))
+    }
+
+    fn mean(img: &Image) -> [f32; 3] {
+        let mut sum = [0.0f32; 3];
+        for p in img.rgba.chunks(4) {
+            for i in 0..3 {
+                sum[i] += p[i] as f32;
+            }
+        }
+        sum.map(|s| s / (img.rgba.len() / 4) as f32)
+    }
+
+    #[test]
+    fn styles_paint_animate_and_keep_text_on_top() {
+        let Some(mut r) = rig() else { return };
+        for style in [1.0, 2.0, 3.0] {
+            assert!(r.v.set_layers(&[sky(style)], Transition::Instant).is_empty());
+            let a = frame(&mut r, 10.0);
+            let b = frame(&mut r, 14.0);
+            let changed = a.rgba.iter().zip(&b.rgba).filter(|(x, y)| x != y).count();
+            assert!(changed > a.rgba.len() / 50, "style {style} animates ({changed} bytes)");
+            assert!(r.v.animating());
+            // Opaque: every pixel is painted, and it is not flat.
+            let first = rgb(a.pixel(0, 0));
+            let varied = a.rgba.chunks(4).filter(|p| rgb([p[0], p[1], p[2], 255]) != first);
+            assert!(varied.count() > a.rgba.len() / 8, "style {style} paints a scene");
+            // Text composites on top: the first glyph cell holds bright ink.
+            let m = r.h.renderer.cell_metrics();
+            let bright = (4..4 + m.height as u32)
+                .flat_map(|y| (4..4 + m.width as u32).map(move |x| (x, y)))
+                .filter(|&(x, y)| a.pixel(x, y)[0] > 200)
+                .count();
+            assert!(bright > 5, "style {style}: text stays visible");
+        }
+    }
+
+    #[test]
+    fn alert_mood_warms_the_scene() {
+        let Some(mut r) = rig() else { return };
+        r.v.set_layers(&[sky(1.0)], Transition::Instant);
+        let calm = mean(&frame(&mut r, 20.0));
+        r.v.set_param("sky", "alert", 1.0, Transition::tween(0.9));
+        let _ = frame(&mut r, 20.5); // mid-fade
+        let root = mean(&frame(&mut r, 22.0));
+        assert!(root[0] > calm[0] + 3.0, "red rises: {calm:?} -> {root:?}");
+        assert!(root[0] - root[2] > calm[0] - calm[2], "scene shifts warm");
+    }
+
+    #[test]
+    fn install_wave_runs_once() {
+        let Some(mut r) = rig() else { return };
+        r.v.set_layers(&[sky(1.0)], Transition::Instant);
+        let before = frame(&mut r, 5.0);
+        // What the preset's rule does: jump to 0, sweep to 1 over 2.6 s.
+        r.v.set_param("sky", "install", 0.0, Transition::Instant);
+        r.v.set_param(
+            "sky",
+            "install",
+            1.0,
+            Transition::Tween { duration: 2.6, easing: Easing::Linear },
+        );
+        let during = mean(&frame(&mut r, 5.0 + 1.3));
+        let after = mean(&frame(&mut r, 5.0 + 3.0));
+        let b = mean(&before);
+        let lift = |m: &[f32; 3]| m.iter().sum::<f32>() - b.iter().sum::<f32>();
+        assert!(lift(&during) > 6.0, "wave lights up: {b:?} -> {during:?}");
+        assert!(during[0] - b[0] > during[2] - b[2], "the surge color is warm");
+        // Once the wave has passed, the scene matches one that never had it.
+        r.v.set_layers(&[sky(1.0)], Transition::Instant);
+        let calm = mean(&frame(&mut r, 5.0 + 3.0));
+        assert!(after.iter().zip(&calm).all(|(x, y)| (x - y).abs() < 0.5), "{after:?} vs {calm:?}");
+        assert!(lift(&after) < lift(&during) / 4.0);
+    }
+
+    #[test]
+    fn palette_overrides_and_unknown_colors() {
+        let Some(mut r) = rig() else { return };
+        let red_base = LayerSpec {
+            params: vec![("intensity".into(), 0.0)],
+            colors: vec![("base".into(), [1.0, 0.0, 0.0, 1.0])],
+            ..sky(1.0)
+        };
+        assert!(r.v.set_layers(&[red_base], Transition::Instant).is_empty());
+        let c = rgb(frame(&mut r, 1.0).pixel(200, 200));
+        assert!(c[0] > 150 && c[1] < 20 && c[2] < 20, "base color drives the sky: {c:?}");
+        let bad = LayerSpec { colors: vec![("bse".into(), [0.0; 4])], ..sky(1.0) };
+        let errs = r.v.set_layers(&[bad], Transition::Instant);
+        assert!(errs[0].contains("no color \"bse\"") && errs[0].contains("accent0"), "{errs:?}");
+    }
+
+    #[test]
+    fn custom_shader_colors() {
+        let Some(mut r) = rig() else { return };
+        let src = "fn shade(uv: vec2<f32>, px: vec2<f32>) -> vec4<f32> { return color(C_tint); }";
+        let spec = LayerSpec {
+            colors: vec![("tint".into(), [0.0, 1.0, 0.0, 1.0])],
+            ..LayerSpec::new(
+                "c",
+                LayerKind::Shader { name: "mine".into(), source: Some(src.into()) },
+            )
+        };
+        assert!(r.v.set_layers(&[spec], Transition::Instant).is_empty());
+        assert_eq!(rgb(frame(&mut r, 0.0).pixel(1, 1)), [0, 255, 0]);
+    }
+}

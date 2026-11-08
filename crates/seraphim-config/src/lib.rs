@@ -12,6 +12,12 @@
 //!    keys; tables merge key by key, a profile's `[[background]]` list
 //!    replaces the base one).
 //!
+//! A **preset** (`preset = "name"`: built-in, or `presets/<name>.toml`) goes
+//! underneath all of that: a file of `[[background]]` layers, `[[on]]`
+//! interaction rules and `[visual]` settings. Layers from the
+//! configuration with the same `id` merge into the preset's; others stack
+//! on top. Rules add up.
+//!
 //! Every file is validated on its own first, so errors point at the right
 //! file, line and column.
 
@@ -41,8 +47,98 @@ pub struct Config {
     pub clipboard: Clipboard,
     pub colors: Colors,
     pub visual: Visual,
+    /// Background preset: a built-in name ([`BUILTIN_PRESETS`]) or a file
+    /// in `presets/`; `"none"` for no preset.
+    pub preset: Option<String>,
     /// Background layers, bottom first (spec §5.1, §5.4).
     pub background: Vec<Background>,
+    /// Interaction rules: animate layers when events happen.
+    pub on: Vec<Rule>,
+}
+
+/// Built-in presets: (name, TOML).
+pub const BUILTIN_PRESETS: &[(&str, &str)] = &[("heavens", include_str!("presets/heavens.toml"))];
+
+/// "When this event happens, animate that layer property."
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Rule {
+    /// Event name: exact, `prefix.*` or `*`.
+    pub event: String,
+    /// Conditions on the event's data: key (dotted path) = value. Strings
+    /// are globs (`*`, `?`); a list matches if any entry does.
+    pub when: std::collections::BTreeMap<String, toml::Value>,
+    /// Target layer id.
+    pub layer: String,
+    /// A shader parameter, or `opacity`.
+    pub param: String,
+    pub to: f32,
+    /// Jump here first, then animate to `to` (restarts one-shot effects).
+    pub from: Option<f32>,
+    pub duration_ms: u32,
+    /// An easing name, `spring` or `instant`.
+    pub easing: String,
+}
+
+impl Default for Rule {
+    fn default() -> Self {
+        Rule {
+            event: String::new(),
+            when: Default::default(),
+            layer: String::new(),
+            param: String::new(),
+            to: 0.0,
+            from: None,
+            duration_ms: 300,
+            easing: "ease-in-out".into(),
+        }
+    }
+}
+
+pub const EASINGS: &[&str] = &[
+    "linear",
+    "ease",
+    "ease-in",
+    "ease-out",
+    "ease-in-out",
+    "ease-out-expo",
+    "ease-out-back",
+    "spring",
+    "instant",
+];
+
+impl Rule {
+    fn validate(&self) -> Result<(), String> {
+        if self.event.trim().is_empty() {
+            return Err("missing `event` (e.g. \"session.privileged\")".into());
+        }
+        if self.layer.trim().is_empty() {
+            return Err("missing `layer` (the id of a [[background]] layer)".into());
+        }
+        if self.param.trim().is_empty() {
+            return Err("missing `param` (a shader parameter or \"opacity\")".into());
+        }
+        if !EASINGS.contains(&self.easing.as_str()) {
+            return Err(format!("unknown easing {:?} ({})", self.easing, EASINGS.join(", ")));
+        }
+        if self.duration_ms > 600_000 {
+            return Err("duration_ms must be at most 600000".into());
+        }
+        for (k, v) in &self.when {
+            let ok = match v {
+                toml::Value::String(_) | toml::Value::Boolean(_) => true,
+                toml::Value::Integer(_) | toml::Value::Float(_) => true,
+                toml::Value::Array(a) => a.iter().all(|x| x.is_str()),
+                _ => false,
+            };
+            if !ok {
+                return Err(format!(
+                    "when.{k}: expected a string, number, boolean or list of strings"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Built-in themes: (name, colors as TOML).
@@ -98,13 +194,16 @@ pub struct Background {
     pub path: Option<String>,
     /// `image`: `cover`, `contain`, `stretch` or `tile`.
     pub fit: String,
-    /// `shader`: a built-in name (`aurora`, `starfield`) or a `.wgsl` file.
+    /// `shader`: a built-in name (`aurora`, `starfield`, `heavens`) or a `.wgsl` file.
     pub shader: Option<String>,
     pub opacity: f32,
     /// `normal`, `add`, `multiply` or `screen`.
     pub blend: String,
     /// Shader parameters.
     pub params: std::collections::BTreeMap<String, f32>,
+    /// `shader`: named colors, `"#rrggbb[aa]"` or a theme color
+    /// ([`is_color_ref`]).
+    pub palette: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Background {
@@ -121,6 +220,7 @@ impl Default for Background {
             opacity: 1.0,
             blend: "normal".into(),
             params: Default::default(),
+            palette: Default::default(),
         }
     }
 }
@@ -260,6 +360,16 @@ impl Config {
     /// and its theme applied. A missing `path` means built-in defaults plus
     /// the profile, if any.
     pub fn load_layered(path: &Path, profile: Option<&str>) -> Result<Loaded, ConfigError> {
+        Config::load_layered_with(path, profile, None)
+    }
+
+    /// [`Config::load_layered`] with `preset` overriding the files' own
+    /// (e.g. from the command line).
+    pub fn load_layered_with(
+        path: &Path,
+        profile: Option<&str>,
+        preset: Option<&str>,
+    ) -> Result<Loaded, ConfigError> {
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let mut sources = Vec::new();
         let read = |p: &Path| -> Result<Option<String>, ConfigError> {
@@ -271,7 +381,7 @@ impl Config {
         };
         let table = |text: &str, p: &Path| -> Result<toml::Table, ConfigError> {
             // Full validation of this file alone (line/column errors) ...
-            Config::parse(text, p)?;
+            Config::parse_with(text, p, true)?;
             // ... then keep its raw keys for merging.
             text.parse::<toml::Table>()
                 .map_err(|e| ConfigError::Invalid(p.to_owned(), e.to_string()))
@@ -294,6 +404,32 @@ impl Config {
             let over = table(&text, &p)?;
             merge(&mut merged, over);
             sources.push(p);
+        }
+        if let Some(p) = preset {
+            merged.insert("preset".into(), toml::Value::String(p.to_owned()));
+        }
+        // The preset goes underneath everything loaded so far.
+        let preset = merged.get("preset").and_then(|v| v.as_str()).map(str::to_owned);
+        if let Some(name) = preset.filter(|p| p != "none") {
+            check_name("preset", &name)?;
+            let (text, origin) = match BUILTIN_PRESETS.iter().find(|(n, _)| *n == name) {
+                Some((_, t)) => (t.to_string(), PathBuf::from(format!("<built-in preset {name}>"))),
+                None => {
+                    let p = dir.join("presets").join(format!("{name}.toml"));
+                    let t = read(&p)?.ok_or_else(|| {
+                        let names: Vec<&str> = BUILTIN_PRESETS.iter().map(|t| t.0).collect();
+                        ConfigError::Invalid(
+                            p.clone(),
+                            format!("preset {name:?} not found (built-in: {})", names.join(", ")),
+                        )
+                    })?;
+                    sources.push(p.clone());
+                    (t, p)
+                }
+            };
+            let mut base = parse_preset(&text, &origin)?;
+            merge_over_preset(&mut base, merged);
+            merged = base;
         }
         // Theme colors go underneath the explicit [colors] table.
         if let Some(theme) = merged.get("theme").and_then(|v| v.as_str()).map(str::to_owned) {
@@ -328,7 +464,7 @@ impl Config {
         let config: Config = toml::Value::Table(merged)
             .try_into()
             .map_err(|e| ConfigError::Invalid(path.to_owned(), e.to_string()))?;
-        config.validate().map_err(|e| ConfigError::Invalid(path.to_owned(), e))?;
+        config.validate(false).map_err(|e| ConfigError::Invalid(path.to_owned(), e))?;
         Ok(Loaded { config, profile: profile.unwrap_or_else(|| "default".into()), sources })
     }
 
@@ -354,9 +490,15 @@ impl Config {
     }
 
     pub fn parse(text: &str, origin: &Path) -> Result<Config, ConfigError> {
+        Config::parse_with(text, origin, false)
+    }
+
+    /// `partial`: one file of several, where a `[[background]]` with an
+    /// `id` and no `kind` may modify a preset's layer.
+    fn parse_with(text: &str, origin: &Path, partial: bool) -> Result<Config, ConfigError> {
         let config: Config = toml::from_str(text)
             .map_err(|e| ConfigError::Invalid(origin.to_owned(), e.to_string()))?;
-        config.validate().map_err(|e| ConfigError::Invalid(origin.to_owned(), e))?;
+        config.validate(partial).map_err(|e| ConfigError::Invalid(origin.to_owned(), e))?;
         Ok(config)
     }
 
@@ -369,7 +511,7 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, partial: bool) -> Result<(), String> {
         let f = &self.font;
         if !(4.0..=200.0).contains(&f.size) {
             return Err(format!("font.size must be between 4 and 200 points (got {})", f.size));
@@ -398,7 +540,19 @@ impl Config {
             return Err(format!("visual.window_opacity must be 0-1 (got {})", v.window_opacity));
         }
         for (i, b) in self.background.iter().enumerate() {
-            b.validate().map_err(|e| format!("background {} ({}): {e}", i + 1, b.kind))?;
+            let name = b.id.clone().unwrap_or_else(|| (i + 1).to_string());
+            if b.kind.is_empty() && b.id.is_some() {
+                if partial {
+                    continue;
+                }
+                return Err(format!(
+                    "background {name:?}: missing `kind`, and no preset layer has this id"
+                ));
+            }
+            b.validate().map_err(|e| format!("background {name:?} ({}): {e}", b.kind))?;
+        }
+        for (i, r) in self.on.iter().enumerate() {
+            r.validate().map_err(|e| format!("on {} ({}): {e}", i + 1, r.event))?;
         }
         if self.shell.program.as_deref().is_some_and(|s| s.trim().is_empty()) {
             return Err("shell.program must not be empty (remove it to use $SHELL)".into());
@@ -546,6 +700,90 @@ mod tests {
     }
 
     #[test]
+    fn builtin_presets_are_valid() {
+        for (name, text) in BUILTIN_PRESETS {
+            let t = parse_preset(text, Path::new(name)).unwrap();
+            assert!(t.contains_key("background"), "{name}");
+        }
+    }
+
+    #[test]
+    fn preset_layers_merge_by_id_and_rules_add_up() {
+        let cfg = dir_with(&[
+            (
+                "config.toml",
+                "preset = \"heavens\"\n[[background]]\nid = \"sky\"\nparams = { style = 2 }\n\
+                 [[background]]\nkind = \"solid\"\ncolor = \"#00000040\"\n\
+                 [[on]]\nevent = \"terminal.bell\"\nlayer = \"sky\"\nparam = \"alert\"\nto = 1\n",
+            ),
+            ("profiles/still.toml", "[[background]]\nid = \"sky\"\nparams = { speed = 0 }\n"),
+        ]);
+        let c = Config::load_layered(&cfg, None).unwrap().config;
+        assert_eq!(c.background.len(), 2, "override merged, new layer stacked on top");
+        let sky = &c.background[0];
+        assert_eq!(sky.shader.as_deref(), Some("heavens"));
+        assert_eq!(sky.params["style"], 2.0, "config overrides the preset's param");
+        assert_eq!(sky.params["intensity"], 0.6, "other params kept");
+        assert_eq!(sky.palette["base"], "theme.background");
+        assert_eq!(c.background[1].kind, "solid");
+        assert_eq!(c.visual.max_fps, 30, "preset [visual] applies");
+        assert_eq!(c.on.len(), 5, "4 preset rules + 1");
+        assert_eq!(c.on[4].event, "terminal.bell");
+        // A profile works the same way, on top of the preset.
+        let c = Config::load_layered(&cfg, Some("still")).unwrap().config;
+        assert_eq!(c.background.len(), 1);
+        assert_eq!(c.background[0].params["speed"], 0.0);
+        assert_eq!(c.background[0].params["style"], 1.0, "profile list replaced config's");
+    }
+
+    #[test]
+    fn user_presets_and_errors() {
+        let cfg = dir_with(&[
+            ("config.toml", "preset = \"mine\"\n"),
+            (
+                "presets/mine.toml",
+                "[[background]]\nid = \"a\"\nkind = \"solid\"\ncolor = \"#102030\"\n",
+            ),
+            ("presets/bad.toml", "[font]\nsize = 12.0\n"),
+            ("profiles/bad.toml", "preset = \"bad\"\n"),
+            ("profiles/missing.toml", "preset = \"nope\"\n"),
+            ("profiles/orphan.toml", "[[background]]\nid = \"zzz\"\nopacity = 0.5\n"),
+            ("profiles/none.toml", "preset = \"none\"\n"),
+        ]);
+        let l = Config::load_layered(&cfg, None).unwrap();
+        assert_eq!(l.config.background[0].color.as_deref(), Some("#102030"));
+        assert!(l.sources.iter().any(|p| p.ends_with("presets/mine.toml")));
+        let e = Config::load_layered(&cfg, Some("bad")).unwrap_err().to_string();
+        assert!(e.contains("may only set") && e.contains("font"), "{e}");
+        let e = Config::load_layered(&cfg, Some("missing")).unwrap_err().to_string();
+        assert!(e.contains("not found") && e.contains("heavens"), "{e}");
+        let e = Config::load_layered(&cfg, Some("orphan")).unwrap_err().to_string();
+        assert!(e.contains("zzz") && e.contains("no preset layer"), "{e}");
+        assert!(Config::load_layered(&cfg, Some("none")).unwrap().config.background.is_empty());
+    }
+
+    #[test]
+    fn rules_and_palettes_are_validated() {
+        let e = parse("[[on]]\nevent = \"x\"\nlayer = \"a\"\nparam = \"p\"\neasing = \"bouncy\"\n")
+            .unwrap_err();
+        assert!(e.contains("bouncy") && e.contains("ease-out"), "{e}");
+        let e = parse("[[on]]\nlayer = \"a\"\nparam = \"p\"\n").unwrap_err();
+        assert!(e.contains("missing `event`"), "{e}");
+        let e = parse(
+            "[[on]]\nevent = \"x\"\nlayer = \"a\"\nparam = \"p\"\nwhen = { a = { b = 1 } }\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("when.a"), "{e}");
+        let e = parse("[[background]]\nkind = \"shader\"\nshader = \"heavens\"\npalette = { base = \"theme.bright.9\" }\n")
+            .unwrap_err();
+        assert!(e.contains("palette.base"), "{e}");
+        for ok in ["#123456", "#12345678", "theme.background", "theme.normal.0", "theme.bright.7"] {
+            assert!(is_color_ref(ok), "{ok}");
+        }
+        assert!(!is_color_ref("theme.ansi.3") && !is_color_ref("red"));
+    }
+
+    #[test]
     fn profile_backgrounds_replace_the_base_list() {
         let cfg = dir_with(&[
             ("config.toml", "[[background]]\nkind = \"solid\"\ncolor = \"#112233\"\n[[background]]\nkind = \"shader\"\nshader = \"aurora\"\n"),
@@ -647,6 +885,68 @@ fn check_name(what: &str, name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Keys a preset file may set.
+const PRESET_KEYS: &[&str] = &["background", "on", "visual"];
+
+/// Validate a preset file and return its table.
+pub fn parse_preset(text: &str, origin: &Path) -> Result<toml::Table, ConfigError> {
+    let invalid = |e: String| ConfigError::Invalid(origin.to_owned(), e);
+    Config::parse(text, origin)?;
+    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| invalid(e.to_string()))?;
+    if let Some(k) = table.keys().find(|k| !PRESET_KEYS.contains(&k.as_str())) {
+        return Err(invalid(format!(
+            "a preset may only set {} (found `{k}`)",
+            PRESET_KEYS.join(", ")
+        )));
+    }
+    Ok(table)
+}
+
+/// Layer the configuration over a preset: `[[background]]` entries with a
+/// matching `id` merge into the preset's layer, others are appended;
+/// `[[on]]` rules are appended; everything else deep-merges.
+fn merge_over_preset(base: &mut toml::Table, mut over: toml::Table) {
+    if let Some(toml::Value::Array(layers)) = over.remove("background") {
+        let toml::Value::Array(list) =
+            base.entry("background").or_insert_with(|| toml::Value::Array(Vec::new()))
+        else {
+            unreachable!("validated preset")
+        };
+        for layer in layers {
+            let id = layer.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+            let existing = id.and_then(|id| {
+                list.iter_mut().find(|l| l.get("id").and_then(|v| v.as_str()) == Some(&id))
+            });
+            match (existing, layer) {
+                (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge(b, o),
+                (_, layer) => list.push(layer),
+            }
+        }
+    }
+    if let Some(toml::Value::Array(rules)) = over.remove("on") {
+        match base.entry("on").or_insert_with(|| toml::Value::Array(Vec::new())) {
+            toml::Value::Array(list) => list.extend(rules),
+            _ => unreachable!("validated preset"),
+        }
+    }
+    merge(base, over);
+}
+
+/// Whether `s` names a color: `#rrggbb`, `#rrggbbaa`, `theme.foreground`,
+/// `theme.background`, `theme.cursor`, `theme.selection`,
+/// `theme.normal.0`-`7` or `theme.bright.0`-`7`.
+pub fn is_color_ref(s: &str) -> bool {
+    if s.starts_with('#') {
+        return parse_rgba(s).is_some();
+    }
+    let Some(r) = s.strip_prefix("theme.") else { return false };
+    if ["foreground", "background", "cursor", "selection"].contains(&r) {
+        return true;
+    }
+    let idx = r.strip_prefix("normal.").or_else(|| r.strip_prefix("bright."));
+    idx.and_then(|i| i.parse::<u8>().ok()).is_some_and(|i| i < 8)
+}
+
 /// Deep-merge `over` into `base`: tables merge, everything else replaces.
 fn merge(base: &mut toml::Table, over: toml::Table) {
     for (k, v) in over {
@@ -713,6 +1013,13 @@ impl Background {
                     return Err(
                         "a shader layer needs `shader` (a built-in name or a .wgsl file)".into()
                     );
+                }
+                for (k, v) in &self.palette {
+                    if !is_color_ref(v) {
+                        return Err(format!(
+                            "palette.{k}: invalid color {v:?} (\"#rrggbb\", \"#rrggbbaa\", \"theme.background\", \"theme.bright.5\", ...)"
+                        ));
+                    }
                 }
             }
             "" => return Err("missing `kind` (solid, gradient, image or shader)".into()),
