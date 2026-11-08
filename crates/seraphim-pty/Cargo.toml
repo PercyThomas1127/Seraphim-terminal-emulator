@@ -1,0 +1,10 @@
+[package]
+name = "seraphim-pty"
+description = "Seraphim PTY management: spawning shells, resizing, I/O"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nix.workspace = true
+libc.workspace = true

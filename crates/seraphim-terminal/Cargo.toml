@@ -1,0 +1,10 @@
+[package]
+name = "seraphim-terminal"
+description = "Seraphim Terminal Core: VT/xterm state machine and structured terminal state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vte.workspace = true
+unicode-width.workspace = true

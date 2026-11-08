@@ -1,0 +1,11 @@
+[package]
+name = "seraphim"
+description = "Seraphim terminal environment (Phase I headless driver)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seraphim-terminal.workspace = true
+seraphim-session.workspace = true
+seraphim-events.workspace = true

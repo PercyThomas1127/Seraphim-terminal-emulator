@@ -1,0 +1,12 @@
+[package]
+name = "seraphim-session"
+description = "Seraphim Session Manager: binds PTYs to terminal state and publishes events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seraphim-terminal.workspace = true
+seraphim-pty.workspace = true
+seraphim-events.workspace = true
+serde_json.workspace = true
