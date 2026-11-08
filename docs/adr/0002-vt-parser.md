@@ -22,12 +22,13 @@ wrap rules, scroll regions, modes, alternate screens, SGR, OSC handling.
 1. **APC strings are discarded.** `vte` enters `SosPmApcString` and drops
    the payload. The **Kitty graphics protocol is APC-based**
    (`ESC _ G ... ESC \`), so it is unreachable through `vte` as-is.
-   Plan (Phase II): a small pre-filter in front of `vte` that extracts
-   `ESC _ … ST` sequences and routes them to the graphics decoder, or
-   upstream an APC callback to `vte`. Decide when the graphics renderer
-   starts; both are small.
-2. **Sixel** arrives as DCS via `hook/put/unhook` — supported by `vte`,
-   not yet handled by us.
+   **Resolved (Phase II):** the pre-filter in `src/prefilter.rs` cuts
+   `ESC _ … ST` out of the stream (in order, across read boundaries; a
+   trailing ESC is held back until the next byte shows whether it starts
+   an APC) and hands the payload to `State::apc`, which runs the Kitty
+   graphics protocol (`src/graphics.rs`). Payloads are capped at 64 MiB.
+2. **Sixel** arrives as DCS via `hook/put/unhook`. **Resolved:**
+   `src/sixel.rs` decodes it into the same image store.
 3. **OSC payload size.** With `std`, `vte`'s OSC buffer grows without
    limit. **Resolved:** `src/prefilter.rs` sits in front of vte, caps OSC
    at 2 MiB (configurable) by sending CAN and discarding the rest. The

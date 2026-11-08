@@ -52,8 +52,8 @@
 
 ## Not yet
 
-* Kitty graphics protocol / Sixel / inline images (spec §4.2) — needs the
-  APC pre-filter from ADR 0002.
+* (Done since: Kitty graphics protocol and Sixel inline images; see the
+  Phase II plan.)
 * Image formats beyond PNG, image blur, video and animated images.
 * Continuous bindings (`[[bind]]`, ADR 0006). Event-triggered animations
   are done: see ADR 0008.

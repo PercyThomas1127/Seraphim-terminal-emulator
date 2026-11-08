@@ -9,6 +9,10 @@ license.workspace = true
 vte.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+png.workspace = true
+miniz_oxide.workspace = true
 
 [dev-dependencies]
 vte.workspace = true
+png.workspace = true
+miniz_oxide.workspace = true

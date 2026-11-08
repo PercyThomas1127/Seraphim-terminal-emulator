@@ -372,6 +372,10 @@ impl App {
                 color_scheme: Some(renderer.theme().scheme()),
                 scrollback: o.scrollback,
                 grapheme_clustering: o.grapheme_clustering,
+                cell_pixels: {
+                    let m = renderer.cell_metrics();
+                    Some((m.width, m.height))
+                },
             },
             &bus,
         )
@@ -493,6 +497,8 @@ impl App {
                 let a = self.active.as_mut().unwrap();
                 a.renderer.set_fonts(f);
                 a.overlay.set_fonts(g);
+                let m = a.renderer.cell_metrics();
+                let _ = a.session.set_cell_pixels(m.width, m.height);
                 self.resize_grid();
             }
             (Err(e), _) | (_, Err(e)) => eprintln!("seraphim: {e}"),
@@ -1320,6 +1326,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let (Ok(f), Ok(g)) = (Fonts::new(&config), Fonts::new(&config)) {
                     a.renderer.set_fonts(f);
                     a.overlay.set_fonts(g);
+                    let m = a.renderer.cell_metrics();
+                    let _ = a.session.set_cell_pixels(m.width, m.height);
                 }
                 a.window.request_redraw();
             }

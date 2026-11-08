@@ -15,6 +15,7 @@
 mod atlas;
 pub mod font;
 pub mod headless;
+mod images;
 mod theme;
 
 use std::collections::HashMap;
@@ -105,6 +106,10 @@ pub struct Renderer {
     applied_overrides: seraphim_terminal::palette::ColorOverrides,
     instances: Vec<Instance>,
     stats: FrameStats,
+    /// Instances before this index are cell backgrounds (and the block
+    /// cursor); images below text are drawn between the two halves.
+    bg_end: u32,
+    images: images::Images,
 }
 
 impl Renderer {
@@ -250,6 +255,7 @@ impl Renderer {
         });
         let instance_capacity = 4096;
         let instance_buffer = Self::make_instance_buffer(device, instance_capacity);
+        let images = images::Images::new(device, format, &globals);
         Renderer {
             pipeline,
             bind_group,
@@ -267,6 +273,8 @@ impl Renderer {
             applied_overrides: Default::default(),
             instances: Vec::new(),
             stats: FrameStats::default(),
+            bg_end: 0,
+            images,
         }
     }
 
@@ -345,19 +353,37 @@ impl Renderer {
             atlas: [ATLAS_SIZE as f32, ATLAS_SIZE as f32],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+        let m = self.fonts.metrics();
+        self.images.prepare(device, queue, term, view.padding.round(), (m.width, m.height));
         self.instance_count = self.instances.len() as u32;
         self.stats.instances = self.instances.len();
     }
 
     /// Record the draw into an existing render pass.
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.instance_count == 0 {
+        if self.images.is_empty() {
+            if self.instance_count > 0 {
+                self.draw_cells(pass, 0..self.instance_count);
+            }
+            return;
+        }
+        // Kitty z-layers: under backgrounds, under text, over text.
+        let split = self.bg_end.min(self.instance_count);
+        self.images.render(pass, 0);
+        self.draw_cells(pass, 0..split);
+        self.images.render(pass, 1);
+        self.draw_cells(pass, split..self.instance_count);
+        self.images.render(pass, 2);
+    }
+
+    fn draw_cells(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>) {
+        if range.is_empty() {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..4, 0..self.instance_count);
+        pass.draw(0..4, range);
     }
 
     fn build_instances(&mut self, queue: &wgpu::Queue, term: &Terminal, view: &View) {
@@ -440,6 +466,8 @@ impl Renderer {
         if block_cursor {
             self.push_solid(cursor_x, cursor_y, cursor_w, ch, self.theme.cursor);
         }
+
+        self.bg_end = self.instances.len() as u32;
 
         // 3. Glyphs and decorations.
         for r in 0..rows {

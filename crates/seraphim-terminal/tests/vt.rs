@@ -227,7 +227,7 @@ fn dec_special_graphics() {
 #[test]
 fn device_status_and_attributes() {
     let mut t = term(10, 5, "\x1b[3;4H\x1b[6n\x1b[5n\x1b[c");
-    assert_eq!(t.take_responses(), b"\x1b[3;4R\x1b[0n\x1b[?62;22c");
+    assert_eq!(t.take_responses(), b"\x1b[3;4R\x1b[0n\x1b[?62;4;22c");
     assert!(t.take_responses().is_empty());
 }
 

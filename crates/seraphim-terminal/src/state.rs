@@ -212,6 +212,10 @@ pub(crate) struct State {
     pub overrides: ColorOverrides,
     /// DECRQSS request being collected (`DCS $ q ... ST`), capped length.
     dcs: Option<Vec<u8>>,
+    /// Sixel image being received (`DCS ... q ... ST`).
+    sixel: Option<Box<crate::sixel::Sixel>>,
+    /// Inline images (Kitty graphics protocol and Sixel).
+    pub graphics: crate::graphics::Graphics,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -254,6 +258,8 @@ impl State {
             scheme: ColorScheme::default(),
             overrides: ColorOverrides::default(),
             dcs: None,
+            sixel: None,
+            graphics: Default::default(),
         }
     }
 
@@ -455,6 +461,12 @@ impl State {
                 scrollback.push_back(std::mem::replace(row, buf));
             }
         });
+        if top == 0 && bottom + 1 == self.rows {
+            // Images scroll with full-screen scrolls (into history on the
+            // primary screen).
+            let history = if keep { self.scrollback.len() } else { 0 };
+            self.graphics.scroll(self.alt_active, moved, history);
+        }
         if keep {
             // Content moved up into history: keep the viewport and the
             // selection on the same text.
@@ -704,6 +716,10 @@ impl State {
             return;
         }
         self.alt_active = enable;
+        // The alternate screen's images go with it.
+        if !enable || clear {
+            self.graphics.clear_screen(true, None);
+        }
         self.sync_kitty();
         self.selection = None;
         self.display_offset = 0;
@@ -721,7 +737,10 @@ impl State {
         let scheme = std::mem::take(&mut self.scheme);
         let clusters = self.grapheme_default;
         let was_alt = self.alt_active;
+        let mut graphics = std::mem::take(&mut self.graphics);
+        graphics.reset();
         *self = State::new(cols, rows, limit);
+        self.graphics = graphics;
         self.scrollback = scrollback;
         self.scheme = scheme;
         self.grapheme_default = clusters;
@@ -1380,12 +1399,21 @@ impl Perform for State {
         self.osc(params, bell_terminated);
     }
 
-    fn hook(&mut self, _params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+    fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         // DECRQSS: DCS $ q <setting> ST
         self.dcs = (!ignore && intermediates == b"$" && action == 'q').then(Vec::new);
+        // Sixel: DCS P1 ; P2 ; P3 q <data> ST
+        if !ignore && intermediates.is_empty() && action == 'q' {
+            let p: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
+            self.sixel = Some(Box::new(crate::sixel::Sixel::new(&p)));
+        }
     }
 
     fn put(&mut self, byte: u8) {
+        if let Some(sx) = &mut self.sixel {
+            sx.put(byte);
+            return;
+        }
         if let Some(buf) = &mut self.dcs {
             if buf.len() < 64 {
                 buf.push(byte);
@@ -1394,6 +1422,12 @@ impl Perform for State {
     }
 
     fn unhook(&mut self) {
+        if let Some(sx) = self.sixel.take() {
+            if let Some((w, h, rgba)) = sx.finish() {
+                self.place_sixel(w, h, rgba);
+            }
+            return;
+        }
         if let Some(buf) = self.dcs.take() {
             self.decrqss(&buf);
         }
@@ -1401,6 +1435,44 @@ impl Perform for State {
 }
 
 impl State {
+    fn graphics_ctx(&self) -> crate::graphics::Ctx {
+        crate::graphics::Ctx {
+            row: self.cursor.row,
+            col: self.cursor.col,
+            rows: self.rows,
+            alt: self.alt_active,
+        }
+    }
+
+    /// An APC string from the pre-filter; `G` is the Kitty graphics
+    /// protocol, anything else is ignored.
+    pub fn apc(&mut self, payload: &[u8]) {
+        let Some(body) = payload.strip_prefix(b"G") else { return };
+        let ctx = self.graphics_ctx();
+        let effect = self.graphics.command(body, ctx);
+        self.responses.extend_from_slice(&effect.response);
+        if let Some((cols, rows)) = effect.cursor_move {
+            // After the image: its last row, the column past its right edge.
+            for _ in 1..rows {
+                self.linefeed();
+            }
+            self.cursor.col = (ctx.col + cols).min(self.cols - 1);
+            self.cursor.pending_wrap = false;
+        }
+        self.damage_all();
+    }
+
+    fn place_sixel(&mut self, w: u32, h: u32, rgba: Vec<u8>) {
+        let ctx = self.graphics_ctx();
+        let (_, rows) = self.graphics.place_sixel(ctx, w, h, rgba);
+        // Sixel scrolling: the cursor goes to the line below the image.
+        for _ in 0..rows {
+            self.linefeed();
+        }
+        self.cursor.col = ctx.col;
+        self.damage_all();
+    }
+
     fn kitty_stack(&mut self) -> &mut Vec<u8> {
         if self.alt_active {
             &mut self.kitty_alt
@@ -1503,6 +1575,22 @@ impl State {
             ([], 'H') | ([], 'f') => self.goto(n(0) - 1, n(1) - 1),
             ([], 'I') => self.tab_forward(n(0)),
             ([], 'Z') => self.tab_backward(n(0)),
+            // XTWINOPS pixel size reports, used by image tools to size
+            // pictures; only once the front end has told us the cell size.
+            ([], 't') if matches!(p.first(), Some(14 | 16)) && self.graphics.cell_px_known => {
+                let (cw, ch) = self.graphics.cell_px;
+                let reply = match p.first().copied().unwrap_or(0) {
+                    14 => Some(format!(
+                        "\x1b[4;{};{}t",
+                        (ch * self.rows as f32).round(),
+                        (cw * self.cols as f32).round()
+                    )),
+                    _ => Some(format!("\x1b[6;{};{}t", ch.round(), cw.round())),
+                };
+                if let Some(r) = reply {
+                    self.responses.extend_from_slice(r.as_bytes());
+                }
+            }
             ([], 'J') | ([b'?'], 'J') => {
                 let (row, col) = (self.cursor.row, self.cursor.col);
                 match p.first().copied().unwrap_or(0) {
@@ -1514,8 +1602,12 @@ impl State {
                         self.erase_rows(0, row);
                         self.erase_cells(row, 0, col + 1);
                     }
-                    2 => self.erase_rows(0, self.rows),
+                    2 => {
+                        self.erase_rows(0, self.rows);
+                        self.graphics.clear_screen(self.alt_active, Some((0, self.rows)));
+                    }
                     3 => {
+                        self.graphics.clear_screen(self.alt_active, None);
                         self.scrollback.clear();
                         self.display_offset = 0;
                         if self.selection_range().is_some_and(|r| r.start.line < 0) {
@@ -1559,7 +1651,7 @@ impl State {
             }
             ([], 'c') if arg(p, 0, 0) == 0 => {
                 // Primary DA: VT220 with ANSI color.
-                self.responses.extend_from_slice(b"\x1b[?62;22c");
+                self.responses.extend_from_slice(b"\x1b[?62;4;22c");
             }
             ([b'>'], 'c') if arg(p, 0, 0) == 0 => {
                 self.responses.extend_from_slice(b"\x1b[>1;10;0c");

@@ -174,6 +174,17 @@ items = [
 A `[[menu]]` titled like a built-in one appends to it (`replace = true`
 replaces it).
 
+### Images
+
+![Kitty graphics and Sixel](docs/images/graphics.png)
+
+Programs can show pictures inline with the **Kitty graphics protocol**
+(`kitten icat`, `timg`, `chafa -f kitty`, yazi, ...) or **Sixel**
+(`img2sixel`, `chafa -f sixel`, gnuplot, ...). Images scroll with the text
+into the history and can sit under or over the text (kitty z-index). The
+PTY reports pixel sizes, so tools size pictures correctly. Animation and
+Unicode placeholders (used through tmux) are not supported yet.
+
 ### Configuration
 
 Settings live in `~/.config/seraphim/config.toml` (font, window size,

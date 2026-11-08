@@ -20,12 +20,14 @@
 //! ```
 
 mod cell;
+pub mod graphics;
 mod grid;
 pub mod input;
 pub mod palette;
 mod prefilter;
 mod reflow;
 mod selection;
+mod sixel;
 mod state;
 
 pub use cell::{Attrs, Cell, Color, Flags};
@@ -64,7 +66,30 @@ impl Terminal {
     /// Feed raw bytes from the PTY.
     pub fn advance(&mut self, bytes: &[u8]) {
         let (parser, state) = (&mut self.parser, &mut self.state);
-        self.limiter.filter(bytes, |part| parser.advance(state, part));
+        self.limiter.filter(bytes, |part| match part {
+            prefilter::Part::Bytes(b) => parser.advance(state, b),
+            prefilter::Part::Apc(payload) => state.apc(&payload),
+        });
+    }
+
+    /// Inline images (Kitty graphics protocol, Sixel) and their placements.
+    pub fn graphics(&self) -> &graphics::Graphics {
+        &self.state.graphics
+    }
+
+    /// Images to draw in the current viewport, lowest z first.
+    pub fn visible_images(&self) -> Vec<graphics::VisiblePlacement<'_>> {
+        let s = &self.state;
+        s.graphics.visible(s.alt_active, s.rows, s.display_offset)
+    }
+
+    /// Cell size in pixels, used to size images given in pixels. Set by
+    /// the front end whenever the font changes.
+    pub fn set_cell_pixel_size(&mut self, width: f32, height: f32) {
+        if width > 0.0 && height > 0.0 {
+            self.state.graphics.cell_px = (width, height);
+            self.state.graphics.cell_px_known = true;
+        }
     }
 
     /// Maximum OSC payload in bytes; longer ones are discarded.

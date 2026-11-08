@@ -30,6 +30,7 @@ fontdb = "0.24"
 bytemuck = "1"
 pollster = "1"
 png = "0.18"
+miniz_oxide = { version = "0.8", features = ["with-alloc"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }

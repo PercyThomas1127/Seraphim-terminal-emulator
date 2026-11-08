@@ -63,6 +63,9 @@ pub struct SessionConfig {
     pub color_scheme: Option<seraphim_terminal::palette::ColorScheme>,
     /// Initial (and RIS) state of grapheme clustering, mode 2027.
     pub grapheme_clustering: bool,
+    /// Cell size in pixels, for image sizing and the PTY's pixel size
+    /// (`TIOCGWINSZ`, which image tools read). `None` reports 0.
+    pub cell_pixels: Option<(f32, f32)>,
 }
 
 impl Default for SessionConfig {
@@ -75,8 +78,19 @@ impl Default for SessionConfig {
             notify: None,
             color_scheme: None,
             grapheme_clustering: true,
+            cell_pixels: None,
         }
     }
+}
+
+/// PTY size with pixel dimensions from the cell size.
+fn pty_size(cols: u16, rows: u16, cell: Option<(f32, f32)>) -> PtySize {
+    let mut s = PtySize::new(cols, rows);
+    if let Some((w, h)) = cell {
+        s.pixel_width = (cols as f32 * w).round().min(u16::MAX as f32) as u16;
+        s.pixel_height = (rows as f32 * h).round().min(u16::MAX as f32) as u16;
+    }
+    s
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,11 +133,12 @@ pub struct Session {
     writer: Arc<Mutex<std::fs::File>>,
     shared: Arc<Shared>,
     io_thread: Option<JoinHandle<()>>,
+    cell_pixels: Mutex<Option<(f32, f32)>>,
 }
 
 impl Session {
     pub fn spawn(id: SessionId, config: SessionConfig, bus: &EventBus) -> io::Result<Session> {
-        let size = PtySize::new(config.cols, config.rows);
+        let size = pty_size(config.cols, config.rows, config.cell_pixels);
         let pty = Pty::spawn(&config.command, size)?;
         let mut term = Terminal::with_scrollback(
             config.cols as usize,
@@ -132,6 +147,9 @@ impl Session {
         );
         if let Some(scheme) = config.color_scheme.clone() {
             term.set_color_scheme(scheme);
+        }
+        if let Some((w, h)) = config.cell_pixels {
+            term.set_cell_pixel_size(w, h);
         }
         term.set_grapheme_clustering(config.grapheme_clustering);
         let terminal = Arc::new(Mutex::new(term));
@@ -165,7 +183,15 @@ impl Session {
             .name(format!("seraphim-session-{id}"))
             .spawn(move || io.run())?;
 
-        Ok(Session { id, terminal, pty, writer, shared, io_thread: Some(io_thread) })
+        Ok(Session {
+            id,
+            terminal,
+            pty,
+            writer,
+            shared,
+            io_thread: Some(io_thread),
+            cell_pixels: Mutex::new(config.cell_pixels),
+        })
     }
 
     pub fn id(&self) -> SessionId {
@@ -202,7 +228,20 @@ impl Session {
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         self.terminal.lock().unwrap().resize(cols as usize, rows as usize);
         self.shared.generation.fetch_add(1, Ordering::Release);
-        self.pty.lock().unwrap().resize(PtySize::new(cols, rows))
+        let cell = *self.cell_pixels.lock().unwrap();
+        self.pty.lock().unwrap().resize(pty_size(cols, rows, cell))
+    }
+
+    /// The font changed: new cell size in pixels (images, size reports and
+    /// the PTY's pixel size follow).
+    pub fn set_cell_pixels(&self, width: f32, height: f32) -> io::Result<()> {
+        *self.cell_pixels.lock().unwrap() = Some((width, height));
+        let (cols, rows) = {
+            let mut t = self.terminal.lock().unwrap();
+            t.set_cell_pixel_size(width, height);
+            (t.cols() as u16, t.rows() as u16)
+        };
+        self.pty.lock().unwrap().resize(pty_size(cols, rows, Some((width, height))))
     }
 
     pub fn exit_info(&self) -> Option<ExitInfo> {
