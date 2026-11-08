@@ -86,6 +86,21 @@ window_opacity = 1.0
 # Crossfade duration when switching profiles, in milliseconds.
 transition_ms = 400
 
+[cursor]
+# Glide between cells over this many milliseconds (0 jumps).
+glide_ms = 80
+# Leave a fading trail while gliding.
+trail = false
+# Fade in and out when blinking (0 blinks hard).
+blink_fade_ms = 150
+# Soft glow around the cursor, 0 to 1.
+glow = 0.0
+# A ring spreads from the cursor on each key press.
+ripple = false
+# Fade a new selection in over this many milliseconds.
+selection_fade_ms = 90
+# visual.reduced_motion turns the moving effects off.
+
 # Background layers, bottom first. Kinds: solid, gradient, image (PNG),
 # shader (built-in "aurora", "starfield", "heavens", or a .wgsl file in
 # shaders/ implementing

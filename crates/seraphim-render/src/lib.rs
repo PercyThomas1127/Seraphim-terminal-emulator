@@ -13,6 +13,7 @@
 //! text is always composited on top so it stays crisp (spec §4.4).
 
 mod atlas;
+pub mod cursorfx;
 pub mod font;
 pub mod headless;
 mod images;
@@ -37,7 +38,8 @@ struct Instance {
     uv: [f32; 4],
     color: [f32; 4],
     kind: u32,
-    _pad: [u32; 3],
+    /// Effect parameters (glow, ring); zero otherwise.
+    params: [f32; 3],
 }
 
 // SAFETY: plain-old-data, repr(C), no padding beyond the explicit field.
@@ -47,6 +49,10 @@ unsafe impl bytemuck::Pod for Instance {}
 const KIND_SOLID: u32 = 0;
 const KIND_MASK: u32 = 1;
 const KIND_COLOR: u32 = 2;
+/// Soft glow around an inner rectangle: params = (radius, quad w, quad h).
+const KIND_GLOW: u32 = 3;
+/// Ring: params = (radius, thickness, quad size).
+const KIND_RING: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -110,6 +116,7 @@ pub struct Renderer {
     /// cursor); images below text are drawn between the two halves.
     bg_end: u32,
     images: images::Images,
+    fx: cursorfx::Fx,
 }
 
 impl Renderer {
@@ -219,8 +226,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let attributes =
-            wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Uint32];
+        let attributes = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Uint32, 4 => Float32x3];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("cells"),
             layout: Some(&pipeline_layout),
@@ -275,6 +281,7 @@ impl Renderer {
             stats: FrameStats::default(),
             bg_end: 0,
             images,
+            fx: Default::default(),
         }
     }
 
@@ -285,6 +292,26 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
+    }
+
+    /// Cursor and selection effects (none by default).
+    pub fn set_cursor_effects(&mut self, fx: cursorfx::CursorEffects) {
+        self.fx.cfg = fx;
+    }
+
+    /// Use a fixed time for effects instead of the clock (tests).
+    pub fn set_effects_clock(&mut self, now: Option<std::time::Instant>) {
+        self.fx.clock = now;
+    }
+
+    /// A key was pressed (for typing ripples).
+    pub fn key_pressed(&mut self) {
+        self.fx.ripple();
+    }
+
+    /// An effect is in motion: the window should keep drawing frames.
+    pub fn effects_animating(&self) -> bool {
+        self.fx.animating()
     }
 
     pub fn cell_metrics(&self) -> CellMetrics {
@@ -420,51 +447,94 @@ impl Renderer {
         // The cursor lives on the live screen; when scrolled back it moves
         // down the viewport and may leave it entirely.
         let cursor_vrow = cursor.row + offset;
-        let show_cursor = cursor.visible && cursor_vrow < rows && (view.cursor_on || !view.focused);
+        let now = self.fx.now();
+        // Blink: fades when configured; an unfocused cursor never blinks.
+        let blink = if view.focused { self.fx.blink_alpha(view.cursor_on, now) } else { 1.0 };
+        let show_cursor = cursor.visible && cursor_vrow < rows && blink > 0.0;
         let block_cursor = show_cursor && view.focused && cursor.shape == CursorShape::Block;
-        let cursor_wide = show_cursor
+        let cursor_wide = cursor_vrow < rows
             && term.visible_row(cursor_vrow).cells.get(cursor.col).is_some_and(|c| c.is_wide());
-        let cursor_w = if cursor_wide { 2.0 * cw } else { cw };
-        let cursor_x = pad + cursor.col as f32 * cw;
-        let cursor_y = pad + cursor_vrow as f32 * ch;
+        let target_w = if cursor_wide { 2.0 * cw } else { cw };
+        let target = [pad + cursor.col as f32 * cw, pad + cursor_vrow as f32 * ch, target_w, ch];
+        // Glide: draw where the cursor is on its way, not where it ends.
+        let (shown, settled) = if cursor.visible && cursor_vrow < rows {
+            let (r, t) = self.fx.cursor(target, now);
+            (r, t >= 1.0)
+        } else {
+            (target, true)
+        };
+        let [cursor_x, cursor_y, cursor_w, _] = shown;
+        let cursor_color = to_f32(self.theme.cursor, blink);
+        let sel_alpha = self.fx.selection_alpha(selection.is_some(), now);
         let selected = |r: usize, c: usize| {
             selection.is_some_and(|s: SelectionRange| {
                 s.contains(Point::new(r as i64 - offset as i64, c))
             })
         };
 
-        // 1. Backgrounds, merged into runs of equal color.
+        // 1. Backgrounds, merged into runs of equal color. A new
+        // selection fades in.
         for r in 0..rows {
             let row = term.visible_row(r);
             let y = pad + r as f32 * ch;
-            let mut run: Option<(usize, Rgb)> = None;
+            let mut run: Option<(usize, Rgb, bool)> = None;
             let n = row.cells.len().min(cols);
             for (c, cell) in row.cells[..n].iter().enumerate() {
-                let (_, bg) = self.colors(&cell.attrs, selected(r, c));
+                let sel = selected(r, c);
+                let (_, bg) = self.colors(&cell.attrs, sel);
                 match (run, bg) {
-                    (Some((_, rc)), Some(b)) if rc == b => {}
+                    (Some((_, rc, rs)), Some(b)) if rc == b && rs == sel => {}
                     _ => {
-                        if let Some((start, color)) = run.take() {
-                            self.push_solid(
-                                pad + start as f32 * cw,
-                                y,
-                                (c - start) as f32 * cw,
-                                ch,
-                                color,
-                            );
+                        if let Some((start, color, s)) = run.take() {
+                            let a = if s { sel_alpha } else { 1.0 };
+                            let w = (c - start) as f32 * cw;
+                            self.push_rect(pad + start as f32 * cw, y, w, ch, to_f32(color, a));
                         }
-                        run = bg.map(|b| (c, b));
+                        run = bg.map(|b| (c, b, sel));
                     }
                 }
             }
-            if let Some((start, color)) = run {
-                self.push_solid(pad + start as f32 * cw, y, (n - start) as f32 * cw, ch, color);
+            if let Some((start, color, s)) = run {
+                let a = if s { sel_alpha } else { 1.0 };
+                let w = (n - start) as f32 * cw;
+                self.push_rect(pad + start as f32 * cw, y, w, ch, to_f32(color, a));
+            }
+        }
+
+        // Ripples and glow sit under the text.
+        let center = [cursor_x + cursor_w / 2.0, cursor_y + ch / 2.0];
+        for (c, p) in self.fx.ripples(center, now) {
+            let max_r = ch * 3.0;
+            let size = 2.0 * max_r + 4.0;
+            let radius = max_r * (1.0 - (1.0 - p).powi(2));
+            let color = to_f32(self.theme.cursor, 0.55 * (1.0 - p));
+            self.push_effect(
+                [c[0] - size / 2.0, c[1] - size / 2.0, size, size],
+                color,
+                KIND_RING,
+                [radius, 1.5 + 1.5 * (1.0 - p), size],
+            );
+        }
+        if show_cursor && self.fx.cfg.glow > 0.0 {
+            let rad = ch * 0.7;
+            let (qw, qh) = (cursor_w + 2.0 * rad, ch + 2.0 * rad);
+            self.push_effect(
+                [cursor_x - rad, cursor_y - rad, qw, qh],
+                to_f32(self.theme.cursor, 0.55 * self.fx.cfg.glow * blink),
+                KIND_GLOW,
+                [rad, qw, qh],
+            );
+        }
+        // Trail behind a gliding cursor.
+        if show_cursor {
+            for (r, a) in self.fx.trail(now) {
+                self.push_rect(r[0], r[1], r[2], r[3], to_f32(self.theme.cursor, a * blink));
             }
         }
 
         // 2. Block cursor sits under the glyph.
         if block_cursor {
-            self.push_solid(cursor_x, cursor_y, cursor_w, ch, self.theme.cursor);
+            self.push_rect(cursor_x, cursor_y, cursor_w, ch, cursor_color);
         }
 
         self.bg_end = self.instances.len() as u32;
@@ -481,7 +551,10 @@ impl Renderer {
                 let x = pad + c as f32 * cw;
                 let width = if cell.is_wide() { 2.0 * cw } else { cw };
                 let (mut fg, _) = self.colors(&cell.attrs, selected(r, c));
-                let under_cursor = block_cursor && r == cursor_vrow && c == cursor.col;
+                // Text inverts under the block only once it has arrived and
+                // is mostly opaque.
+                let under_cursor =
+                    block_cursor && settled && blink > 0.5 && r == cursor_vrow && c == cursor.col;
                 if under_cursor {
                     fg = self.theme.cursor_text;
                 }
@@ -574,17 +647,17 @@ impl Renderer {
 
         // 4. Non-block cursors draw over the text.
         if show_cursor && !block_cursor {
-            let c = self.theme.cursor;
+            let c = cursor_color;
             let t = (m.stroke * 2.0).max(1.0).round();
             if !view.focused {
-                self.push_solid(cursor_x, cursor_y, cursor_w, 1.0, c);
-                self.push_solid(cursor_x, cursor_y + ch - 1.0, cursor_w, 1.0, c);
-                self.push_solid(cursor_x, cursor_y, 1.0, ch, c);
-                self.push_solid(cursor_x + cursor_w - 1.0, cursor_y, 1.0, ch, c);
+                self.push_rect(cursor_x, cursor_y, cursor_w, 1.0, c);
+                self.push_rect(cursor_x, cursor_y + ch - 1.0, cursor_w, 1.0, c);
+                self.push_rect(cursor_x, cursor_y, 1.0, ch, c);
+                self.push_rect(cursor_x + cursor_w - 1.0, cursor_y, 1.0, ch, c);
             } else if cursor.shape == CursorShape::Bar {
-                self.push_solid(cursor_x, cursor_y, t, ch, c);
+                self.push_rect(cursor_x, cursor_y, t, ch, c);
             } else {
-                self.push_solid(cursor_x, cursor_y + ch - t, cursor_w, t, c);
+                self.push_rect(cursor_x, cursor_y + ch - t, cursor_w, t, c);
             }
         }
         // 5. Scroll position indicator while viewing history.
@@ -611,13 +684,29 @@ impl Renderer {
         }
     }
 
+    fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
+        self.instances.push(Instance {
+            rect: [x, y, w, h],
+            uv: [0.0; 4],
+            color,
+            kind: KIND_SOLID,
+            params: [0.0; 3],
+        });
+    }
+
+    fn push_effect(&mut self, rect: [f32; 4], color: [f32; 4], kind: u32, params: [f32; 3]) {
+        // uv spans the whole atlas so the shader sees 0..1 across the quad.
+        let uv = [0.0, 0.0, ATLAS_SIZE as f32, ATLAS_SIZE as f32];
+        self.instances.push(Instance { rect, uv, color, kind, params });
+    }
+
     fn push_solid(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
         self.instances.push(Instance {
             rect: [x, y, w, h],
             uv: [0.0; 4],
             color: to_f32(color, 1.0),
             kind: KIND_SOLID,
-            _pad: [0; 3],
+            params: [0.0; 3],
         });
     }
 
@@ -681,7 +770,7 @@ impl Renderer {
             uv: [g.rect.x as f32, g.rect.y as f32, g.rect.w as f32, g.rect.h as f32],
             color: to_f32(fg, 1.0),
             kind: if g.color { KIND_COLOR } else { KIND_MASK },
-            _pad: [0; 3],
+            params: [0.0; 3],
         });
         true
     }
@@ -772,7 +861,7 @@ impl Renderer {
             uv: [g.rect.x as f32, g.rect.y as f32, w, h],
             color: to_f32(fg, 1.0),
             kind: if g.color { KIND_COLOR } else { KIND_MASK },
-            _pad: [0; 3],
+            params: [0.0; 3],
         });
         true
     }

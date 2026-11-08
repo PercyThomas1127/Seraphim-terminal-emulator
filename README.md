@@ -146,6 +146,21 @@ the config; switch with `--profile NAME` or **Ctrl+Shift+P** at runtime
 draws frames while something moves, pauses when the window is unfocused, and
 stops entirely with `visual.reduced_motion = true`.
 
+### Cursor effects
+
+The cursor glides between cells and fades when it blinks; a new selection
+fades in. Optional: a soft glow, a trail while gliding, and a ripple on
+every key press (`[cursor]` in the config). `visual.reduced_motion` turns
+the moving ones off.
+
+```toml
+[cursor]
+glide_ms = 80
+glow = 0.6
+ripple = true
+trail = true
+```
+
 ### Menu bar
 
 ![The menu bar](docs/images/menu.png)

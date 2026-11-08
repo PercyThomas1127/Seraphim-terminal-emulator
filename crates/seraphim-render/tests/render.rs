@@ -379,3 +379,112 @@ fn overline_dotted_and_dashed_are_drawn() {
     let t2 = row.windows(2).filter(|p| p[0] != p[1]).count();
     assert!(t2 >= 3 && t2 < transitions, "dashed: {t2} transitions");
 }
+
+mod cursor_effects {
+    use super::*;
+    use seraphim_render::cursorfx::CursorEffects;
+    use std::time::{Duration, Instant};
+
+    fn frame(h: &mut Headless, t: &Terminal, at: Instant) -> Image {
+        h.renderer.set_effects_clock(Some(at));
+        render(h, t, true)
+    }
+
+    fn cursor_px(img: &Image, (x, y, w, hh): (u32, u32, u32, u32)) -> usize {
+        let c = Theme::default().cursor;
+        (y..y + hh)
+            .flat_map(|yy| (x..x + w).map(move |xx| (xx, yy)))
+            .filter(|&(xx, yy)| rgb(img.pixel(xx, yy)) == c)
+            .count()
+    }
+
+    #[test]
+    fn glide_draws_the_cursor_between_cells() {
+        let Some(mut h) = headless() else { return };
+        h.renderer.set_cursor_effects(CursorEffects { glide_ms: 100, ..Default::default() });
+        let mut t = Terminal::new(20, 2);
+        let t0 = Instant::now();
+        frame(&mut h, &t, t0); // at 0,0
+        t.advance(b"\x1b[1;11H"); // jump to column 10
+        frame(&mut h, &t, t0 + Duration::from_millis(30)); // the glide starts when drawn
+        let mid = frame(&mut h, &t, t0 + Duration::from_millis(60));
+        let start = cell(&h, 0, 0);
+        let end = cell(&h, 0, 10);
+        assert!(
+            cursor_px(&mid, start) < 10 && cursor_px(&mid, end) < 10,
+            "neither at start nor end"
+        );
+        assert!(h.renderer.effects_animating());
+        let m = h.renderer.cell_metrics();
+        let between = (0..20)
+            .filter(|&c| cursor_px(&mid, cell(&h, 0, c)) as f32 > m.width * m.height * 0.3)
+            .count();
+        assert!(between >= 1, "drawn somewhere along the way");
+        let done = frame(&mut h, &t, t0 + Duration::from_millis(500));
+        assert!(cursor_px(&done, end) as f32 > m.width * m.height * 0.8, "arrived");
+        assert!(!h.renderer.effects_animating());
+    }
+
+    #[test]
+    fn glow_ripple_and_selection_fade() {
+        let Some(mut h) = headless() else { return };
+        let bg = Theme::default().background;
+        h.renderer.set_cursor_effects(CursorEffects {
+            glow: 1.0,
+            ripple: true,
+            selection_fade_ms: 100,
+            ..Default::default()
+        });
+        let mut t = Terminal::new(20, 6);
+        t.advance(b"\x1b[3;10H");
+        let t0 = Instant::now();
+        let img = frame(&mut h, &t, t0);
+        // Glow: the cell above the cursor is tinted, far cells are not.
+        let (x, y, w, hh) = cell(&h, 1, 9);
+        let above = img.pixel(x + w / 2, y + hh - 2);
+        assert_ne!(rgb(above), bg, "glow spills into the neighbouring cell");
+        assert_eq!(rgb(img.pixel(1, 1)), bg, "but not across the window");
+        // Ripple: a ring around the cursor a moment after a key press.
+        h.renderer.key_pressed();
+        frame(&mut h, &t, t0);
+        let img = frame(&mut h, &t, t0 + Duration::from_millis(150));
+        let (cx, cy, cw2, ch2) = cell(&h, 2, 9);
+        let (cx, cy) = (cx + cw2 / 2, cy + ch2 / 2);
+        let ring = (0..80).any(|d| rgb(img.pixel(cx + d, cy)) != bg && d > cw2 * 2);
+        assert!(ring, "ring away from the cursor");
+        assert!(h.renderer.effects_animating());
+        // Selection fades in.
+        h.renderer
+            .set_cursor_effects(CursorEffects { selection_fade_ms: 100, ..Default::default() });
+        t.start_selection(
+            seraphim_terminal::SelectionKind::Simple,
+            seraphim_terminal::Point::new(0, 0),
+        );
+        t.update_selection(seraphim_terminal::Point::new(0, 5));
+        let sel = Theme::default().selection_bg;
+        let (x, y, _, _) = cell(&h, 0, 2);
+        let first = frame(&mut h, &t, t0 + Duration::from_millis(1000));
+        let later = frame(&mut h, &t, t0 + Duration::from_millis(1200));
+        assert_eq!(rgb(first.pixel(x + 1, y + 1)), bg, "starts transparent");
+        assert_eq!(rgb(later.pixel(x + 1, y + 1)), sel, "fully in");
+    }
+
+    #[test]
+    fn blink_fade_is_partial_mid_way() {
+        let Some(mut h) = headless() else { return };
+        h.renderer.set_cursor_effects(CursorEffects { blink_fade_ms: 100, ..Default::default() });
+        let t = Terminal::new(10, 2);
+        let t0 = Instant::now();
+        let (width, height) = h.size_for(&t, PAD);
+        let view = |on| View { width, height, padding: PAD, focused: true, cursor_on: on };
+        h.renderer.set_effects_clock(Some(t0));
+        h.render(&t, view(true));
+        h.render(&t, view(false)); // blink off seen at t0
+        h.renderer.set_effects_clock(Some(t0 + Duration::from_millis(40)));
+        let img = h.render(&t, view(false));
+        let (x, y, _, _) = cell(&h, 0, 0);
+        let p = rgb(img.pixel(x + 2, y + 2));
+        let (c, bg) = (Theme::default().cursor, Theme::default().background);
+        assert!(p != c && p != bg, "half-faded: {p:?}");
+    }
+}

@@ -72,6 +72,27 @@ pub struct WindowOptions {
     pub live_reload: bool,
     /// Shown in the window at startup (e.g. a config error).
     pub notice: Option<String>,
+    pub cursor: seraphim_config::CursorFx,
+}
+
+impl WindowOptions {
+    /// Cursor effects; reduced motion keeps only the static glow.
+    fn cursor_effects(&self) -> seraphim_render::cursorfx::CursorEffects {
+        let c = &self.cursor;
+        let fx = seraphim_render::cursorfx::CursorEffects {
+            glide_ms: c.glide_ms,
+            trail: c.trail,
+            blink_fade_ms: c.blink_fade_ms,
+            glow: c.glow,
+            ripple: c.ripple,
+            selection_fade_ms: c.selection_fade_ms,
+        };
+        if self.visual.reduced_motion {
+            fx.still()
+        } else {
+            fx
+        }
+    }
 }
 
 impl Default for WindowOptions {
@@ -100,6 +121,7 @@ impl Default for WindowOptions {
             watch: Vec::new(),
             live_reload: true,
             notice: None,
+            cursor: Default::default(),
         }
     }
 }
@@ -365,6 +387,7 @@ impl App {
         if (font_px(o.font_size, scale) - renderer.fonts().size_px()).abs() > 0.1 {
             renderer.set_fonts(self.fonts_for(scale)?);
         }
+        renderer.set_cursor_effects(o.cursor_effects());
         let overlay =
             Renderer::new(&gpu.device, gpu.config.format, self.fonts_for(scale)?, o.theme.clone());
         let inner = window.inner_size();
@@ -606,6 +629,7 @@ impl App {
         };
         let a = self.active.as_mut().unwrap();
         a.renderer.set_theme(o.theme.clone());
+        a.renderer.set_cursor_effects(o.cursor_effects());
         a.overlay.set_theme(o.theme.clone());
         a.menu.close();
         a.menu_src = (o.menus.clone(), o.config_path.clone(), o.profile.clone());
@@ -1257,6 +1281,9 @@ impl Active {
         if let Some(input) = key_input(event, self.mods()) {
             let modes = self.session.terminal().modes().clone();
             let bytes = encode_key_input(&input, &modes);
+            if !bytes.is_empty() {
+                self.renderer.key_pressed();
+            }
             self.write(&bytes);
         }
     }
@@ -1452,7 +1479,10 @@ impl ApplicationHandler<UserEvent> for App {
             // Synthetic presses are replayed by winit for keys already held
             // when focus arrives; forwarding them would duplicate input.
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => a.on_key(&event),
-            WindowEvent::Ime(Ime::Commit(text)) => a.write(text.as_bytes()),
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                a.renderer.key_pressed();
+                a.write(text.as_bytes());
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 a.on_cursor_moved(position.x, position.y, pad)
             }
@@ -1543,8 +1573,9 @@ impl ApplicationHandler<UserEvent> for App {
             a.window.request_redraw();
         }
 
-        // Animated background: draw frames at up to max_fps while it moves.
-        if a.visual.animating() {
+        // Animated background or cursor effects: draw frames at up to
+        // max_fps while something moves.
+        if a.visual.animating() || a.renderer.effects_animating() {
             let next =
                 a.last_frame + Duration::from_secs_f64(1.0 / a.visual_cfg.max_fps.max(1) as f64);
             if now >= next {

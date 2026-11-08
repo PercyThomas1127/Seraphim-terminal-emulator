@@ -78,6 +78,7 @@ pub fn options_from_config(
         watch: files,
         live_reload: c.live_reload,
         notice: None,
+        cursor: c.cursor.clone(),
         menu_bar: c.window.menu_bar,
         menus: crate::menu::merge(&seraphim_config::builtin_menu(), &c.menu),
         profile: profile.to_owned(),

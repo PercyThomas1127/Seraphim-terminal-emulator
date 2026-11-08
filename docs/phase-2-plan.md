@@ -19,6 +19,7 @@
 | Menu bar (File, Edit, View, Profiles, Help, after Konsole): Alt tap, mouse, access keys, check marks, user `[[menu]]` entries; zoom, full screen, new window, select all, clear and reset | `seraphim/src/menu.rs`, `menu.toml` |
 | Inline images: Kitty graphics protocol (transmit/put/delete/query, chunked, zlib, PNG/RGB/RGBA, direct and file/temp-file transfer, source rects, cell sizes, offsets, z-index under backgrounds / under text / over text, C=1, replies with q) and Sixel (RGB/HLS palettes, raster attributes, repeats); images scroll with the text into history; `CSI 14t/16t` and the PTY's pixel size report the cell size | `seraphim-terminal/src/graphics.rs`, `sixel.rs`, `seraphim-render/src/images.rs` |
 | Live reload: config, profile, theme, preset, shader and image files are watched (polled, no extra dependency) and applied on save; in-window notices for reloads and errors, including at startup | `seraphim/src/watch.rs` |
+| Cursor and selection effects: glide, trail, blink fade, glow, typing ripples, selection fade-in (`[cursor]`), time-based, off under reduced motion | `seraphim-render/src/cursorfx.rs` |
 | Named shader colors (`palette`, `color(C_name)`), theme-relative | `seraphim-visual` |
 
 See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules.
@@ -31,5 +32,4 @@ See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules
 2. **Continuous bindings** (spec §5.3, §11.4): `[[bind]]` from metrics
    (CPU, battery) to layer parameters; event rules (`[[on]]`) are done.
 3. **More background features:** JPEG/WebP, blur, animated images.
-4. **Cursor and selection effects**, animated cursor movement (spec §6.3).
 6. **Measure animated scenes on real GPUs.**

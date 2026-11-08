@@ -50,6 +50,7 @@ pub struct Config {
     pub clipboard: Clipboard,
     pub colors: Colors,
     pub visual: Visual,
+    pub cursor: CursorFx,
     /// Background preset: a built-in name ([`BUILTIN_PRESETS`]) or a file
     /// in `presets/`; `"none"` for no preset.
     pub preset: Option<String>,
@@ -170,6 +171,7 @@ impl Default for Config {
             clipboard: Default::default(),
             colors: Default::default(),
             visual: Default::default(),
+            cursor: Default::default(),
             preset: None,
             background: Vec::new(),
             on: Vec::new(),
@@ -284,6 +286,38 @@ pub struct Visual {
     pub window_opacity: f32,
     /// Duration of crossfades when switching profiles, in milliseconds.
     pub transition_ms: u32,
+}
+
+/// Cursor and selection effects (`[cursor]`). Reduced motion turns the
+/// moving ones off.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CursorFx {
+    /// Glide between cells over this many milliseconds (0: jump).
+    pub glide_ms: u32,
+    /// Leave a fading trail while gliding.
+    pub trail: bool,
+    /// Fade the cursor in and out when blinking (0: hard blink).
+    pub blink_fade_ms: u32,
+    /// Soft glow around the cursor, 0 to 1.
+    pub glow: f32,
+    /// A ring spreads from the cursor on each key press.
+    pub ripple: bool,
+    /// Fade a new selection in over this many milliseconds.
+    pub selection_fade_ms: u32,
+}
+
+impl Default for CursorFx {
+    fn default() -> Self {
+        CursorFx {
+            glide_ms: 80,
+            trail: false,
+            blink_fade_ms: 150,
+            glow: 0.0,
+            ripple: false,
+            selection_fade_ms: 90,
+        }
+    }
 }
 
 impl Default for Visual {
@@ -661,6 +695,13 @@ impl Config {
         let v = &self.visual;
         if !(1..=1000).contains(&v.max_fps) {
             return Err(format!("visual.max_fps must be 1-1000 (got {})", v.max_fps));
+        }
+        let c = &self.cursor;
+        if !(0.0..=1.0).contains(&c.glow) {
+            return Err(format!("cursor.glow must be 0-1 (got {})", c.glow));
+        }
+        if c.glide_ms > 1000 || c.blink_fade_ms > 1000 || c.selection_fade_ms > 1000 {
+            return Err("cursor durations must be at most 1000 ms".into());
         }
         if !(0.0..=1.0).contains(&v.window_opacity) {
             return Err(format!("visual.window_opacity must be 0-1 (got {})", v.window_opacity));
