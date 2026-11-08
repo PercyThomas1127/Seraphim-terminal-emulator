@@ -152,3 +152,51 @@ fn sixel_image_renders() {
     assert_eq!(rgb(img.pixel(PAD as u32 + 5, PAD as u32 + 11)), [0, 255, 0]);
     assert_ne!(rgb(img.pixel(PAD as u32 + 20, PAD as u32 + 5)), [0, 255, 0], "16 px wide");
 }
+
+#[test]
+fn unicode_placeholders_draw_their_slice() {
+    use seraphim_terminal::graphics::{DIACRITICS, PLACEHOLDER};
+    let Some(mut h) = headless() else { return };
+    let mut t = term(&h, 10, 3);
+    let m = h.renderer.cell_metrics();
+    // 2x1 image (red | blue) shown over 2x1 cells.
+    let px = [[255u8, 0, 0, 255], [0, 0, 255, 255]].concat();
+    kitty(&mut t, "a=T,U=1,f=32,s=2,v=1,i=7,c=2,r=1,q=2", &px);
+    let d = |i: usize| char::from_u32(DIACRITICS[i]).unwrap();
+    // Explicit row/column on the first cell, inferred column on the second.
+    t.advance(
+        format!("\x1b[2;3H\x1b[38;5;7m{PLACEHOLDER}{}{}{PLACEHOLDER}\x1b[m", d(0), d(0)).as_bytes(),
+    );
+    let img = render(&mut h, &t);
+    let at = |col: f32| {
+        let x = (PAD + col * m.width) as u32;
+        let y = (PAD + 1.5 * m.height) as u32;
+        rgb(img.pixel(x, y))
+    };
+    // The 2:1 image fills the 2x1-cell box's width; vertically centered.
+    // (Linear filtering of a 2-pixel image: allow a little bleed.)
+    let near =
+        |a: [u8; 3], b: [u8; 3]| a.iter().zip(&b).all(|(x, y)| (*x as i32 - *y as i32).abs() <= 24);
+    assert!(near(at(2.5), [255, 0, 0]), "first cell: left half {:?}", at(2.5));
+    assert!(near(at(3.5), [0, 0, 255]), "second cell (column inferred): right half {:?}", at(3.5));
+    assert_eq!(at(4.5), Theme::default().background, "nothing past the placeholders");
+}
+
+#[test]
+fn kitty_animation_plays() {
+    let Some(mut h) = headless() else { return };
+    let mut t = term(&h, 10, 3);
+    kitty(&mut t, "a=T,f=32,s=1,v=1,c=2,r=1,C=1,i=3,q=2", &[255, 0, 0, 255]);
+    kitty(&mut t, "a=f,i=3,f=32,s=1,v=1,z=100,q=2", &[0, 0, 255, 255]);
+    t.advance(b"\x1b_Ga=a,i=3,r=1,z=100,s=3,v=1,q=2\x1b\\");
+    let epoch = t.graphics().image(3).unwrap().anim.epoch;
+    let at = |h: &mut Headless, ms: u64| {
+        h.renderer.set_effects_clock(Some(epoch + std::time::Duration::from_millis(ms)));
+        let img = render(h, &t);
+        rgb(img.pixel(PAD as u32 + 3, PAD as u32 + 3))
+    };
+    assert_eq!(at(&mut h, 50), [255, 0, 0]);
+    assert!(h.renderer.effects_animating(), "keeps drawing while it plays");
+    assert_eq!(at(&mut h, 150), [0, 0, 255]);
+    assert_eq!(at(&mut h, 250), [255, 0, 0], "loops");
+}

@@ -466,6 +466,9 @@ impl State {
             // primary screen).
             let history = if keep { self.scrollback.len() } else { 0 };
             self.graphics.scroll(self.alt_active, moved, history);
+        } else if !self.graphics.is_empty() {
+            // Scroll region: images inside it move with the text.
+            self.graphics.scroll_region(self.alt_active, top, bottom, -(moved as i64));
         }
         if keep {
             // Content moved up into history: keep the viewport and the
@@ -491,6 +494,10 @@ impl State {
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
         let attrs = self.cursor.attrs;
         self.grid().scroll_down(top, bottom, n, &attrs);
+        if !self.graphics.is_empty() {
+            let moved = n.min(bottom + 1 - top) as i64;
+            self.graphics.scroll_region(self.alt_active, top, bottom, moved);
+        }
         if self.selection.is_some() {
             self.invalidate_selection(top as i64, bottom as i64);
         }
@@ -644,6 +651,10 @@ impl State {
         let attrs = self.cursor.attrs;
         let (t, b) = (self.scroll_top, self.scroll_bottom);
         self.grid().scroll_up(t, b, n, &attrs, |_| {});
+        if !self.graphics.is_empty() {
+            let moved = n.min(b + 1 - t) as i64;
+            self.graphics.scroll_region(self.alt_active, t, b, -moved);
+        }
         self.damage_range(t, b);
         self.scroll_top = top;
         self.cursor.col = 0;

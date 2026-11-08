@@ -311,7 +311,7 @@ impl Renderer {
 
     /// An effect is in motion: the window should keep drawing frames.
     pub fn effects_animating(&self) -> bool {
-        self.fx.animating()
+        self.fx.animating() || self.images.animating
     }
 
     pub fn cell_metrics(&self) -> CellMetrics {
@@ -381,7 +381,8 @@ impl Renderer {
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         let m = self.fonts.metrics();
-        self.images.prepare(device, queue, term, view.padding.round(), (m.width, m.height));
+        let now = self.fx.now();
+        self.images.prepare(device, queue, term, view.padding.round(), (m.width, m.height), now);
         self.instance_count = self.instances.len() as u32;
         self.stats.instances = self.instances.len();
     }
@@ -559,7 +560,9 @@ impl Renderer {
                     fg = self.theme.cursor_text;
                 }
                 let flags = cell.attrs.flags;
-                if cell.ch != ' ' && !flags.contains(Flags::HIDDEN) {
+                // Unicode image placeholders draw as images (images.rs).
+                let placeholder = cell.ch == seraphim_terminal::graphics::PLACEHOLDER;
+                if cell.ch != ' ' && !placeholder && !flags.contains(Flags::HIDDEN) {
                     let style =
                         FontStyle::new(flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
                     let marks = row.combining(c);

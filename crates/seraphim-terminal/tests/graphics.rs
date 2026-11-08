@@ -240,3 +240,131 @@ fn random_apc_input_never_panics() {
         t.check_invariants().unwrap();
     }
 }
+
+#[test]
+fn images_move_with_scroll_regions() {
+    let mut t = Terminal::with_scrollback(20, 10, 100);
+    t.set_cell_pixel_size(10.0, 20.0);
+    let img = rgba(10, 20, [1, 1, 1, 255]);
+    // One image inside the region (rows 3-7), one outside (row 0).
+    t.advance(&apc("a=T,f=32,s=10,v=20,i=1,C=1,q=2", &img));
+    t.advance(b"\x1b[6;1H");
+    t.advance(&apc("a=T,f=32,s=10,v=20,i=2,C=1,q=2", &img));
+    t.advance(b"\x1b[3;8r\x1b[8;1H\n"); // scroll the region up one line
+    let rows = |t: &Terminal| {
+        let mut v: Vec<(u32, i64)> =
+            t.visible_images().iter().map(|v| (v.image.id, v.row)).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(rows(&t), [(1, 0), (2, 4)], "only the image in the region moved");
+    t.advance(b"\x1b[2T"); // scroll down two (SD) inside the region
+    assert_eq!(rows(&t), [(1, 0), (2, 6)]);
+    t.advance(b"\x1b[3;1H\x1b[5M"); // delete 5 lines at the region top: pushed out
+    assert_eq!(rows(&t), [(1, 0)], "scrolled out of the region");
+    // Full-screen scroll down (reverse index at the top) moves images too.
+    t.advance(b"\x1b[r\x1b[1;1H\x1bM");
+    assert_eq!(rows(&t), [(1, 1)]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shared_memory_transfer() {
+    // POSIX shm lives in /dev/shm on Linux; write the object there.
+    let name = format!("/seraphim-test-{}", std::process::id());
+    let path = format!("/dev/shm{name}");
+    if std::fs::write(&path, rgba(2, 2, [7, 8, 9, 255])).is_err() {
+        return; // no /dev/shm here
+    }
+    let mut t = term();
+    t.advance(format!("\x1b_Ga=T,t=s,f=32,s=2,v=2,i=4;{}\x1b\\", b64(name.as_bytes())).as_bytes());
+    assert_eq!(reply(&mut t), "\x1b_Gi=4;OK\x1b\\");
+    assert_eq!(&t.graphics().image(4).unwrap().rgba[..4], &[7, 8, 9, 255]);
+    assert!(!std::path::Path::new(&path).exists(), "unlinked after reading");
+    t.advance(format!("\x1b_Ga=T,t=s,i=5;{}\x1b\\", b64(b"/a/b")).as_bytes());
+    assert!(reply(&mut t).contains("EINVAL"));
+}
+
+#[test]
+fn unicode_placeholders_create_virtual_placements() {
+    use seraphim_terminal::graphics::{diacritic_value, DIACRITICS, PLACEHOLDER};
+    let mut t = term();
+    t.advance(&apc("a=T,U=1,f=32,s=4,v=2,i=42,c=4,r=2,q=2", &rgba(4, 2, [1, 2, 3, 255])));
+    assert!(t.visible_images().is_empty(), "virtual: shown only through placeholders");
+    assert_eq!((t.cursor().row, t.cursor().col), (0, 0), "no cursor movement");
+    let (img, p) = t.graphics().virtual_placement(42, 0).unwrap();
+    assert_eq!((img.id, p.cols, p.rows), (42, 4, 2));
+    // A placeholder row: fg = image id 42, diacritics row 0 / column 1.
+    let d = |i: usize| char::from_u32(DIACRITICS[i]).unwrap();
+    t.advance(format!("\x1b[38;5;42m{PLACEHOLDER}{}{}\x1b[m", d(0), d(1)).as_bytes());
+    let row = t.screen().row(0);
+    assert_eq!(row.cells[0].ch, PLACEHOLDER);
+    assert_eq!(row.combining(0), &[d(0), d(1)], "marks stay on the cell");
+    assert_eq!(diacritic_value(d(1)), Some(1));
+    assert_eq!(diacritic_value('a'), None);
+    // Clearing the screen keeps virtual placements; deleting by id doesn't.
+    t.advance(b"\x1b[2J");
+    assert!(t.graphics().virtual_placement(42, 0).is_some());
+    t.advance(b"\x1b_Ga=d,d=I,i=42\x1b\\");
+    assert!(t.graphics().virtual_placement(42, 0).is_none());
+}
+
+#[test]
+fn animation_frames_and_playback() {
+    use seraphim_terminal::graphics::PlayState;
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let mut t = term();
+    let red = rgba(2, 2, [255, 0, 0, 255]);
+    t.advance(&apc("a=T,f=32,s=2,v=2,i=9,q=2", &red));
+    // Frame 2: blue everywhere, 100 ms. Frame 3: frame 1 plus a
+    // half-transparent white pixel at (1,0), blended; frame 4 replaces.
+    t.advance(&apc("a=f,i=9,f=32,s=2,v=2,z=100", &rgba(2, 2, [0, 0, 255, 255])));
+    assert_eq!(reply(&mut t), "\x1b_Gi=9;OK\x1b\\");
+    t.advance(&apc("a=f,i=9,c=1,x=1,y=0,s=1,v=1,f=32,q=2", &[255, 255, 255, 128]));
+    t.advance(&apc("a=f,i=9,c=1,X=1,s=1,v=1,f=32,q=2", &[0, 0, 0, 0]));
+    // A frame on a background color (Y = RGBA) with no base.
+    t.advance(&apc("a=f,i=9,Y=16711935,s=1,v=1,f=32,q=2", &[0, 0, 0, 0]));
+    let img = t.graphics().image(9).unwrap();
+    assert_eq!(img.frame_count(), 5);
+    assert_eq!(&img.frame(1).0[..4], &[0, 0, 255, 255]);
+    let f3 = img.frame(2).0;
+    assert_eq!(&f3[..4], &[255, 0, 0, 255], "copied from frame 1");
+    assert_eq!(&f3[4..8], &[255, 128, 128, 255], "white at half alpha over red");
+    assert_eq!(&img.frame(3).0[..4], &[0, 0, 0, 0], "X=1 replaces, alpha too");
+    assert_eq!(&img.frame(4).0[4..8], &[0, 255, 0, 255], "Y=0x00ff00ff background");
+    assert_eq!(img.anim.gaps, [40, 100, 40, 40, 40], "default gap 40 ms");
+    assert!(!img.animating(), "stopped until told to run");
+
+    // Run, looping forever; frame 1 for 40 ms, frame 2 for 100 ms ...
+    t.advance(b"\x1b_Ga=a,i=9,s=3,v=1,q=2\x1b\\");
+    let img = t.graphics().image(9).unwrap();
+    assert_eq!(img.anim.state, PlayState::Running);
+    assert!(t.graphics().animating() || t.graphics().placements().is_empty());
+    let e = img.anim.epoch;
+    assert_eq!(img.frame_at(e + ms(10)), 0);
+    assert_eq!(img.frame_at(e + ms(60)), 1);
+    assert_eq!(img.frame_at(e + ms(150)), 2);
+    assert_eq!(img.frame_at(e + ms(260 + 10)), 0, "loops (period 260 ms)");
+    // Two passes then stop on the last frame (v=3 means 2 loops).
+    t.advance(b"\x1b_Ga=a,i=9,v=3,c=1,q=2\x1b\\");
+    let img = t.graphics().image(9).unwrap();
+    let e = img.anim.epoch;
+    assert_eq!(img.frame_at(e + ms(260 + 60)), 1, "second pass");
+    assert_eq!(img.frame_at(e + ms(600)), 4, "done: last frame");
+    // Loading mode waits on the last frame; stop freezes; c picks a frame.
+    t.advance(b"\x1b_Ga=a,i=9,s=2,v=1,c=1,q=2\x1b\\");
+    let img = t.graphics().image(9).unwrap();
+    assert_eq!(img.frame_at(img.anim.epoch + ms(2000)), 4);
+    t.advance(b"\x1b_Ga=a,i=9,s=1,c=3,q=2\x1b\\");
+    let img = t.graphics().image(9).unwrap();
+    assert_eq!(img.frame_at(img.anim.epoch + ms(5000)), 2);
+    // Gap change for frame 2 (r=2, z=500).
+    t.advance(b"\x1b_Ga=a,i=9,r=2,z=500,q=2\x1b\\");
+    assert_eq!(t.graphics().image(9).unwrap().anim.gaps[1], 500);
+    // Errors.
+    t.advance(&apc("a=f,i=404,f=32,s=1,v=1", &[0; 4]));
+    assert!(reply(&mut t).contains("ENOENT"));
+    t.advance(b"\x1b_Ga=c,i=9\x1b\\");
+    assert!(reply(&mut t).contains("EINVAL"));
+}

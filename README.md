@@ -216,9 +216,11 @@ replaces it).
 Programs can show pictures inline with the **Kitty graphics protocol**
 (`kitten icat`, `timg`, `chafa -f kitty`, yazi, ...) or **Sixel**
 (`img2sixel`, `chafa -f sixel`, gnuplot, ...). Images scroll with the text
-into the history and can sit under or over the text (kitty z-index). The
-PTY reports pixel sizes, so tools size pictures correctly. Animation and
-Unicode placeholders (used through tmux) are not supported yet.
+into the history, move with scroll regions, and can sit under or over the
+text (kitty z-index). Kitty animations play, Unicode placeholders work (so
+images show through tmux), and local tools can hand images over through
+shared memory or files. The PTY reports pixel sizes, so tools size
+pictures correctly.
 
 ### Configuration
 

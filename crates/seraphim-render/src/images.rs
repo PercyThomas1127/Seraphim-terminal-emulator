@@ -5,8 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use seraphim_terminal::graphics::BELOW_BACKGROUND;
-use seraphim_terminal::Terminal;
+use seraphim_terminal::graphics::{
+    diacritic_value, Image, Placement, BELOW_BACKGROUND, PLACEHOLDER,
+};
+use seraphim_terminal::{Color, Terminal};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -40,6 +42,8 @@ pub(crate) struct Images {
     capacity: usize,
     draws: Vec<Draw>,
     max_side: u32,
+    /// A drawn image is playing an animation.
+    pub animating: bool,
 }
 
 /// Which layer a z-index belongs to.
@@ -155,6 +159,7 @@ impl Images {
             capacity,
             draws: Vec::new(),
             max_side: device.limits().max_texture_dimension_2d,
+            animating: false,
         }
     }
 
@@ -175,26 +180,40 @@ impl Images {
         term: &Terminal,
         pad: f32,
         cell: (f32, f32),
+        now: std::time::Instant,
     ) {
         self.draws.clear();
+        self.animating = false;
         let visible = term.visible_images();
         // Drop textures of images the terminal no longer has.
         if !self.textures.is_empty() {
-            let alive: HashSet<u64> = term.graphics().images().map(|i| i.key).collect();
+            let alive: HashSet<u64> = term
+                .graphics()
+                .images()
+                .flat_map(|i| std::iter::once(i.key).chain(i.anim.frames.iter().map(|f| f.key)))
+                .collect();
             self.textures.retain(|k, _| alive.contains(k));
         }
-        if visible.is_empty() {
+        let placeholders =
+            if term.graphics().has_virtual() { placeholder_cells(term) } else { Vec::new() };
+        if visible.is_empty() && placeholders.is_empty() {
             return;
         }
         let (cw, ch) = cell;
         let mut quads: Vec<(usize, u64, Quad)> = Vec::with_capacity(visible.len());
+        for ph in &placeholders {
+            let Some((img, p)) = term.graphics().virtual_placement(ph.image, ph.placement) else {
+                continue;
+            };
+            if let Some(q) = placeholder_quad(img, p, ph, pad, (cw, ch)) {
+                let key = self.frame_texture(device, queue, img, now);
+                quads.push((layer(p.z), key, q));
+            }
+        }
         for v in &visible {
             let p = v.placement;
             let img = v.image;
-            if !self.textures.contains_key(&img.key) {
-                let t = self.upload(device, queue, img.width, img.height, &img.rgba);
-                self.textures.insert(img.key, t);
-            }
+            let key = self.frame_texture(device, queue, img, now);
             let x = (pad + p.col as f32 * cw + p.offset[0] as f32).round();
             let y = (pad + v.row as f32 * ch + p.offset[1] as f32).round();
             let (w, h) = if p.fill {
@@ -212,7 +231,7 @@ impl Images {
                 p.src[2] as f32 / iw,
                 p.src[3] as f32 / ih,
             ];
-            quads.push((layer(p.z), img.key, Quad { rect: [x, y, w, h], uv }));
+            quads.push((layer(p.z), key, Quad { rect: [x, y, w, h], uv }));
         }
         // Stable: within a layer, z order (already sorted) is kept.
         quads.sort_by_key(|q| q.0);
@@ -231,6 +250,26 @@ impl Images {
                 _ => self.draws.push(Draw { key: *key, layer: *layer, range: i..i + 1 }),
             }
         }
+    }
+
+    /// The texture key for the frame of `img` to show now, uploading it on
+    /// first use.
+    fn frame_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        img: &Image,
+        now: std::time::Instant,
+    ) -> u64 {
+        if img.animating() {
+            self.animating = true;
+        }
+        let (rgba, key) = img.frame(img.frame_at(now));
+        if !self.textures.contains_key(&key) {
+            let t = self.upload(device, queue, img.width, img.height, rgba);
+            self.textures.insert(key, t);
+        }
+        key
     }
 
     fn upload(
@@ -321,4 +360,106 @@ impl Images {
     pub fn is_empty(&self) -> bool {
         self.draws.is_empty()
     }
+}
+
+/// A placeholder cell resolved to (image, placement, row, column).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlaceholderCell {
+    view_row: usize,
+    view_col: usize,
+    image: u32,
+    placement: u32,
+    row: u32,
+    col: u32,
+}
+
+/// The id a placeholder color encodes: 24-bit RGB or a palette index.
+fn color_id(c: Color) -> u32 {
+    match c {
+        Color::Rgb(r, g, b) => (r as u32) << 16 | (g as u32) << 8 | b as u32,
+        Color::Indexed(i) => i as u32,
+        Color::Default => 0,
+    }
+}
+
+/// Every placeholder cell in the viewport. Missing row/column diacritics
+/// are inferred from the cell to the left, as the kitty spec allows.
+fn placeholder_cells(term: &Terminal) -> Vec<PlaceholderCell> {
+    let mut out = Vec::new();
+    for r in 0..term.rows() {
+        let row = term.visible_row(r);
+        let mut prev: Option<PlaceholderCell> = None;
+        for (c, cell) in row.cells.iter().enumerate().take(term.cols()) {
+            if cell.ch != PLACEHOLDER {
+                prev = None;
+                continue;
+            }
+            let marks = row.combining(c);
+            let vals: Vec<Option<u32>> = marks.iter().map(|&m| diacritic_value(m)).collect();
+            let mut image = color_id(cell.attrs.fg);
+            if let Some(Some(high)) = vals.get(2) {
+                image |= high << 24;
+            }
+            let placement = color_id(cell.attrs.underline_color);
+            let continues = |p: &PlaceholderCell| p.image == image && p.placement == placement;
+            let (prow, pcol) = match prev.filter(continues) {
+                Some(p) => (Some(p.row), Some(p.col + 1)),
+                None => (None, None),
+            };
+            let row_v = vals.first().copied().flatten().or(prow).unwrap_or(0);
+            let col_v = match vals.get(1).copied().flatten() {
+                Some(v) => v,
+                // Same row as the cell before: the next column.
+                None if prow == Some(row_v) => pcol.unwrap_or(0),
+                None => 0,
+            };
+            let ph = PlaceholderCell {
+                view_row: r,
+                view_col: c,
+                image,
+                placement,
+                row: row_v,
+                col: col_v,
+            };
+            if image != 0 {
+                out.push(ph);
+            }
+            prev = Some(ph);
+        }
+    }
+    out
+}
+
+/// The slice of a virtual placement shown in one placeholder cell. The
+/// image is fitted (aspect kept, centered) into the placement's cell box.
+fn placeholder_quad(
+    img: &Image,
+    p: &Placement,
+    ph: &PlaceholderCell,
+    pad: f32,
+    (cw, ch): (f32, f32),
+) -> Option<Quad> {
+    let (bw, bh) = (p.cols as f32 * cw, p.rows as f32 * ch);
+    let (sw, sh) = (p.src[2].max(1) as f32, p.src[3].max(1) as f32);
+    let s = (bw / sw).min(bh / sh);
+    let (iw, ih) = (sw * s, sh * s);
+    let (ox, oy) = ((bw - iw) / 2.0, (bh - ih) / 2.0);
+    // This cell's rectangle inside the box, clipped to the image.
+    let (cx, cy) = (ph.col as f32 * cw, ph.row as f32 * ch);
+    let x0 = cx.max(ox);
+    let y0 = cy.max(oy);
+    let x1 = (cx + cw).min(ox + iw);
+    let y1 = (cy + ch).min(oy + ih);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let screen_x = pad + ph.view_col as f32 * cw + (x0 - cx);
+    let screen_y = pad + ph.view_row as f32 * ch + (y0 - cy);
+    let (fw, fh) = (img.width.max(1) as f32, img.height.max(1) as f32);
+    let u0 = (p.src[0] as f32 + (x0 - ox) / s) / fw;
+    let v0 = (p.src[1] as f32 + (y0 - oy) / s) / fh;
+    Some(Quad {
+        rect: [screen_x, screen_y, x1 - x0, y1 - y0],
+        uv: [u0, v0, (x1 - x0) / s / fw, (y1 - y0) / s / fh],
+    })
 }

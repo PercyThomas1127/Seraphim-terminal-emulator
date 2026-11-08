@@ -11,8 +11,9 @@
 //! RGB, RGBA and PNG; zlib compression (`o=z`); chunked transfers (`m=1`);
 //! direct data and files (`t=d`, `t=f`, `t=t`); source rectangles,
 //! cell offsets, sizes in cells, z-index and `C=1`. Not supported yet:
-//! animation (`a=f/a/c`), shared memory (`t=s`) and Unicode placeholders
-//! (`U=1`); those are answered with an error.
+//! composing frames (`a=c`), answered with an error. Animation frames and
+//! playback (`a=f`, `a=a`), shared memory (`t=s`) and Unicode placeholders
+//! (`U=1`, see [`PLACEHOLDER`]) are supported.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,6 +41,107 @@ pub struct Image {
     /// No id from the client (Sixel, anonymous kitty images): dropped as
     /// soon as nothing shows it.
     transient: bool,
+    /// Animation: frames after the first (`rgba` is frame 1) and playback.
+    pub anim: Animation,
+}
+
+/// Default gap between frames, in milliseconds (kitty's).
+pub const DEFAULT_GAP: u32 = 40;
+/// Frames kept per image.
+pub const MAX_FRAMES: usize = 1000;
+
+/// One frame after the first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub rgba: Arc<Vec<u8>>,
+    /// Texture cache key, unique per frame contents.
+    pub key: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlayState {
+    #[default]
+    Stopped,
+    /// Play, but wait on the last frame for more to arrive.
+    Loading,
+    Running,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Animation {
+    pub frames: Vec<Frame>,
+    /// Gap after each frame (frame 1 first), ms; 0 = shown only in passing.
+    pub gaps: Vec<u32>,
+    pub state: PlayState,
+    /// Loops to play: 0 forever, else this many passes.
+    pub loops: u32,
+    /// Frame shown while stopped (0-based), and where playback started.
+    pub current: usize,
+    /// When playback (re)started.
+    pub epoch: std::time::Instant,
+}
+
+impl Default for Animation {
+    fn default() -> Self {
+        Animation {
+            frames: Vec::new(),
+            gaps: vec![DEFAULT_GAP],
+            state: PlayState::Stopped,
+            loops: 0,
+            current: 0,
+            epoch: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Image {
+    pub fn frame_count(&self) -> usize {
+        1 + self.anim.frames.len()
+    }
+
+    /// Whether it changes over time right now.
+    pub fn animating(&self) -> bool {
+        self.frame_count() > 1 && self.anim.state != PlayState::Stopped
+    }
+
+    /// The frame index to show at `now`.
+    pub fn frame_at(&self, now: std::time::Instant) -> usize {
+        let a = &self.anim;
+        let n = self.frame_count();
+        if n == 1 || a.state == PlayState::Stopped {
+            return a.current.min(n - 1);
+        }
+        let gaps: Vec<u64> =
+            (0..n).map(|i| a.gaps.get(i).copied().unwrap_or(DEFAULT_GAP) as u64).collect();
+        let period: u64 = gaps.iter().sum::<u64>().max(1);
+        let mut t = now.saturating_duration_since(a.epoch).as_millis() as u64;
+        // Playback starts at `current`: offset by the time before it.
+        t += gaps[..a.current.min(n - 1)].iter().sum::<u64>();
+        let last = n - 1;
+        let finished = match a.state {
+            PlayState::Loading => t >= period - gaps[last],
+            _ => a.loops > 0 && t >= period * a.loops as u64,
+        };
+        if finished {
+            return last;
+        }
+        let mut t = t % period;
+        for (i, g) in gaps.iter().enumerate() {
+            if t < *g {
+                return i;
+            }
+            t -= g;
+        }
+        last
+    }
+
+    /// RGBA and texture key of frame `i` (0-based).
+    pub fn frame(&self, i: usize) -> (&Arc<Vec<u8>>, u64) {
+        match i.checked_sub(1).and_then(|j| self.anim.frames.get(j)) {
+            Some(f) => (&f.rgba, f.key),
+            None => (&self.rgba, self.key),
+        }
+    }
 }
 
 /// An image shown on the grid.
@@ -66,6 +168,49 @@ pub struct Placement {
     /// Below text when negative; below cell backgrounds under
     /// [`BELOW_BACKGROUND`].
     pub z: i32,
+    /// A virtual placement (`U=1`): shown only through placeholder cells,
+    /// not anchored to the grid.
+    pub virtual_: bool,
+}
+
+/// The Unicode placeholder character: cells holding it show part of a
+/// virtual placement (`U=1`). Combining marks from [`DIACRITICS`] give the
+/// row, the column and the image id's high byte; the foreground color gives
+/// the image id, the underline color the placement id.
+pub const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// Row/column diacritics, in order (index = value), from the kitty spec.
+pub const DIACRITICS: [u32; 297] = [
+    0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F, 0x0346, 0x034A, 0x034B, 0x034C,
+    0x0350, 0x0351, 0x0352, 0x0357, 0x035B, 0x0363, 0x0364, 0x0365, 0x0366, 0x0367, 0x0368, 0x0369,
+    0x036A, 0x036B, 0x036C, 0x036D, 0x036E, 0x036F, 0x0483, 0x0484, 0x0485, 0x0486, 0x0487, 0x0592,
+    0x0593, 0x0594, 0x0595, 0x0597, 0x0598, 0x0599, 0x059C, 0x059D, 0x059E, 0x059F, 0x05A0, 0x05A1,
+    0x05A8, 0x05A9, 0x05AB, 0x05AC, 0x05AF, 0x05C4, 0x0610, 0x0611, 0x0612, 0x0613, 0x0614, 0x0615,
+    0x0616, 0x0617, 0x0657, 0x0658, 0x0659, 0x065A, 0x065B, 0x065D, 0x065E, 0x06D6, 0x06D7, 0x06D8,
+    0x06D9, 0x06DA, 0x06DB, 0x06DC, 0x06DF, 0x06E0, 0x06E1, 0x06E2, 0x06E4, 0x06E7, 0x06E8, 0x06EB,
+    0x06EC, 0x0730, 0x0732, 0x0733, 0x0735, 0x0736, 0x073A, 0x073D, 0x073F, 0x0740, 0x0741, 0x0743,
+    0x0745, 0x0747, 0x0749, 0x074A, 0x07EB, 0x07EC, 0x07ED, 0x07EE, 0x07EF, 0x07F0, 0x07F1, 0x07F3,
+    0x0816, 0x0817, 0x0818, 0x0819, 0x081B, 0x081C, 0x081D, 0x081E, 0x081F, 0x0820, 0x0821, 0x0822,
+    0x0823, 0x0825, 0x0826, 0x0827, 0x0829, 0x082A, 0x082B, 0x082C, 0x082D, 0x0951, 0x0953, 0x0954,
+    0x0F82, 0x0F83, 0x0F86, 0x0F87, 0x135D, 0x135E, 0x135F, 0x17DD, 0x193A, 0x1A17, 0x1A75, 0x1A76,
+    0x1A77, 0x1A78, 0x1A79, 0x1A7A, 0x1A7B, 0x1A7C, 0x1B6B, 0x1B6D, 0x1B6E, 0x1B6F, 0x1B70, 0x1B71,
+    0x1B72, 0x1B73, 0x1CD0, 0x1CD1, 0x1CD2, 0x1CDA, 0x1CDB, 0x1CE0, 0x1DC0, 0x1DC1, 0x1DC3, 0x1DC4,
+    0x1DC5, 0x1DC6, 0x1DC7, 0x1DC8, 0x1DC9, 0x1DCB, 0x1DCC, 0x1DD1, 0x1DD2, 0x1DD3, 0x1DD4, 0x1DD5,
+    0x1DD6, 0x1DD7, 0x1DD8, 0x1DD9, 0x1DDA, 0x1DDB, 0x1DDC, 0x1DDD, 0x1DDE, 0x1DDF, 0x1DE0, 0x1DE1,
+    0x1DE2, 0x1DE3, 0x1DE4, 0x1DE5, 0x1DE6, 0x1DFE, 0x20D0, 0x20D1, 0x20D4, 0x20D5, 0x20D6, 0x20D7,
+    0x20DB, 0x20DC, 0x20E1, 0x20E7, 0x20E9, 0x20F0, 0x2CEF, 0x2CF0, 0x2CF1, 0x2DE0, 0x2DE1, 0x2DE2,
+    0x2DE3, 0x2DE4, 0x2DE5, 0x2DE6, 0x2DE7, 0x2DE8, 0x2DE9, 0x2DEA, 0x2DEB, 0x2DEC, 0x2DED, 0x2DEE,
+    0x2DEF, 0x2DF0, 0x2DF1, 0x2DF2, 0x2DF3, 0x2DF4, 0x2DF5, 0x2DF6, 0x2DF7, 0x2DF8, 0x2DF9, 0x2DFA,
+    0x2DFB, 0x2DFC, 0x2DFD, 0x2DFE, 0x2DFF, 0xA66F, 0xA67C, 0xA67D, 0xA6F0, 0xA6F1, 0xA8E0, 0xA8E1,
+    0xA8E2, 0xA8E3, 0xA8E4, 0xA8E5, 0xA8E6, 0xA8E7, 0xA8E8, 0xA8E9, 0xA8EA, 0xA8EB, 0xA8EC, 0xA8ED,
+    0xA8EE, 0xA8EF, 0xA8F0, 0xA8F1, 0xAAB0, 0xAAB2, 0xAAB3, 0xAAB7, 0xAAB8, 0xAABE, 0xAABF, 0xAAC1,
+    0xFE20, 0xFE21, 0xFE22, 0xFE23, 0xFE24, 0xFE25, 0xFE26, 0x10A0F, 0x10A38, 0x1D185, 0x1D186,
+    0x1D187, 0x1D188, 0x1D189, 0x1D1AA, 0x1D1AB, 0x1D1AC, 0x1D1AD, 0x1D242, 0x1D243, 0x1D244,
+];
+
+/// The number a placeholder diacritic stands for.
+pub fn diacritic_value(c: char) -> Option<u32> {
+    DIACRITICS.binary_search(&(c as u32)).ok().map(|i| i as u32)
 }
 
 /// z-index under which an image is drawn below cell backgrounds too.
@@ -253,6 +398,21 @@ impl Graphics {
         self.placements.is_empty()
     }
 
+    /// Any virtual placements (so renderers know to look for placeholders).
+    pub fn has_virtual(&self) -> bool {
+        self.placements.iter().any(|p| p.virtual_)
+    }
+
+    /// The virtual placement a placeholder cell refers to: by image id and
+    /// placement id (0: the newest virtual placement of that image).
+    pub fn virtual_placement(&self, image: u32, placement: u32) -> Option<(&Image, &Placement)> {
+        let p =
+            self.placements.iter().rev().find(|p| {
+                p.virtual_ && p.image == image && (placement == 0 || p.id == placement)
+            })?;
+        Some((self.images.get(&image)?, p))
+    }
+
     /// Lines scrolled off the top of a screen so far.
     pub fn scrolled(&self, alt: bool) -> i64 {
         self.scrolled[alt as usize]
@@ -271,11 +431,43 @@ impl Graphics {
         // Gone once their last row has left the history too.
         let oldest = self.scrolled[alt as usize] - history as i64;
         let before = self.placements.len();
-        self.placements.retain(|p| p.alt != alt || p.line + p.rows as i64 > oldest);
+        self.placements.retain(|p| p.virtual_ || p.alt != alt || p.line + p.rows as i64 > oldest);
         if self.placements.len() != before {
             self.drop_unused();
         }
         self.changed();
+    }
+
+    /// Rows `top..=bottom` of a screen scrolled by `delta` lines (negative:
+    /// up). Images entirely inside the region move with it; one pushed out
+    /// of the region is removed. Images not inside it stay put.
+    pub(crate) fn scroll_region(&mut self, alt: bool, top: usize, bottom: usize, delta: i64) {
+        let base = self.scrolled[alt as usize];
+        let (t, b) = (top as i64, bottom as i64);
+        let before = self.placements.len();
+        let mut moved = false;
+        self.placements.retain_mut(|p| {
+            if p.alt != alt || p.virtual_ {
+                return true;
+            }
+            let (r0, r1) = (p.line - base, p.line - base + p.rows as i64 - 1);
+            if r0 < t || r1 > b {
+                return true;
+            }
+            moved = true;
+            let n0 = r0 + delta;
+            if n0 < t || n0 + p.rows as i64 - 1 > b {
+                return false;
+            }
+            p.line += delta;
+            true
+        });
+        if self.placements.len() != before {
+            self.drop_unused();
+        }
+        if moved {
+            self.changed();
+        }
     }
 
     /// Placements visible in a `rows`-row viewport scrolled back by
@@ -290,7 +482,7 @@ impl Graphics {
         let mut out: Vec<VisiblePlacement> = self
             .placements
             .iter()
-            .filter(|p| p.alt == alt)
+            .filter(|p| p.alt == alt && !p.virtual_)
             .filter_map(|p| {
                 let row = p.line - top;
                 if row + p.rows as i64 <= 0 || row >= rows as i64 {
@@ -309,7 +501,7 @@ impl Graphics {
         let base = self.scrolled[alt as usize];
         let before = self.placements.len();
         self.placements.retain(|p| {
-            if p.alt != alt {
+            if p.alt != alt || p.virtual_ {
                 return true;
             }
             match rows {
@@ -356,8 +548,19 @@ impl Graphics {
         }
         let key = self.next_key;
         self.next_key += 1;
-        self.images
-            .insert(id, Image { id, number, width, height, rgba: Arc::new(rgba), key, transient });
+        self.images.insert(
+            id,
+            Image {
+                id,
+                number,
+                width,
+                height,
+                rgba: Arc::new(rgba),
+                key,
+                transient,
+                anim: Animation::default(),
+            },
+        );
         self.order.push(id);
         self.enforce_quota(id);
         self.changed();
@@ -374,7 +577,9 @@ impl Graphics {
     }
 
     fn enforce_quota(&mut self, keep: u32) {
-        let mut used: usize = self.images.values().map(|i| i.rgba.len()).sum();
+        let size =
+            |i: &Image| i.rgba.len() + i.anim.frames.iter().map(|f| f.rgba.len()).sum::<usize>();
+        let mut used: usize = self.images.values().map(size).sum();
         if used <= QUOTA_BYTES {
             return;
         }
@@ -386,7 +591,7 @@ impl Graphics {
                 let shown = self.placements.iter().any(|p| p.image == id);
                 if id != keep && (pass == 1 || !shown) {
                     if let Some(img) = self.images.remove(&id) {
-                        used -= img.rgba.len();
+                        used -= size(&img);
                     }
                     self.placements.retain(|p| p.image != id);
                     self.order.remove(i);
@@ -455,6 +660,7 @@ impl Graphics {
             rows,
             fill: false,
             z: 0,
+            virtual_: false,
         });
         (cols, rows)
     }
@@ -515,7 +721,21 @@ impl Graphics {
                 self.delete(&cmd, ctx);
                 Effect::default()
             }
-            b'f' | b'a' | b'c' => respond(&cmd, "EINVAL:animation is not supported"),
+            b'f' => {
+                if self.resolve(&cmd).is_none() {
+                    return respond(&cmd, "ENOENT:no such image");
+                }
+                let mut l = Loading { cmd, data: Vec::new(), pending: Vec::new(), failed: None };
+                l.feed(payload);
+                if l.cmd.more {
+                    self.loading = Some(l);
+                    return Effect::default();
+                }
+                l.end();
+                self.finish(l.cmd, l.data, l.failed, ctx)
+            }
+            b'a' => self.control(&cmd),
+            b'c' => respond(&cmd, "EINVAL:composing frames (a=c) is not supported"),
             _ => respond(&cmd, "EINVAL:unknown action"),
         }
     }
@@ -540,9 +760,6 @@ impl Graphics {
         if let Some(e) = failed {
             return respond(&cmd, &e);
         }
-        if cmd.unicode {
-            return respond(&cmd, "EINVAL:unicode placeholders are not supported");
-        }
         let decoded = decode(&cmd, data);
         let (w, h, rgba) = match decoded {
             Ok(d) => d,
@@ -551,6 +768,9 @@ impl Graphics {
         if cmd.action == b'q' {
             return respond(&cmd, "OK");
         }
+        if cmd.action == b'f' {
+            return self.add_frame(&cmd, w, h, rgba);
+        }
         let id = self.add_image(cmd.id, cmd.number, w, h, rgba);
         // With only an image number, the reply names the id we chose.
         let cmd = if cmd.number != 0 { Cmd { id, ..cmd } } else { cmd };
@@ -558,6 +778,127 @@ impl Graphics {
             return self.put(&cmd, id, ctx);
         }
         respond(&cmd, "OK")
+    }
+
+    /// `a=f`: a new frame (or an edit of frame `r`), composited from base
+    /// frame `c` or a background color `Y`, with `s x v` data at `x, y`
+    /// (alpha-blended, or replacing with `X=1`), shown for `z` ms.
+    fn add_frame(&mut self, cmd: &Cmd, w: u32, h: u32, data: Vec<u8>) -> Effect {
+        let Some(id) = self.resolve(cmd) else { return respond(cmd, "ENOENT:no such image") };
+        let key = self.next_key;
+        self.next_key += 1;
+        let img = self.images.get_mut(&id).expect("resolved");
+        let n = img.frame_count();
+        let (iw, ih) = (img.width as usize, img.height as usize);
+        let edit = (cmd.rows as usize).checked_sub(1).filter(|&r| r < n);
+        if edit.is_none() && n >= MAX_FRAMES {
+            return respond(cmd, "ENOSPC:too many frames");
+        }
+        // The canvas: the frame being edited, a base frame, or a color.
+        let mut canvas: Vec<u8> =
+            match (edit, (cmd.cols as usize).checked_sub(1).filter(|&c| c < n)) {
+                (Some(r), _) => img.frame(r).0.as_ref().clone(),
+                (None, Some(c)) => img.frame(c).0.as_ref().clone(),
+                (None, None) => {
+                    let [r, g, b, a] = cmd.off_y.to_be_bytes();
+                    [r, g, b, a].repeat(iw * ih)
+                }
+            };
+        let (x0, y0) = (cmd.x as usize, cmd.y as usize);
+        let replace = cmd.off_x == 1;
+        for y in 0..(h as usize) {
+            let ty = y0 + y;
+            if ty >= ih {
+                break;
+            }
+            for x in 0..(w as usize) {
+                let tx = x0 + x;
+                if tx >= iw {
+                    break;
+                }
+                let s = &data[(y * w as usize + x) * 4..][..4];
+                let d = &mut canvas[(ty * iw + tx) * 4..][..4];
+                if replace || s[3] == 255 {
+                    d.copy_from_slice(s);
+                } else if s[3] > 0 {
+                    // Straight-alpha "over".
+                    let (sa, da) = (s[3] as f32 / 255.0, d[3] as f32 / 255.0);
+                    let oa = sa + da * (1.0 - sa);
+                    for c in 0..3 {
+                        let v = (s[c] as f32 * sa + d[c] as f32 * da * (1.0 - sa)) / oa.max(1e-6);
+                        d[c] = v.round() as u8;
+                    }
+                    d[3] = (oa * 255.0).round() as u8;
+                }
+            }
+        }
+        let gap = if cmd.z > 0 {
+            cmd.z as u32
+        } else if cmd.z < 0 {
+            0
+        } else {
+            DEFAULT_GAP
+        };
+        match edit {
+            Some(0) => {
+                img.rgba = Arc::new(canvas);
+                img.key = key;
+            }
+            Some(r) => img.anim.frames[r - 1] = Frame { rgba: Arc::new(canvas), key },
+            None => img.anim.frames.push(Frame { rgba: Arc::new(canvas), key }),
+        }
+        let index = edit.unwrap_or(n);
+        if img.anim.gaps.len() <= index {
+            img.anim.gaps.resize(index + 1, DEFAULT_GAP);
+        }
+        if cmd.z != 0 || edit.is_none() {
+            img.anim.gaps[index] = gap;
+        }
+        self.enforce_quota(id);
+        self.changed();
+        respond(cmd, "OK")
+    }
+
+    /// `a=a`: playback state `s` (1 stop, 2 loading, 3 run), current frame
+    /// `c`, loops `v`, gap `z` of frame `r`.
+    fn control(&mut self, cmd: &Cmd) -> Effect {
+        let Some(id) = self.resolve(cmd) else { return respond(cmd, "ENOENT:no such image") };
+        let img = self.images.get_mut(&id).expect("resolved");
+        let n = img.frame_count();
+        let now = std::time::Instant::now();
+        // Freeze where it is before changing anything.
+        img.anim.current = img.frame_at(now);
+        img.anim.epoch = now;
+        if let Some(r) = (cmd.rows as usize).checked_sub(1).filter(|&r| r < n) {
+            if img.anim.gaps.len() <= r {
+                img.anim.gaps.resize(r + 1, DEFAULT_GAP);
+            }
+            if cmd.z != 0 {
+                img.anim.gaps[r] = cmd.z.max(0) as u32;
+            }
+        }
+        if let Some(c) = (cmd.cols as usize).checked_sub(1).filter(|&c| c < n) {
+            img.anim.current = c;
+        }
+        match cmd.width {
+            1 => img.anim.state = PlayState::Stopped,
+            2 => img.anim.state = PlayState::Loading,
+            3 => img.anim.state = PlayState::Running,
+            _ => {}
+        }
+        // v: 0 leaves it, 1 loops forever, n plays n-1 loops.
+        match cmd.height {
+            0 => {}
+            1 => img.anim.loops = 0,
+            v => img.anim.loops = v - 1,
+        }
+        self.changed();
+        respond(cmd, "OK")
+    }
+
+    /// Any visible image is playing an animation.
+    pub fn animating(&self) -> bool {
+        self.placements.iter().any(|p| self.images.get(&p.image).is_some_and(Image::animating))
     }
 
     fn put(&mut self, cmd: &Cmd, id: u32, ctx: Ctx) -> Effect {
@@ -599,9 +940,10 @@ impl Graphics {
             rows,
             fill,
             z: cmd.z,
+            virtual_: cmd.unicode,
         });
         let mut e = respond(cmd, "OK");
-        if !cmd.no_move {
+        if !cmd.no_move && !cmd.unicode {
             e.cursor_move = Some((cols, rows));
         }
         e
@@ -626,6 +968,11 @@ impl Graphics {
             }
             let r = p.line - base;
             let on_screen = r + p.rows as i64 > 0 && r < screen_rows;
+            let positional =
+                matches!(cmd.delete.to_ascii_lowercase(), b'a' | b'c' | b'p' | b'q' | b'x' | b'y');
+            if p.virtual_ && positional {
+                return true;
+            }
             let gone = match cmd.delete.to_ascii_lowercase() {
                 b'a' => on_screen,
                 b'i' => p.image == cmd.id && (cmd.placement == 0 || p.id == cmd.placement),
@@ -707,7 +1054,7 @@ fn decode(cmd: &Cmd, data: Vec<u8>) -> Result<(u32, u32, Vec<u8>), String> {
     let data = match cmd.medium {
         b'd' => data,
         b'f' | b't' => read_file(cmd, &data)?,
-        b's' => return Err("EINVAL:shared memory transmission is not supported".into()),
+        b's' => read_shm(cmd, &data)?,
         _ => return Err("EINVAL:unknown transmission medium".into()),
     };
     let data = match cmd.compression {
@@ -781,6 +1128,41 @@ fn read_file(cmd: &Cmd, path: &[u8]) -> Result<Vec<u8>, String> {
         let _ = std::fs::remove_file(path);
     }
     Ok(data)
+}
+
+/// `t=s`: the payload names a POSIX shared-memory object, which is read
+/// and then unlinked (the client hands it over).
+#[cfg(unix)]
+fn read_shm(cmd: &Cmd, name: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek};
+    use std::os::fd::FromRawFd;
+    let name = std::str::from_utf8(name).map_err(|_| "EINVAL:name is not UTF-8")?;
+    if name.is_empty() || name[1..].contains('/') || name.contains('\0') {
+        return Err("EINVAL:bad shared memory name".into());
+    }
+    let c = std::ffi::CString::new(name).map_err(|_| "EINVAL:bad shared memory name")?;
+    // SAFETY: c is a valid NUL-terminated string; the fd is owned below.
+    let fd = unsafe { libc::shm_open(c.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return Err(format!("ENOENT:{}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd was just opened and is not used elsewhere.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    // SAFETY: as above.
+    unsafe { libc::shm_unlink(c.as_ptr()) };
+    if cmd.file_offset > 0 {
+        f.seek(std::io::SeekFrom::Start(cmd.file_offset as u64))
+            .map_err(|e| format!("EINVAL:{e}"))?;
+    }
+    let limit = if cmd.size > 0 { cmd.size } else { MAX_TRANSMISSION };
+    let mut data = Vec::new();
+    f.take(limit as u64).read_to_end(&mut data).map_err(|e| format!("EIO:{e}"))?;
+    Ok(data)
+}
+
+#[cfg(not(unix))]
+fn read_shm(_: &Cmd, _: &[u8]) -> Result<Vec<u8>, String> {
+    Err("EINVAL:shared memory transmission is not supported here".into())
 }
 
 fn png_rgba(data: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
