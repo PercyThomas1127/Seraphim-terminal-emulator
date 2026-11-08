@@ -17,6 +17,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod actions;
 mod window;
 
 use seraphim_events::EventBus;
@@ -139,6 +140,7 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
             }
             "--cols" => o.cols = value("--cols")?.parse().map_err(|_| "--cols needs a number")?,
             "--rows" => o.rows = value("--rows")?.parse().map_err(|_| "--rows needs a number")?,
+            "--allow-clipboard-read" => o.allow_clipboard_read = true,
             "-e" | "--" => {
                 let rest: Vec<&String> = it.by_ref().collect();
                 let (prog, args) = rest.split_first().ok_or("-e needs a PROGRAM")?;
@@ -154,7 +156,7 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [-e PROGRAM [ARGS...]]\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [-e PROGRAM [ARGS...]]\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),

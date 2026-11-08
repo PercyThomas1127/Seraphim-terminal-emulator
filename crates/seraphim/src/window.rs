@@ -3,20 +3,31 @@
 //! Threading: the event loop thread owns the window, surface and renderer.
 //! The session's I/O thread never touches them; it only pokes the loop via
 //! an `EventLoopProxy`, and the loop redraws (coalesced, vsync-paced) when
-//! it gets around to it. No frames are rendered while nothing changes.
+//! it gets around to it. No frames are rendered while nothing changes; the
+//! only timer is cursor blinking, and only when the application asked for a
+//! blinking cursor.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use seraphim_events::EventBus;
 use seraphim_render::{FontConfig, Fonts, Renderer, Theme, View};
-use seraphim_session::{Command, Notifier, Session, SessionConfig};
-use seraphim_terminal::input::{encode_focus, encode_key, encode_paste, Key, Mods};
+use seraphim_session::{ClipboardRequest, Command, Notifier, Session, SessionConfig};
+use seraphim_terminal::input::{
+    encode_focus, encode_key, encode_mouse, encode_paste, mouse_reporting, Key, Mods, MouseAction,
+    MouseButton,
+};
+use seraphim_terminal::{MouseMode, Point};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Ime, KeyEvent, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event::{
+    ElementState, Ime, KeyEvent, MouseButton as WButton, MouseScrollDelta, WindowEvent,
+};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
+
+use crate::actions::{self, Action, ClickTracker, ShortcutKey};
 
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
@@ -29,6 +40,9 @@ pub struct WindowOptions {
     pub command: Option<Command>,
     /// Logical padding in pixels.
     pub padding: f32,
+    /// Let applications read the clipboard via OSC 52 (off by default:
+    /// any program, including one on a remote host, could read it).
+    pub allow_clipboard_read: bool,
 }
 
 impl Default for WindowOptions {
@@ -40,13 +54,18 @@ impl Default for WindowOptions {
             rows: 30,
             command: None,
             padding: 6.0,
+            allow_clipboard_read: false,
         }
     }
 }
 
+const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// Lines scrolled per wheel notch when scrolling history.
+const WHEEL_LINES: i64 = 3;
+
 #[derive(Debug)]
 enum UserEvent {
-    /// Terminal state changed (output, exit).
+    /// Terminal state changed (output, exit, clipboard request).
     Wake,
 }
 
@@ -57,17 +76,118 @@ struct Gpu {
     config: wgpu::SurfaceConfiguration,
 }
 
+/// System clipboards. Missing or failing clipboards degrade to no-ops with
+/// a message, never a crash.
+struct Clipboards {
+    inner: Option<arboard::Clipboard>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Board {
+    Clipboard,
+    /// The X11/Wayland primary selection (select to copy, middle-click paste).
+    Primary,
+}
+
+impl Clipboards {
+    fn new() -> Self {
+        match arboard::Clipboard::new() {
+            Ok(c) => Clipboards { inner: Some(c) },
+            Err(e) => {
+                eprintln!("seraphim: clipboard unavailable: {e}");
+                Clipboards { inner: None }
+            }
+        }
+    }
+
+    fn set(&mut self, board: Board, text: String) {
+        let Some(c) = &mut self.inner else { return };
+        let r = match board {
+            Board::Clipboard => c.set_text(text),
+            Board::Primary => primary_set(c, text),
+        };
+        if let Err(e) = r {
+            eprintln!("seraphim: clipboard write failed: {e}");
+        }
+    }
+
+    fn get(&mut self, board: Board) -> Option<String> {
+        let c = self.inner.as_mut()?;
+        match board {
+            Board::Clipboard => c.get_text().ok(),
+            Board::Primary => primary_get(c),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn primary_set(c: &mut arboard::Clipboard, text: String) -> Result<(), arboard::Error> {
+    use arboard::{LinuxClipboardKind, SetExtLinux};
+    c.set().clipboard(LinuxClipboardKind::Primary).text(text)
+}
+#[cfg(not(target_os = "linux"))]
+fn primary_set(_: &mut arboard::Clipboard, _: String) -> Result<(), arboard::Error> {
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+fn primary_get(c: &mut arboard::Clipboard) -> Option<String> {
+    use arboard::{GetExtLinux, LinuxClipboardKind};
+    c.get().clipboard(LinuxClipboardKind::Primary).text().ok()
+}
+#[cfg(not(target_os = "linux"))]
+fn primary_get(_: &mut arboard::Clipboard) -> Option<String> {
+    None
+}
+
+#[derive(Default)]
+struct MouseState {
+    /// Last pointer position in physical pixels.
+    pos: (f64, f64),
+    /// Last reported cell, to avoid duplicate motion reports.
+    cell: Option<(usize, usize)>,
+    /// Buttons currently held (for drag selection and motion reports).
+    left: bool,
+    middle: bool,
+    right: bool,
+    clicks: ClickTracker,
+    /// Press location of a simple selection not started yet: a plain click
+    /// must not select (and overwrite PRIMARY with) a single character.
+    pending: Option<(Point, bool)>,
+    /// Fractional wheel scrolling from touchpads.
+    wheel_accum: f64,
+    reporting: bool,
+}
+
+impl MouseState {
+    fn held(&self) -> MouseButton {
+        if self.left {
+            MouseButton::Left
+        } else if self.middle {
+            MouseButton::Middle
+        } else if self.right {
+            MouseButton::Right
+        } else {
+            MouseButton::None
+        }
+    }
+}
+
 struct Active {
     window: Arc<Window>,
     gpu: Gpu,
     renderer: Renderer,
     session: Session,
     _bus: EventBus,
+    clipboards: Clipboards,
     modifiers: ModifiersState,
+    mouse: MouseState,
     focused: bool,
     scale: f64,
     title: String,
     last_generation: u64,
+    blink_on: bool,
+    blink_deadline: Instant,
+    warned_clipboard_read: bool,
 }
 
 struct App {
@@ -120,6 +240,7 @@ impl App {
             ));
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
         window.set_ime_allowed(true);
+        window.set_cursor(CursorIcon::Text);
         let scale = window.scale_factor();
 
         let gpu = init_gpu(event_loop, window.clone())?;
@@ -151,11 +272,16 @@ impl App {
             renderer,
             session,
             _bus: bus,
+            clipboards: Clipboards::new(),
             modifiers: ModifiersState::empty(),
+            mouse: MouseState::default(),
             focused: true,
             scale,
             title: String::new(),
             last_generation: u64::MAX,
+            blink_on: true,
+            blink_deadline: Instant::now() + BLINK_INTERVAL,
+            warned_clipboard_read: false,
         })
     }
 
@@ -210,6 +336,312 @@ fn init_gpu(event_loop: &ActiveEventLoop, window: Arc<Window>) -> Result<Gpu, St
     Ok(Gpu { surface, device, queue, config })
 }
 
+impl Active {
+    fn mods(&self) -> Mods {
+        Mods {
+            shift: self.modifiers.shift_key(),
+            alt: self.modifiers.alt_key(),
+            ctrl: self.modifiers.control_key(),
+        }
+    }
+
+    /// Restart the blink cycle with the cursor visible (after input/output).
+    fn reset_blink(&mut self) {
+        self.blink_on = true;
+        self.blink_deadline = Instant::now() + BLINK_INTERVAL;
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Typing returns the view to the live screen.
+        {
+            let mut t = self.session.terminal();
+            if t.display_offset() > 0 {
+                t.scroll_to_bottom();
+                self.window.request_redraw();
+            }
+        }
+        self.reset_blink();
+        let _ = self.session.write(bytes);
+    }
+
+    fn paste(&mut self, board: Board) {
+        let Some(text) = self.clipboards.get(board) else { return };
+        if text.is_empty() {
+            return;
+        }
+        let bytes = encode_paste(&text, self.session.terminal().modes());
+        self.write(&bytes);
+    }
+
+    fn copy_selection(&mut self, board: Board) {
+        let text = self.session.terminal().selection_text();
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            self.clipboards.set(board, text);
+        }
+    }
+
+    fn run_action(&mut self, action: Action) {
+        let rows = self.session.terminal().rows() as i64;
+        let scroll = |a: &mut Active, delta: i64| {
+            a.session.terminal().scroll_display(delta);
+            a.window.request_redraw();
+        };
+        match action {
+            Action::Copy => self.copy_selection(Board::Clipboard),
+            Action::Paste => self.paste(Board::Clipboard),
+            Action::ScrollPageUp => scroll(self, rows - 1),
+            Action::ScrollPageDown => scroll(self, -(rows - 1)),
+            Action::ScrollLineUp => scroll(self, 1),
+            Action::ScrollLineDown => scroll(self, -1),
+            Action::ScrollTop => scroll(self, i64::MAX / 2),
+            Action::ScrollBottom => scroll(self, -(i64::MAX / 2)),
+        }
+    }
+
+    fn cell_at(&self, pad: f32) -> (usize, usize) {
+        let m = self.renderer.cell_metrics();
+        let t = self.session.terminal();
+        actions::cell_at(
+            self.mouse.pos.0,
+            self.mouse.pos.1,
+            pad,
+            m.width,
+            m.height,
+            t.cols(),
+            t.rows(),
+        )
+    }
+
+    /// Should mouse events go to the application? Shift always selects.
+    fn reporting(&self) -> bool {
+        mouse_reporting(self.session.terminal().modes()) && !self.modifiers.shift_key()
+    }
+
+    fn update_pointer_icon(&mut self) {
+        let reporting = self.reporting();
+        if reporting != self.mouse.reporting {
+            self.mouse.reporting = reporting;
+            self.window.set_cursor(if reporting { CursorIcon::Default } else { CursorIcon::Text });
+        }
+    }
+
+    fn report_mouse(&mut self, button: MouseButton, action: MouseAction, cell: (usize, usize)) {
+        let bytes = encode_mouse(
+            button,
+            action,
+            cell.1,
+            cell.0,
+            self.mods(),
+            self.session.terminal().modes(),
+        );
+        if let Some(b) = bytes {
+            let _ = self.session.write(&b);
+        }
+    }
+
+    fn on_cursor_moved(&mut self, x: f64, y: f64, pad: f32) {
+        self.mouse.pos = (x, y);
+        let cell = self.cell_at(pad);
+        let moved = self.mouse.cell != Some(cell);
+        self.mouse.cell = Some(cell);
+        self.update_pointer_icon();
+        if !moved {
+            return;
+        }
+        if self.reporting() {
+            self.report_mouse(self.mouse.held(), MouseAction::Motion, cell);
+            return;
+        }
+        if !self.mouse.left {
+            return;
+        }
+        let mut t = self.session.terminal();
+        let point = t.viewport_point(cell.0, cell.1);
+        if let Some((anchor, block)) = self.mouse.pending.take() {
+            if anchor != point {
+                t.start_selection(actions::selection_kind(1, block), anchor);
+            }
+        }
+        if t.selection().is_some() {
+            t.update_selection(point);
+            drop(t);
+            self.window.request_redraw();
+        }
+    }
+
+    fn on_mouse_button(&mut self, state: ElementState, button: WButton, pad: f32) {
+        let pressed = state == ElementState::Pressed;
+        let cell = self.cell_at(pad);
+        match button {
+            WButton::Left => self.mouse.left = pressed,
+            WButton::Middle => self.mouse.middle = pressed,
+            WButton::Right => self.mouse.right = pressed,
+            _ => return,
+        }
+        if self.reporting() {
+            let b = match button {
+                WButton::Left => MouseButton::Left,
+                WButton::Middle => MouseButton::Middle,
+                _ => MouseButton::Right,
+            };
+            let action = if pressed { MouseAction::Press } else { MouseAction::Release };
+            self.report_mouse(b, action, cell);
+            return;
+        }
+        match (button, pressed) {
+            (WButton::Left, true) => {
+                let clicks = self.mouse.clicks.press(Instant::now(), cell.0, cell.1);
+                let block = self.modifiers.control_key();
+                let mut t = self.session.terminal();
+                let point = t.viewport_point(cell.0, cell.1);
+                if self.modifiers.shift_key() && t.selection().is_some() && clicks == 1 {
+                    t.update_selection(point); // Shift+click extends
+                } else if clicks >= 2 {
+                    t.start_selection(actions::selection_kind(clicks, false), point);
+                } else {
+                    t.clear_selection();
+                    self.mouse.pending = Some((point, block));
+                }
+                drop(t);
+                self.window.request_redraw();
+            }
+            (WButton::Left, false) => {
+                self.mouse.pending = None;
+                self.copy_selection(Board::Primary);
+            }
+            (WButton::Middle, true) => self.paste(Board::Primary),
+            _ => {}
+        }
+    }
+
+    fn on_wheel(&mut self, delta: MouseScrollDelta, pad: f32) {
+        let lines = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y as f64,
+            MouseScrollDelta::PixelDelta(p) => {
+                self.mouse.wheel_accum += p.y / self.renderer.cell_metrics().height as f64;
+                let whole = self.mouse.wheel_accum.trunc();
+                self.mouse.wheel_accum -= whole;
+                whole / WHEEL_LINES as f64
+            }
+        };
+        let notches = lines.round() as i64;
+        if notches == 0 {
+            return;
+        }
+        let cell = self.cell_at(pad);
+        // Note: `reporting()` locks the terminal itself, so call it before
+        // taking the lock here (the mutex is not re-entrant).
+        let reporting = self.reporting();
+        let (alt_scroll, alt_screen) = {
+            let t = self.session.terminal();
+            let m = t.modes();
+            (m.alternate_scroll && m.mouse == MouseMode::Off, t.is_alternate_screen())
+        };
+        if reporting {
+            let b = if notches > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
+            for _ in 0..notches.abs() {
+                self.report_mouse(b, MouseAction::Press, cell);
+            }
+        } else if alt_screen && alt_scroll {
+            // Full-screen apps without mouse support (less, man): wheel
+            // becomes cursor keys.
+            let key = if notches > 0 { Key::Up } else { Key::Down };
+            let modes = self.session.terminal().modes().clone();
+            let one = encode_key(key, Mods::default(), &modes);
+            let bytes = one.repeat((notches.unsigned_abs() as usize) * WHEEL_LINES as usize);
+            let _ = self.session.write(&bytes);
+        } else {
+            self.session.terminal().scroll_display(notches * WHEEL_LINES);
+            self.window.request_redraw();
+        }
+    }
+
+    fn on_key(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let m = actions::Modifiers {
+            shift: self.modifiers.shift_key(),
+            ctrl: self.modifiers.control_key(),
+            alt: self.modifiers.alt_key(),
+        };
+        let sk = match &event.logical_key {
+            WKey::Character(s) => s.chars().next().map(ShortcutKey::Char),
+            WKey::Named(NamedKey::Insert) => Some(ShortcutKey::Insert),
+            WKey::Named(NamedKey::PageUp) => Some(ShortcutKey::PageUp),
+            WKey::Named(NamedKey::PageDown) => Some(ShortcutKey::PageDown),
+            WKey::Named(NamedKey::Home) => Some(ShortcutKey::Home),
+            WKey::Named(NamedKey::End) => Some(ShortcutKey::End),
+            WKey::Named(NamedKey::ArrowUp) => Some(ShortcutKey::Up),
+            WKey::Named(NamedKey::ArrowDown) => Some(ShortcutKey::Down),
+            _ => None,
+        };
+        let alt_screen = self.session.terminal().is_alternate_screen();
+        if let Some(action) = sk.and_then(|k| actions::shortcut(k, m, alt_screen)) {
+            self.run_action(action);
+            return;
+        }
+        if let Some(bytes) = key_bytes(event, self.modifiers, &self.session) {
+            self.write(&bytes);
+        }
+    }
+
+    /// Apply the clipboard policy to OSC 52 requests from the application.
+    fn handle_clipboard_requests(&mut self, allow_read: bool) {
+        for req in self.session.take_clipboard_requests() {
+            match req {
+                ClipboardRequest::Store { selection, data } => {
+                    let board =
+                        if selection.contains('c') { Board::Clipboard } else { Board::Primary };
+                    match actions::decode_base64(&data).map(String::from_utf8) {
+                        Some(Ok(text)) => self.clipboards.set(board, text),
+                        _ => eprintln!("seraphim: ignored malformed OSC 52 clipboard data"),
+                    }
+                }
+                ClipboardRequest::Load { selection } => {
+                    if allow_read {
+                        let board =
+                            if selection.contains('c') { Board::Clipboard } else { Board::Primary };
+                        let text = self.clipboards.get(board).unwrap_or_default();
+                        let reply =
+                            format!("\x1b]52;{selection};{}\x07", encode_base64(text.as_bytes()));
+                        let _ = self.session.write(reply.as_bytes());
+                    } else if !self.warned_clipboard_read {
+                        self.warned_clipboard_read = true;
+                        eprintln!("seraphim: denied an application's request to read the clipboard (OSC 52)");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `SERAPHIM_DEBUG_INPUT=1` logs raw window input events to stderr.
+fn debug_input() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SERAPHIM_DEBUG_INPUT").is_some_and(|v| v != "0"))
+}
+
+fn encode_base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.active.is_some() {
@@ -225,13 +657,17 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: UserEvent) {
-        let Some(a) = &self.active else { return };
+        let allow_read = self.options.allow_clipboard_read;
+        let Some(a) = &mut self.active else { return };
         if let Some(exit) = a.session.exit_info() {
             self.exit_code = exit.code.unwrap_or(1);
             event_loop.exit();
             return;
         }
+        a.handle_clipboard_requests(allow_read);
         if a.session.generation() != a.last_generation {
+            a.reset_blink();
+            a.update_pointer_icon();
             a.window.request_redraw();
         }
     }
@@ -239,6 +675,11 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let pad = self.active.as_ref().map(|a| self.padding(a.scale)).unwrap_or(0.0);
         let Some(a) = &mut self.active else { return };
+        if debug_input()
+            && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::CursorMoved { .. })
+        {
+            eprintln!("seraphim: input {event:?}");
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -262,28 +703,32 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 a.focused = focused;
+                a.reset_blink();
                 let bytes = encode_focus(focused, a.session.terminal().modes());
                 if !bytes.is_empty() {
                     let _ = a.session.write(&bytes);
                 }
                 a.window.request_redraw();
             }
-            WindowEvent::ModifiersChanged(m) => a.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                a.modifiers = m.state();
+                a.update_pointer_icon();
+            }
             // Synthetic presses are replayed by winit for keys already held
             // when focus arrives; forwarding them would duplicate input.
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
-                if let Some(bytes) = key_bytes(&event, a.modifiers, &a.session) {
-                    let _ = a.session.write(&bytes);
-                }
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => a.on_key(&event),
+            WindowEvent::Ime(Ime::Commit(text)) => a.write(text.as_bytes()),
+            WindowEvent::CursorMoved { position, .. } => {
+                a.on_cursor_moved(position.x, position.y, pad)
             }
-            WindowEvent::Ime(Ime::Commit(text)) => {
-                let _ = a.session.write(text.as_bytes());
-            }
+            WindowEvent::CursorLeft { .. } => a.mouse.cell = None,
+            WindowEvent::MouseInput { state, button, .. } => a.on_mouse_button(state, button, pad),
+            WindowEvent::MouseWheel { delta, .. } => a.on_wheel(delta, pad),
             WindowEvent::DroppedFile(path) => {
                 // Paste the path, quoted, like most terminals do.
                 let quoted = format!("'{}' ", path.display().to_string().replace('\'', "'\\''"));
                 let bytes = encode_paste(&quoted, a.session.terminal().modes());
-                let _ = a.session.write(&bytes);
+                a.write(&bytes);
             }
             WindowEvent::RedrawRequested => {
                 let size = a.window.inner_size();
@@ -292,7 +737,7 @@ impl ApplicationHandler<UserEvent> for App {
                     height: size.height,
                     padding: pad,
                     focused: a.focused,
-                    cursor_on: true,
+                    cursor_on: a.blink_on,
                 };
                 {
                     let term = a.session.terminal();
@@ -309,6 +754,26 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(a) = &mut self.active else { return };
+        let blinking = {
+            let t = a.session.terminal();
+            t.modes().cursor_blink && t.modes().cursor_visible && t.display_offset() == 0
+        };
+        if !(blinking && a.focused) {
+            a.blink_on = true;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        if now >= a.blink_deadline {
+            a.blink_on = !a.blink_on;
+            a.blink_deadline = now + BLINK_INTERVAL;
+            a.window.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(a.blink_deadline));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -400,5 +865,19 @@ fn key_bytes(event: &KeyEvent, mods: ModifiersState, session: &Session) -> Optio
         }
         // Plain typing: use the composed text (dead keys, compose, layouts).
         _ => event.text.as_ref().map(|t| t.as_bytes().to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_round_trip() {
+        for s in ["", "a", "ab", "abc", "hello world", "✓ 天使"] {
+            let enc = encode_base64(s.as_bytes());
+            assert_eq!(actions::decode_base64(&enc).unwrap(), s.as_bytes(), "{s:?} -> {enc}");
+        }
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
     }
 }

@@ -55,6 +55,17 @@ cargo run --release -p seraphim
 opens a window running your shell. Options: `--font FAMILY`,
 `--font-size PT`, `--cols N`, `--rows N`, `-e PROGRAM [ARGS...]`.
 
+| Action | Keys / mouse |
+|---|---|
+| Copy selection | `Ctrl+Shift+C` (selecting also copies to PRIMARY) |
+| Paste | `Ctrl+Shift+V`, `Shift+Insert`; middle-click pastes PRIMARY |
+| Select | drag; double-click word; triple-click line; `Ctrl`+drag block; `Shift`+click extends |
+| Scroll history | wheel, `Shift+PageUp/PageDown`, `Shift+Home/End`, `Ctrl+Shift+Up/Down` |
+| Select while an app uses the mouse | hold `Shift` |
+
+Applications may set the clipboard with OSC 52; reading it requires
+`--allow-clipboard-read`. `SERAPHIM_DEBUG_INPUT=1` logs raw input events.
+
 Linux build dependencies: a Vulkan or GL driver, plus the usual X11/Wayland
 client libraries (`libxkbcommon`, `libwayland-client`). With no GPU,
 Mesa's software Vulkan (`mesa-vulkan-drivers`, "lavapipe") works.

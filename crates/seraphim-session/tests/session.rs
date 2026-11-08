@@ -147,3 +147,47 @@ fn manager_tracks_sessions_independently() {
     assert!(m.close(b));
     assert!(m.ids().is_empty());
 }
+
+#[test]
+fn clipboard_requests_are_queued_privately() {
+    let bus = EventBus::new();
+    let sub = bus.subscribe("clipboard.requested", 8);
+    let cmd =
+        Command::new("/bin/sh").args(["-c", "printf '\\033]52;c;aGVsbG8=\\007\\033]52;p;?\\007'"]);
+    let s = Session::spawn(1, SessionConfig { command: cmd, ..Default::default() }, &bus).unwrap();
+    s.wait_exit(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        s.take_clipboard_requests(),
+        vec![
+            seraphim_session::ClipboardRequest::Store {
+                selection: "c".into(),
+                data: "aGVsbG8=".into()
+            },
+            seraphim_session::ClipboardRequest::Load { selection: "p".into() },
+        ]
+    );
+    assert!(s.take_clipboard_requests().is_empty());
+    let ev = wait_event(&sub, "clipboard.requested");
+    assert_eq!(ev.data["op"], "store");
+    assert!(ev.data.get("data").is_none(), "payload must not be broadcast");
+}
+
+#[test]
+#[should_panic(expected = "re-entered")]
+fn relocking_terminal_on_same_thread_panics_instead_of_deadlocking() {
+    let bus = EventBus::new();
+    let cmd = Command::new("/bin/sh").args(["-c", "sleep 5"]);
+    let s = Session::spawn(1, SessionConfig { command: cmd, ..Default::default() }, &bus).unwrap();
+    let _a = s.terminal();
+    let _b = s.terminal();
+}
+
+#[test]
+fn terminal_guard_releases_on_drop() {
+    let bus = EventBus::new();
+    let cmd = Command::new("/bin/sh").args(["-c", "sleep 5"]);
+    let s = Session::spawn(1, SessionConfig { command: cmd, ..Default::default() }, &bus).unwrap();
+    let rows = s.terminal().rows();
+    let cols = s.terminal().cols(); // a second, sequential lock is fine
+    assert_eq!((cols, rows), (80, 24));
+}

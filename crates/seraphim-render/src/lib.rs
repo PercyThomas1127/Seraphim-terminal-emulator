@@ -19,7 +19,7 @@ mod theme;
 
 use std::collections::HashMap;
 
-use seraphim_terminal::{CursorShape, Flags, Terminal};
+use seraphim_terminal::{Attrs, CursorShape, Flags, Point, SelectionRange, Terminal};
 
 use atlas::{Atlas, AtlasRect, ATLAS_SIZE};
 use font::GlyphKey;
@@ -368,23 +368,34 @@ impl Renderer {
         let m = self.fonts.metrics();
         let (cw, ch) = (m.width, m.height);
         let pad = view.padding.round();
-        let grid = term.screen();
+        let (rows, cols) = (term.rows(), term.cols());
+        let offset = term.display_offset();
+        let selection = term.selection_range();
         let cursor = term.cursor();
-        let show_cursor = cursor.visible && (view.cursor_on || !view.focused);
+        // The cursor lives on the live screen; when scrolled back it moves
+        // down the viewport and may leave it entirely.
+        let cursor_vrow = cursor.row + offset;
+        let show_cursor = cursor.visible && cursor_vrow < rows && (view.cursor_on || !view.focused);
         let block_cursor = show_cursor && view.focused && cursor.shape == CursorShape::Block;
-        let cursor_wide = cursor.row < grid.rows()
-            && cursor.col < grid.cols()
-            && grid.cell(cursor.row, cursor.col).is_wide();
+        let cursor_wide = show_cursor
+            && term.visible_row(cursor_vrow).cells.get(cursor.col).is_some_and(|c| c.is_wide());
         let cursor_w = if cursor_wide { 2.0 * cw } else { cw };
         let cursor_x = pad + cursor.col as f32 * cw;
-        let cursor_y = pad + cursor.row as f32 * ch;
+        let cursor_y = pad + cursor_vrow as f32 * ch;
+        let selected = |r: usize, c: usize| {
+            selection.is_some_and(|s: SelectionRange| {
+                s.contains(Point::new(r as i64 - offset as i64, c))
+            })
+        };
 
         // 1. Backgrounds, merged into runs of equal color.
-        for (r, row) in grid.rows_iter().enumerate() {
+        for r in 0..rows {
+            let row = term.visible_row(r);
             let y = pad + r as f32 * ch;
             let mut run: Option<(usize, Rgb)> = None;
-            for (c, cell) in row.cells.iter().enumerate() {
-                let (_, bg) = self.theme.cell_colors(&cell.attrs);
+            let n = row.cells.len().min(cols);
+            for (c, cell) in row.cells[..n].iter().enumerate() {
+                let (_, bg) = self.colors(&cell.attrs, selected(r, c));
                 match (run, bg) {
                     (Some((_, rc)), Some(b)) if rc == b => {}
                     _ => {
@@ -402,13 +413,7 @@ impl Renderer {
                 }
             }
             if let Some((start, color)) = run {
-                self.push_solid(
-                    pad + start as f32 * cw,
-                    y,
-                    (row.cells.len() - start) as f32 * cw,
-                    ch,
-                    color,
-                );
+                self.push_solid(pad + start as f32 * cw, y, (n - start) as f32 * cw, ch, color);
             }
         }
 
@@ -418,16 +423,18 @@ impl Renderer {
         }
 
         // 3. Glyphs and decorations.
-        for (r, row) in grid.rows_iter().enumerate() {
+        for r in 0..rows {
+            let row = term.visible_row(r);
             let y = pad + r as f32 * ch;
-            for (c, cell) in row.cells.iter().enumerate() {
+            let n = row.cells.len().min(cols);
+            for (c, cell) in row.cells[..n].iter().enumerate() {
                 if cell.is_wide_spacer() {
                     continue;
                 }
                 let x = pad + c as f32 * cw;
                 let width = if cell.is_wide() { 2.0 * cw } else { cw };
-                let (mut fg, _) = self.theme.cell_colors(&cell.attrs);
-                let under_cursor = block_cursor && r == cursor.row && c == cursor.col;
+                let (mut fg, _) = self.colors(&cell.attrs, selected(r, c));
+                let under_cursor = block_cursor && r == cursor_vrow && c == cursor.col;
                 if under_cursor {
                     fg = self.theme.cursor_text;
                 }
@@ -488,7 +495,28 @@ impl Renderer {
                 self.push_solid(cursor_x, cursor_y + ch - t, cursor_w, t, c);
             }
         }
+        // 5. Scroll position indicator while viewing history.
+        let history = term.scrollback().len();
+        if offset > 0 && history > 0 {
+            let track = rows as f32 * ch;
+            let total = (history + rows) as f32;
+            let thumb = (track * rows as f32 / total).max(ch);
+            let top = (track - thumb) * (1.0 - offset as f32 / history as f32);
+            let w = (pad / 2.0).clamp(2.0, 4.0);
+            let x = view.width as f32 - w - 1.0;
+            self.push_solid(x, pad + top, w, thumb, self.theme.selection_bg);
+        }
         true
+    }
+
+    /// Cell colors, with the selection highlight applied.
+    fn colors(&self, attrs: &Attrs, selected: bool) -> (Rgb, Option<Rgb>) {
+        let (fg, bg) = self.theme.cell_colors(attrs);
+        if selected {
+            (self.theme.selection_fg.unwrap_or(fg), Some(self.theme.selection_bg))
+        } else {
+            (fg, bg)
+        }
     }
 
     fn push_solid(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {

@@ -78,8 +78,25 @@ pub struct ExitInfo {
     pub signal: Option<i32>,
 }
 
+/// An OSC 52 clipboard request from the application. The data never goes
+/// on the event bus (only `clipboard.requested` metadata does): the UI
+/// drains these with [`Session::take_clipboard_requests`] and applies its
+/// clipboard policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardRequest {
+    /// Set `selection` (`c` clipboard, `p` primary, ...) to base64 `data`.
+    Store { selection: String, data: String },
+    /// The application asks to read the clipboard.
+    Load { selection: String },
+}
+
+/// Largest OSC 52 payload accepted (base64 bytes).
+pub const MAX_CLIPBOARD_REQUEST: usize = 1 << 20;
+const MAX_PENDING_CLIPBOARD: usize = 8;
+
 #[derive(Default)]
 struct Shared {
+    clipboard: Mutex<Vec<ClipboardRequest>>,
     exit: Mutex<Option<ExitInfo>>,
     exited: Condvar,
     /// Bumped whenever terminal state changes; renderers poll/compare this
@@ -145,8 +162,19 @@ impl Session {
 
     /// Lock the terminal state for reading (rendering) or input encoding.
     /// Hold the lock briefly: the I/O thread needs it to make progress.
-    pub fn terminal(&self) -> MutexGuard<'_, Terminal> {
-        self.terminal.lock().unwrap()
+    ///
+    /// # Panics
+    /// If this thread already holds this session's terminal. The mutex is
+    /// not re-entrant, so that would otherwise deadlock silently.
+    pub fn terminal(&self) -> TerminalGuard<'_> {
+        let key = Arc::as_ptr(&self.terminal) as usize;
+        HELD.with(|h| {
+            if h.borrow().contains(&key) {
+                panic!("Session::terminal() re-entered on the same thread (would deadlock)");
+            }
+            h.borrow_mut().push(key);
+        });
+        TerminalGuard { guard: self.terminal.lock().unwrap(), key }
     }
 
     /// Monotonic counter incremented on every state change.
@@ -177,6 +205,11 @@ impl Session {
         *guard
     }
 
+    /// Drain pending OSC 52 requests (oldest first).
+    pub fn take_clipboard_requests(&self) -> Vec<ClipboardRequest> {
+        std::mem::take(&mut *self.shared.clipboard.lock().unwrap())
+    }
+
     /// Info on the process in the terminal's foreground (from `/proc`).
     pub fn foreground_process(&self) -> Option<ProcessInfo> {
         let pgid = self.pty.lock().unwrap().foreground_pgid()?;
@@ -198,6 +231,37 @@ impl Drop for Session {
                 let _ = h.join();
             }
         }
+    }
+}
+
+thread_local! {
+    /// Terminals locked by this thread via [`Session::terminal`].
+    static HELD: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Exclusive access to a session's [`Terminal`]; see [`Session::terminal`].
+pub struct TerminalGuard<'a> {
+    guard: MutexGuard<'a, Terminal>,
+    key: usize,
+}
+
+impl std::ops::Deref for TerminalGuard<'_> {
+    type Target = Terminal;
+    fn deref(&self) -> &Terminal {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for TerminalGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Terminal {
+        &mut self.guard
+    }
+}
+
+impl Drop for TerminalGuard<'_> {
+    fn drop(&mut self) {
+        let key = self.key;
+        HELD.with(|h| h.borrow_mut().retain(|&k| k != key));
     }
 }
 
@@ -306,17 +370,29 @@ impl IoLoop {
                     );
                 }
             }
-            TerminalEvent::ClipboardStore { selection, .. } => {
+            TerminalEvent::ClipboardStore { selection, data } => {
                 p.publish(
                     "clipboard.requested",
                     id,
                     json!({"selection": selection, "op": "store"}),
                 );
+                if data.len() <= MAX_CLIPBOARD_REQUEST {
+                    self.queue_clipboard(ClipboardRequest::Store { selection, data });
+                }
             }
             TerminalEvent::ClipboardLoad { selection } => {
                 p.publish("clipboard.requested", id, json!({"selection": selection, "op": "load"}));
+                self.queue_clipboard(ClipboardRequest::Load { selection });
             }
         }
+    }
+
+    fn queue_clipboard(&self, req: ClipboardRequest) {
+        let mut q = self.shared.clipboard.lock().unwrap();
+        if q.len() >= MAX_PENDING_CLIPBOARD {
+            q.remove(0);
+        }
+        q.push(req);
     }
 
     /// Spec §11.5: detect privileged sessions from trusted process metadata

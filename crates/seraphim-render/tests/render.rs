@@ -186,3 +186,45 @@ fn screenshot() {
         h.renderer.fonts().family_name
     );
 }
+
+#[test]
+fn selection_is_highlighted() {
+    let Some(mut h) = headless() else { return };
+    let theme = Theme::default();
+    let mut t = Terminal::new(8, 2);
+    t.advance(b"abcdef\x1b[?25l");
+    t.start_selection(
+        seraphim_terminal::SelectionKind::Simple,
+        seraphim_terminal::Point::new(0, 1),
+    );
+    t.update_selection(seraphim_terminal::Point::new(0, 2));
+    let img = render(&mut h, &t, true);
+    let (x, y, _, _) = cell(&h, 0, 1);
+    assert_eq!(rgb(img.pixel(x, y)), theme.selection_bg, "selected cell");
+    let (x, y, _, _) = cell(&h, 0, 3);
+    assert_eq!(rgb(img.pixel(x, y)), theme.background, "unselected cell");
+}
+
+#[test]
+fn scrolled_viewport_shows_history_and_moves_cursor() {
+    let Some(mut h) = headless() else { return };
+    let theme = Theme::default();
+    let mut t = Terminal::new(8, 3);
+    t.advance(b"\x1b[41mR\x1b[0m\r\n2\r\n3\r\n4\r\n5"); // red 'R' line scrolls into history
+    let img = render(&mut h, &t, true);
+    let (x, y, w, _) = cell(&h, 0, 0);
+    assert_ne!(rgb(img.pixel(x + w - 1, y)), theme.ansi[1], "red line not visible yet");
+    // Cursor is on the last row while live.
+    let (cx, cy, _, _) = cell(&h, 2, 1);
+    assert_eq!(rgb(img.pixel(cx, cy)), theme.cursor);
+
+    t.scroll_display(2);
+    let img = render(&mut h, &t, true);
+    assert_eq!(rgb(img.pixel(x + w - 1, y)), theme.ansi[1], "history row 0 shown");
+    // Cursor moved off the bottom of the viewport: not drawn anywhere.
+    assert_ne!(rgb(img.pixel(cx, cy)), theme.cursor);
+    // Scroll indicator appears in the right padding.
+    let right = img.width - 2;
+    let any_thumb = (0..img.height).any(|yy| rgb(img.pixel(right, yy)) == theme.selection_bg);
+    assert!(any_thumb, "scroll indicator drawn");
+}

@@ -7,6 +7,7 @@ use vte::{Params, Perform};
 
 use crate::cell::{Attrs, Cell, Color, Flags};
 use crate::grid::{Grid, Row};
+use crate::selection::{Lines, Selection, SelectionRange};
 
 /// Semantic events surfaced to higher layers. The Terminal Core only
 /// *reports* these; acting on them (e.g. touching the clipboard) is the
@@ -86,6 +87,9 @@ pub struct Modes {
     pub app_keypad: bool,
     pub bracketed_paste: bool,
     pub focus_events: bool,
+    /// Mode 1007: on the alternate screen without mouse reporting, the
+    /// mouse wheel sends cursor keys (scrolls in less, man, vim...).
+    pub alternate_scroll: bool,
     pub mouse: MouseMode,
     pub mouse_encoding: MouseEncoding,
     pub synchronized_output: bool,
@@ -105,6 +109,7 @@ impl Default for Modes {
             app_keypad: false,
             bracketed_paste: false,
             focus_events: false,
+            alternate_scroll: true,
             mouse: MouseMode::Off,
             mouse_encoding: MouseEncoding::Default,
             synchronized_output: false,
@@ -176,6 +181,9 @@ pub(crate) struct State {
     pub responses: Vec<u8>,
     damage: Vec<bool>,
     last_printed: Option<char>,
+    /// Lines scrolled back into history in the viewport (0 = bottom).
+    pub display_offset: usize,
+    pub selection: Option<Selection>,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -208,6 +216,8 @@ impl State {
             responses: Vec::new(),
             damage: vec![true; rows],
             last_printed: None,
+            display_offset: 0,
+            selection: None,
         }
     }
 
@@ -244,9 +254,48 @@ impl State {
         out
     }
 
+    /// Mark a row for redraw (no content change, e.g. the cursor moved).
     fn damage_row(&mut self, row: usize) {
         if let Some(d) = self.damage.get_mut(row) {
             *d = true;
+        }
+    }
+
+    /// Mark a row whose *text* changed: redraw it and drop a selection
+    /// that covered it.
+    fn content_changed(&mut self, row: usize) {
+        self.damage_row(row);
+        if self.selection.is_some() {
+            self.invalidate_selection(row as i64, row as i64);
+        }
+    }
+
+    /// Drop the selection if it covers any of screen lines `from..=to`
+    /// (their content is being changed under it).
+    fn invalidate_selection(&mut self, from: i64, to: i64) {
+        if let Some(range) = self.selection_range() {
+            if range.intersects_lines(from, to) {
+                self.selection = None;
+            }
+        }
+    }
+
+    pub fn selection_range(&self) -> Option<SelectionRange> {
+        self.selection.map(|s| s.range(self))
+    }
+
+    /// The row shown at viewport row `i` (accounts for scrollback viewing).
+    pub fn visible_row(&self, i: usize) -> &Row {
+        let line = i as i64 - self.display_offset as i64;
+        self.row(line).unwrap_or_else(|| self.active_grid().row(i.min(self.rows - 1)))
+    }
+
+    pub fn scroll_display(&mut self, delta: i64) {
+        let max = if self.alt_active { 0 } else { self.scrollback.len() as i64 };
+        let new = (self.display_offset as i64 + delta).clamp(0, max) as usize;
+        if new != self.display_offset {
+            self.display_offset = new;
+            self.damage_all();
         }
     }
 
@@ -266,6 +315,8 @@ impl State {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        self.selection = None;
+        self.display_offset = 0;
         // Keep the cursor on screen when shrinking: drop lines from the top
         // of the primary screen into scrollback.
         // (Only the active grid is shifted; drop_top <= cursor.row always.)
@@ -314,6 +365,7 @@ impl State {
         let limit = self.scrollback_limit;
         let scrollback = &mut self.scrollback;
         let grid = if self.alt_active { &mut self.alternate } else { &mut self.primary };
+        let moved = n.min(bottom + 1 - top);
         grid.scroll_up(top, bottom, n, &attrs, |row| {
             if keep {
                 // Recycle the oldest scrollback line's buffer once full.
@@ -325,6 +377,23 @@ impl State {
                 scrollback.push_back(std::mem::replace(row, buf));
             }
         });
+        if keep {
+            // Content moved up into history: keep the viewport and the
+            // selection on the same text.
+            if self.display_offset > 0 {
+                self.display_offset = (self.display_offset + moved).min(self.scrollback.len());
+            }
+            if let Some(sel) = &mut self.selection {
+                sel.anchor.line -= moved as i64;
+                sel.head.line -= moved as i64;
+                let oldest = -(self.scrollback.len() as i64);
+                if sel.anchor.line.min(sel.head.line) < oldest {
+                    self.selection = None;
+                }
+            }
+        } else if self.selection.is_some() {
+            self.invalidate_selection(top as i64, bottom as i64);
+        }
         self.damage_range(top, bottom);
     }
 
@@ -332,6 +401,9 @@ impl State {
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
         let attrs = self.cursor.attrs;
         self.grid().scroll_down(top, bottom, n, &attrs);
+        if self.selection.is_some() {
+            self.invalidate_selection(top as i64, bottom as i64);
+        }
         self.damage_range(top, bottom);
     }
 
@@ -410,7 +482,7 @@ impl State {
             r.cells[from..to].fill(Cell::blank(&attrs));
             r.clear_combining(from, to);
         }
-        self.damage_row(row);
+        self.content_changed(row);
     }
 
     fn erase_rows(&mut self, from: usize, to: usize) {
@@ -418,7 +490,7 @@ impl State {
         let cols = self.cols;
         for r in from..to.min(self.rows) {
             *self.grid().row_mut(r) = Row::new(cols, &attrs);
-            self.damage_row(r);
+            self.content_changed(r);
         }
     }
 
@@ -438,7 +510,7 @@ impl State {
             r.clear_combining(cols - 1, cols);
         }
         self.cursor.pending_wrap = false;
-        self.damage_row(row);
+        self.content_changed(row);
     }
 
     fn delete_chars(&mut self, n: usize) {
@@ -457,7 +529,7 @@ impl State {
         line[col..].rotate_left(n);
         line[cols - n..].fill(Cell::blank(&attrs));
         self.cursor.pending_wrap = false;
-        self.damage_row(row);
+        self.content_changed(row);
     }
 
     fn insert_lines(&mut self, n: usize) {
@@ -542,6 +614,8 @@ impl State {
             return;
         }
         self.alt_active = enable;
+        self.selection = None;
+        self.display_offset = 0;
         if enable && clear {
             let attrs = self.cursor.attrs;
             self.alternate.clear(&attrs);
@@ -618,7 +692,7 @@ impl State {
                 *grid.cell_mut(row, col + 1) = Cell { ch: ' ', attrs: spacer };
             }
         }
-        self.damage_row(row);
+        self.content_changed(row);
         self.last_printed = Some(c);
 
         let next = col + width;
@@ -650,7 +724,7 @@ impl State {
             col -= 1;
         }
         self.grid().row_mut(row).push_combining(col, c);
-        self.damage_row(row);
+        self.content_changed(row);
     }
 
     // ---- SGR -----------------------------------------------------------
@@ -773,6 +847,7 @@ impl State {
             1002 => self.modes.mouse = if on { MouseMode::ButtonMotion } else { MouseMode::Off },
             1003 => self.modes.mouse = if on { MouseMode::AnyMotion } else { MouseMode::Off },
             1004 => self.modes.focus_events = on,
+            1007 => self.modes.alternate_scroll = on,
             1005 => {
                 self.modes.mouse_encoding =
                     if on { MouseEncoding::Utf8 } else { MouseEncoding::Default }
@@ -1002,6 +1077,9 @@ impl Perform for State {
             let grid = if self.alt_active { &mut self.alternate } else { &mut self.primary };
             if grid.put_narrow(row, col, cell) {
                 self.damage[row] = true;
+                if self.selection.is_some() {
+                    self.invalidate_selection(row as i64, row as i64);
+                }
                 self.last_printed = Some(c);
                 if col + 1 >= self.cols {
                     self.cursor.pending_wrap = self.modes.autowrap;
@@ -1090,7 +1168,13 @@ impl Perform for State {
                         self.erase_cells(row, 0, col + 1);
                     }
                     2 => self.erase_rows(0, self.rows),
-                    3 => self.scrollback.clear(),
+                    3 => {
+                        self.scrollback.clear();
+                        self.display_offset = 0;
+                        if self.selection_range().is_some_and(|r| r.start.line < 0) {
+                            self.selection = None;
+                        }
+                    }
                     _ => {}
                 }
                 self.cursor.pending_wrap = false;
@@ -1246,5 +1330,39 @@ impl Perform for State {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         self.osc(params);
+    }
+}
+
+impl Lines for State {
+    fn row(&self, line: i64) -> Option<&Row> {
+        if line >= 0 {
+            let g = self.active_grid();
+            (line < g.rows() as i64).then(|| g.row(line as usize))
+        } else if self.alt_active {
+            None
+        } else {
+            let idx = self.scrollback.len() as i64 + line;
+            (idx >= 0).then(|| &self.scrollback[idx as usize])
+        }
+    }
+    fn first_line(&self) -> i64 {
+        if self.alt_active {
+            0
+        } else {
+            -(self.scrollback.len() as i64)
+        }
+    }
+    fn last_line(&self) -> i64 {
+        self.rows as i64 - 1
+    }
+    fn cols(&self) -> usize {
+        self.cols
+    }
+}
+
+impl State {
+    pub fn selection_text(&self) -> Option<String> {
+        let range = self.selection_range()?;
+        Some(crate::selection::text(self, &range))
     }
 }

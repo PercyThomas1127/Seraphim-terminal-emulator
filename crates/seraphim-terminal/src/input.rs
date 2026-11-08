@@ -4,7 +4,7 @@
 //! This is the legacy xterm encoding. The Kitty keyboard protocol
 //! (spec §3.1) is planned as a separate encoder selected by mode flags.
 
-use crate::Modes;
+use crate::{Modes, MouseEncoding, MouseMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
@@ -161,5 +161,111 @@ pub fn encode_focus(focused: bool, modes: &Modes) -> Vec<u8> {
         b"\x1b[I".to_vec()
     } else {
         b"\x1b[O".to_vec()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+    /// Motion with no button held.
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+impl MouseButton {
+    fn is_wheel(self) -> bool {
+        matches!(self, Self::WheelUp | Self::WheelDown | Self::WheelLeft | Self::WheelRight)
+    }
+}
+
+/// Whether the application currently wants mouse events at all.
+pub fn mouse_reporting(modes: &Modes) -> bool {
+    modes.mouse != MouseMode::Off
+}
+
+/// Encode a mouse event at cell (`col`, `row`) (0-based) for the
+/// application, or `None` if the current modes don't report it.
+pub fn encode_mouse(
+    button: MouseButton,
+    action: MouseAction,
+    col: usize,
+    row: usize,
+    mods: Mods,
+    modes: &Modes,
+) -> Option<Vec<u8>> {
+    match (modes.mouse, action) {
+        (MouseMode::Off, _) => return None,
+        (MouseMode::Press, MouseAction::Motion) => return None,
+        (MouseMode::ButtonMotion, MouseAction::Motion) if button == MouseButton::None => {
+            return None
+        }
+        _ => {}
+    }
+    // Wheels have no release event.
+    if button.is_wheel() && action == MouseAction::Release {
+        return None;
+    }
+    let sgr = modes.mouse_encoding == MouseEncoding::Sgr;
+    let mut code: u32 = match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::None => 3,
+        MouseButton::WheelUp => 64,
+        MouseButton::WheelDown => 65,
+        MouseButton::WheelLeft => 66,
+        MouseButton::WheelRight => 67,
+    };
+    // Legacy encodings can't say which button was released.
+    if action == MouseAction::Release && !sgr {
+        code = 3;
+    }
+    if action == MouseAction::Motion {
+        code += 32;
+    }
+    if mods.shift {
+        code += 4;
+    }
+    if mods.alt {
+        code += 8;
+    }
+    if mods.ctrl {
+        code += 16;
+    }
+    let (x, y) = (col as u32 + 1, row as u32 + 1);
+    match modes.mouse_encoding {
+        MouseEncoding::Sgr => {
+            let fin = if action == MouseAction::Release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{code};{x};{y}{fin}").into_bytes())
+        }
+        MouseEncoding::Default => {
+            // One byte per value, offset by 32: coordinates past 223 can't
+            // be expressed, and xterm drops such events.
+            if x > 223 || y > 223 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', (32 + code) as u8, (32 + x) as u8, (32 + y) as u8])
+        }
+        MouseEncoding::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for v in [32 + code, 32 + x, 32 + y] {
+                let c = char::from_u32(v.min(2047))?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
     }
 }

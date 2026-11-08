@@ -26,6 +26,7 @@ fontdb = "0.24"
 bytemuck = "1"
 pollster = "1"
 png = "0.18"
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
 [profile.release]
 debug = "line-tables-only"

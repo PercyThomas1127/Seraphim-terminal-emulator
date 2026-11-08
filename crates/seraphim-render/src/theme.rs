@@ -11,6 +11,9 @@ pub struct Theme {
     pub cursor: Rgb,
     /// Text color drawn over a block cursor.
     pub cursor_text: Rgb,
+    pub selection_bg: Rgb,
+    /// Text color inside the selection; `None` keeps each cell's color.
+    pub selection_fg: Option<Rgb>,
     /// ANSI colors 0-15.
     pub ansi: [Rgb; 16],
     /// Render bold text in colors 0-7 with their bright variants.
@@ -25,6 +28,8 @@ impl Default for Theme {
             background: [0x14, 0x12, 0x1f],
             cursor: [0xf5, 0xa6, 0xd0],
             cursor_text: [0x14, 0x12, 0x1f],
+            selection_bg: [0x4a, 0x3b, 0x6b],
+            selection_fg: None,
             ansi: [
                 [0x2a, 0x27, 0x3a], // black
                 [0xff, 0x55, 0x77], // red

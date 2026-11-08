@@ -22,10 +22,12 @@
 mod cell;
 mod grid;
 pub mod input;
+mod selection;
 mod state;
 
 pub use cell::{Attrs, Cell, Color, Flags};
 pub use grid::{Grid, Row};
+pub use selection::{Point, Selection, SelectionKind, SelectionRange, WORD_SEPARATORS};
 pub use state::{
     CursorShape, CursorState, Hyperlink, Modes, MouseEncoding, MouseMode, TerminalEvent,
 };
@@ -122,6 +124,68 @@ impl Terminal {
     /// for partial redraws, spec §4.4).
     pub fn take_damage(&mut self) -> Vec<usize> {
         self.state.take_damage()
+    }
+
+    // ---- viewport (scrollback viewing) --------------------------------
+
+    /// How many lines the viewport is scrolled back into history (0 = live).
+    pub fn display_offset(&self) -> usize {
+        self.state.display_offset
+    }
+
+    /// Scroll the viewport by `delta` lines (positive = back into history).
+    /// Clamped to the available scrollback; the alternate screen has none.
+    pub fn scroll_display(&mut self, delta: i64) {
+        self.state.scroll_display(delta);
+    }
+
+    /// Return the viewport to the live screen.
+    pub fn scroll_to_bottom(&mut self) {
+        let off = self.state.display_offset as i64;
+        self.state.scroll_display(-off);
+    }
+
+    /// The row displayed at viewport row `i`, which may come from
+    /// scrollback when [`Terminal::display_offset`] is non-zero. Its length
+    /// may differ from [`Terminal::cols`] if the terminal was resized.
+    pub fn visible_row(&self, i: usize) -> &Row {
+        self.state.visible_row(i)
+    }
+
+    /// Absolute [`Point`] for a cell of the viewport.
+    pub fn viewport_point(&self, row: usize, col: usize) -> Point {
+        Point::new(row as i64 - self.state.display_offset as i64, col.min(self.cols() - 1))
+    }
+
+    // ---- selection ------------------------------------------------------
+
+    pub fn start_selection(&mut self, kind: SelectionKind, at: Point) {
+        self.state.selection = Some(Selection { kind, anchor: at, head: at });
+    }
+
+    /// Move the selection's free end (e.g. while dragging).
+    pub fn update_selection(&mut self, to: Point) {
+        if let Some(s) = &mut self.state.selection {
+            s.head = to;
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.state.selection = None;
+    }
+
+    pub fn selection(&self) -> Option<&Selection> {
+        self.state.selection.as_ref()
+    }
+
+    /// The selection, normalized and expanded (words/lines), if any.
+    pub fn selection_range(&self) -> Option<SelectionRange> {
+        self.state.selection_range()
+    }
+
+    /// Selected text, with soft-wrapped lines joined.
+    pub fn selection_text(&self) -> Option<String> {
+        self.state.selection_text()
     }
 
     /// The whole visible screen as text, one line per row, trailing blanks

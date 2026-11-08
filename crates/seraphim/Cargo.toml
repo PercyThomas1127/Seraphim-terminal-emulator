@@ -13,3 +13,4 @@ seraphim-render.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 pollster.workspace = true
+arboard.workspace = true
