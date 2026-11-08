@@ -130,11 +130,16 @@ selection_fade_ms = 90
 # opacity = 0.7
 # params = { speed = 0.3, intensity = 0.8, hue = 0.78 }
 #
+# Images: PNG, JPEG, WebP or GIF; animated GIF, WebP and APNG play.
+# blur is a radius in image pixels; brightness, contrast and saturation
+# (1 = unchanged) can be animated and bound like shader parameters.
 # [[background]]
 # kind = "image"
-# path = "~/Pictures/wallpaper.png"
+# path = "~/Pictures/wallpaper.jpg"
 # fit = "cover"
 # opacity = 0.3
+# blur = 12
+# params = { brightness = 0.6, saturation = 0.8 }
 #
 # [[background]]
 # id = "glow"

@@ -125,7 +125,10 @@ fn image_layer_fits() {
             .unwrap();
     }
     r.v.set_layers(
-        &[LayerSpec::new("i", LayerKind::Image { path: path.clone(), fit: Fit::Stretch })],
+        &[LayerSpec::new(
+            "i",
+            LayerKind::Image { path: path.clone(), fit: Fit::Stretch, blur: 0.0 },
+        )],
         Transition::Instant,
     );
     let img = r.frame("");
@@ -134,7 +137,10 @@ fn image_layer_fits() {
     assert!(near(rgb(img.pixel(w - 2, h - 2)), [255, 255, 255], 8), "bottom-right white");
     // Missing files are reported, not fatal.
     let errs = r.v.set_layers(
-        &[LayerSpec::new("x", LayerKind::Image { path: dir.join("nope.png"), fit: Fit::Cover })],
+        &[LayerSpec::new(
+            "x",
+            LayerKind::Image { path: dir.join("nope.png"), fit: Fit::Cover, blur: 0.0 },
+        )],
         Transition::Instant,
     );
     assert_eq!(errs.len(), 1, "{errs:?}");
@@ -386,5 +392,87 @@ mod heavens {
         };
         assert!(r.v.set_layers(&[spec], Transition::Instant).is_empty());
         assert_eq!(rgb(frame(&mut r, 0.0).pixel(1, 1)), [0, 255, 0]);
+    }
+}
+
+mod pictures {
+    use super::*;
+
+    fn gif(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = image::codecs::gif::GifEncoder::new(file);
+        let frame = |c: [u8; 4], ms| {
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(8, 8, image::Rgba(c)),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(ms, 1),
+            )
+        };
+        enc.encode_frames([frame([255, 0, 0, 255], 500), frame([0, 0, 255, 255], 500)]).unwrap();
+    }
+
+    #[test]
+    fn animated_gif_plays_by_the_clock() {
+        let Some(mut r) = rig() else { return };
+        let dir = std::env::temp_dir().join(format!("seraphim-vis-gif-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.gif");
+        gif(&path);
+        let spec = LayerSpec::new("g", LayerKind::Image { path, fit: Fit::Stretch, blur: 0.0 });
+        assert!(r.v.set_layers(&[spec], Transition::Instant).is_empty());
+        assert!(r.v.animating(), "an animation needs frames");
+        r.v.set_fixed_time(Some(0.2));
+        assert_eq!(rgb(r.frame("").pixel(1, 1)), [255, 0, 0]);
+        r.v.set_fixed_time(Some(0.7));
+        assert_eq!(rgb(r.frame("").pixel(1, 1)), [0, 0, 255]);
+        r.v.set_fixed_time(Some(1.2));
+        assert_eq!(rgb(r.frame("").pixel(1, 1)), [255, 0, 0], "loops");
+    }
+
+    #[test]
+    fn grading_and_blur() {
+        let Some(mut r) = rig() else { return };
+        let dir = std::env::temp_dir().join(format!("seraphim-vis-grade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("g.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 100, 50, 255])).save(&path).unwrap();
+        let grey = LayerSpec {
+            params: vec![("saturation".into(), 0.0)],
+            ..LayerSpec::new(
+                "i",
+                LayerKind::Image { path: path.clone(), fit: Fit::Stretch, blur: 0.0 },
+            )
+        };
+        assert!(r.v.set_layers(&[grey], Transition::Instant).is_empty());
+        let p = rgb(r.frame("").pixel(1, 1));
+        assert!(p[0] == p[1] && p[1] == p[2], "desaturated: {p:?}");
+        r.v.set_param("i", "brightness", 0.5, Transition::Instant);
+        let q = rgb(r.frame("").pixel(1, 1));
+        assert!(q[0] < p[0] / 2 + 10, "darker: {p:?} -> {q:?}");
+        let bad = LayerSpec {
+            params: vec![("hue".into(), 1.0)],
+            ..LayerSpec::new(
+                "j",
+                LayerKind::Image { path: path.clone(), fit: Fit::Stretch, blur: 0.0 },
+            )
+        };
+        let e = r.v.set_layers(&[bad], Transition::Instant);
+        assert!(e[0].contains("saturation"), "{e:?}");
+        // Blur: a hard edge becomes a ramp.
+        let edge = dir.join("e.png");
+        image::RgbaImage::from_fn(64, 8, |x, _| {
+            image::Rgba(if x < 32 { [255, 255, 255, 255] } else { [0, 0, 0, 255] })
+        })
+        .save(&edge)
+        .unwrap();
+        let spec =
+            LayerSpec::new("b", LayerKind::Image { path: edge, fit: Fit::Stretch, blur: 8.0 });
+        assert!(r.v.set_layers(&[spec], Transition::Instant).is_empty());
+        let img = r.frame("");
+        let mid = img.width / 2;
+        let row: Vec<u8> = (mid - 6..mid + 6).map(|x| img.pixel(x, 1)[0]).collect();
+        let distinct = row.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(distinct >= 5, "soft edge {row:?}");
     }
 }

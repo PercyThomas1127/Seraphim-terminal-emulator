@@ -114,7 +114,7 @@ fn layers(
             "image" => {
                 let path = b.resolve(b.path.as_deref().unwrap_or_default(), &dir);
                 files.push(path.clone());
-                LayerKind::Image { path, fit: Fit::parse(&b.fit).unwrap_or_default() }
+                LayerKind::Image { path, fit: Fit::parse(&b.fit).unwrap_or_default(), blur: b.blur }
             }
             _ => {
                 let name = b.shader.clone().unwrap_or_default();

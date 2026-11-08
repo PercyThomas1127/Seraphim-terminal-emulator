@@ -17,6 +17,7 @@
 //!   motion).
 
 pub mod animation;
+pub mod picture;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -153,10 +154,13 @@ pub enum LayerKind {
         colors: Vec<Rgba>,
         angle: f32,
     },
-    /// PNG image.
+    /// PNG, JPEG, WebP or GIF; animated GIF/WebP/APNG play. `blur` is a
+    /// radius in image pixels. Parameters `brightness`, `contrast` and
+    /// `saturation` (1 = unchanged) grade the colors.
     Image {
         path: PathBuf,
         fit: Fit,
+        blur: f32,
     },
     /// A built-in shader by name, or WGSL source implementing `shade`.
     Shader {
@@ -211,7 +215,12 @@ unsafe impl bytemuck::Pod for Uniforms {}
 struct GpuLayer {
     id: String,
     pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
+    /// One per animation frame (a single one otherwise).
+    frames: Vec<wgpu::BindGroup>,
+    /// Frame delays in seconds, and their sum (0: still).
+    delays: Vec<f32>,
+    period: f32,
+    current: usize,
     uniforms: wgpu::Buffer,
     opacity: Animated,
     params: Vec<(String, Animated)>,
@@ -464,6 +473,18 @@ impl VisualEngine {
             for (i, (_, a)) in l.params.iter_mut().enumerate().take(MAX_PARAMS) {
                 u.params[i] = a.value(now) as f32;
             }
+            if l.period > 0.0 {
+                // Animated image: the frame for this point in its loop.
+                let mut t = (now as f32).rem_euclid(l.period);
+                l.current = l.delays.len() - 1;
+                for (i, d) in l.delays.iter().enumerate() {
+                    if t < *d {
+                        l.current = i;
+                        break;
+                    }
+                    t -= d;
+                }
+            }
             self.queue.write_buffer(&l.uniforms, 0, bytemuck::bytes_of(&u));
         }
     }
@@ -472,14 +493,15 @@ impl VisualEngine {
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
         for l in &self.layers {
             pass.set_pipeline(&l.pipeline);
-            pass.set_bind_group(0, &l.bind_group, &[]);
+            pass.set_bind_group(0, &l.frames[l.current.min(l.frames.len() - 1)], &[]);
             pass.draw(0..3, 0..1);
         }
     }
 
     fn build(&self, spec: &LayerSpec) -> Result<GpuLayer, String> {
         let mut data: Uniforms = bytemuck::Zeroable::zeroed();
-        let mut texture = None;
+        let mut textures: Vec<wgpu::TextureView> = Vec::new();
+        let mut delays: Vec<f32> = Vec::new();
         let mut params: Vec<(String, f32)> = Vec::new();
         let mut colors: Vec<(String, Rgba)> = Vec::new();
         let body: String = match &spec.kind {
@@ -500,18 +522,34 @@ impl VisualEngine {
                 data.info[1] = angle.to_radians();
                 include_str!("shaders/gradient.wgsl").into()
             }
-            LayerKind::Image { path, fit } => {
-                let (w, h, rgba) = load_png(path)?;
+            LayerKind::Image { path, fit, blur } => {
+                let frames = picture::load(path, *blur)?;
                 let max = self.device.limits().max_texture_dimension_2d;
+                let (w, h) = (frames[0].width, frames[0].height);
                 if w > max || h > max {
                     return Err(format!(
                         "{}: {w}x{h} exceeds the GPU limit of {max}",
                         path.display()
                     ));
                 }
-                texture = Some(create_texture(&self.device, &self.queue, w, h, &rgba));
+                for f in &frames {
+                    textures.push(create_texture(
+                        &self.device,
+                        &self.queue,
+                        f.width,
+                        f.height,
+                        &f.rgba,
+                    ));
+                }
+                if frames.len() > 1 {
+                    delays = frames.iter().map(|f| f.delay).collect();
+                }
                 data.image = [w as f32, h as f32, 0.0, 0.0];
                 data.info[2] = *fit as u32 as f32;
+                const GRADING: &[(&str, f32)] =
+                    &[("brightness", 1.0), ("contrast", 1.0), ("saturation", 1.0)];
+                params = with_defaults(GRADING, &spec.params, false)
+                    .map_err(|n| no_such("image", "parameter", n, GRADING))?;
                 include_str!("shaders/image.wgsl").into()
             }
             LayerKind::Shader { name, source } => {
@@ -556,7 +594,7 @@ impl VisualEngine {
             data.colors[i] = *c;
         }
         let source = format!("{PRELUDE}\n{consts}\n{body}");
-        let uses_time = body.contains("u.time");
+        let uses_time = body.contains("u.time") || !delays.is_empty();
 
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -598,26 +636,36 @@ impl VisualEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let view = texture.as_ref().unwrap_or(&self.empty_texture);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(&spec.id),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let views: Vec<&wgpu::TextureView> =
+            if textures.is_empty() { vec![&self.empty_texture] } else { textures.iter().collect() };
+        let frames = views
+            .into_iter()
+            .map(|view| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&spec.id),
+                    layout: &self.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                })
+            })
+            .collect();
+        let period = delays.iter().sum();
         Ok(GpuLayer {
             id: spec.id.clone(),
             pipeline,
-            bind_group,
+            frames,
+            delays,
+            period,
+            current: 0,
             uniforms,
             opacity: Animated::new(spec.opacity as f64),
             params: params.into_iter().map(|(n, v)| (n, Animated::new(v as f64))).collect(),
@@ -695,29 +743,4 @@ fn create_texture(
         size,
     );
     texture.create_view(&wgpu::TextureViewDescriptor::default())
-}
-
-/// Decode a PNG to RGBA8.
-fn load_png(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("image too large")?];
-    let info = reader.next_frame(&mut buf).map_err(|e| format!("{}: {e}", path.display()))?;
-    let px = (info.width * info.height) as usize;
-    let data = &buf[..info.buffer_size()];
-    let rgba: Vec<u8> = match info.color_type {
-        png::ColorType::Rgba => data.to_vec(),
-        png::ColorType::Rgb => data.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
-        png::ColorType::GrayscaleAlpha => {
-            data.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect()
-        }
-        png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        png::ColorType::Indexed => return Err("indexed PNG was not expanded".into()),
-    };
-    if rgba.len() != px * 4 {
-        return Err(format!("{}: unexpected PNG layout", path.display()));
-    }
-    Ok((info.width, info.height, rgba))
 }

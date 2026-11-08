@@ -54,7 +54,8 @@
 
 * (Done since: Kitty graphics protocol and Sixel inline images; see the
   Phase II plan.)
-* Image formats beyond PNG, image blur, video and animated images.
+* (Done since: JPEG/WebP/GIF, animated images, blur, color grading.)
+  Still to do: video, and blur for non-image layers.
 * (Done since: event rules and continuous bindings, ADR 0008.)
 * (Done since: live reload, `seraphim/src/watch.rs`. Scene changes made
   while the window is unfocused apply instantly instead of freezing

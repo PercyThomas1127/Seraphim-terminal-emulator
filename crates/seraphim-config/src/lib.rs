@@ -438,6 +438,8 @@ pub struct Background {
     pub path: Option<String>,
     /// `image`: `cover`, `contain`, `stretch` or `tile`.
     pub fit: String,
+    /// `image`: blur radius in image pixels.
+    pub blur: f32,
     /// `shader`: a built-in name (`aurora`, `starfield`, `heavens`) or a `.wgsl` file.
     pub shader: Option<String>,
     pub opacity: f32,
@@ -460,6 +462,7 @@ impl Default for Background {
             angle: 90.0,
             path: None,
             fit: "cover".into(),
+            blur: 0.0,
             shader: None,
             opacity: 1.0,
             blend: "normal".into(),
@@ -1300,6 +1303,9 @@ impl Background {
             "image" => {
                 if self.path.as_deref().is_none_or(|p| p.trim().is_empty()) {
                     return Err("an image layer needs `path`".into());
+                }
+                if !(0.0..=200.0).contains(&self.blur) {
+                    return Err(format!("blur must be 0-200 (got {})", self.blur));
                 }
                 if !["cover", "contain", "stretch", "tile"].contains(&self.fit.as_str()) {
                     return Err(format!(

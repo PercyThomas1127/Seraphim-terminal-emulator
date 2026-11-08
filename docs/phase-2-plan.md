@@ -21,6 +21,7 @@
 | Live reload: config, profile, theme, preset, shader and image files are watched (polled, no extra dependency) and applied on save; in-window notices for reloads and errors, including at startup | `seraphim/src/watch.rs` |
 | Cursor and selection effects: glide, trail, blink fade, glow, typing ripples, selection fade-in (`[cursor]`), time-based, off under reduced motion | `seraphim-render/src/cursorfx.rs` |
 | Continuous bindings `[[bind]]`: CPU, memory, load, battery, time of day, or an event field, mapped by range or table, eased; values survive reloads | `seraphim/src/bindings.rs` |
+| Background images in PNG, JPEG, WebP and GIF; animated GIF/WebP/APNG; blur (at load); color grading (brightness, contrast, saturation as animatable parameters) | `seraphim-visual/src/picture.rs` |
 | Named shader colors (`palette`, `color(C_name)`), theme-relative | `seraphim-visual` |
 
 See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules.
@@ -30,5 +31,7 @@ See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules
 1. **Graphics follow-ups:** Kitty animation frames (`a=f/a/c`), Unicode
    placeholders (`U=1`, for tmux), shared-memory transfer (`t=s`),
    moving images with scroll regions and reflow.
-3. **More background features:** JPEG/WebP, blur, animated images.
+2. **More background features:** video; blur of non-image layers (a
+   GPU post-process); animated gradients; frame pacing for animated
+   images (wake at the next frame instead of drawing at max_fps).
 6. **Measure animated scenes on real GPUs.**
