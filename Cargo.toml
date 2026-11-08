@@ -17,6 +17,8 @@ seraphim-render = { path = "crates/seraphim-render" }
 seraphim-config = { path = "crates/seraphim-config" }
 vte = "0.15"
 unicode-width = "0.2"
+unicode-segmentation = "1"
+unicode-normalization = "0.1"
 nix = { version = "0.31", features = ["term", "process", "signal", "fs", "ioctl"] }
 libc = "0.2"
 serde_json = "1"

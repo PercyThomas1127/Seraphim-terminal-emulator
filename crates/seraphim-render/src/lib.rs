@@ -22,10 +22,11 @@ use std::collections::HashMap;
 use seraphim_terminal::{Attrs, CursorShape, Flags, Point, SelectionRange, Terminal};
 
 use atlas::{Atlas, AtlasRect, ATLAS_SIZE};
-use font::GlyphKey;
+use font::{is_emoji_cluster, is_ignorable, is_private_use, GlyphKey, ShapedGlyph};
 pub use font::{CellMetrics, FontConfig, FontError, FontStyle, Fonts};
 use theme::to_f32;
 pub use theme::{Rgb, Theme};
+use unicode_normalization::UnicodeNormalization;
 
 /// One quad. Layout must match `Instance` in `shader.wgsl`.
 #[repr(C)]
@@ -94,6 +95,8 @@ pub struct Renderer {
     instance_count: u32,
     atlas: Atlas,
     glyphs: HashMap<GlyphKey, Option<CachedGlyph>>,
+    /// Shaping results per (face, cluster text).
+    shaped: HashMap<(u16, String), Vec<ShapedGlyph>>,
     fonts: Fonts,
     /// The configured theme.
     base_theme: Theme,
@@ -257,6 +260,7 @@ impl Renderer {
             instance_count: 0,
             atlas: Atlas::new(ATLAS_SIZE),
             glyphs: HashMap::new(),
+            shaped: HashMap::new(),
             fonts,
             base_theme: theme.clone(),
             theme,
@@ -295,6 +299,7 @@ impl Renderer {
     pub fn set_fonts(&mut self, fonts: Fonts) {
         self.fonts = fonts;
         self.glyphs.clear();
+        self.shaped.clear();
         self.atlas.clear();
     }
 
@@ -456,37 +461,82 @@ impl Renderer {
                 if cell.ch != ' ' && !flags.contains(Flags::HIDDEN) {
                     let style =
                         FontStyle::new(flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
-                    if !self.push_glyph(queue, cell.ch, style, x, y, width, fg) {
+                    let marks = row.combining(c);
+                    let ok = if !marks.is_empty() {
+                        let mut text = String::with_capacity(8);
+                        text.push(cell.ch);
+                        text.extend(marks.iter());
+                        self.push_cluster(queue, &text, style, x, y, width, fg)
+                    } else if is_private_use(cell.ch) {
+                        // Nerd Font icons may spill into a following blank.
+                        let next_blank = c + 1 < n
+                            && row.cells[c + 1].ch == ' '
+                            && !row.cells[c + 1].is_wide_spacer()
+                            && row.combining(c + 1).is_empty();
+                        // Powerline separators (U+E0A0-E0D7) must stay one
+                        // cell wide so segment edges meet their backgrounds.
+                        let powerline = matches!(cell.ch as u32, 0xE0A0..=0xE0D7);
+                        let box_w = if next_blank && !cell.is_wide() && !powerline {
+                            2.0 * cw
+                        } else {
+                            width
+                        };
+                        self.push_symbol(queue, cell.ch, style, x, y, box_w, fg)
+                    } else if is_ignorable(cell.ch) {
+                        true
+                    } else {
+                        self.push_glyph(queue, cell.ch, style, x, y, width, fg)
+                    };
+                    if !ok {
                         return false;
-                    }
-                    if !row.combining(c).is_empty() {
-                        for &mark in row.combining(c) {
-                            if !self.push_glyph(queue, mark, style, x, y, width, fg) {
-                                return false;
-                            }
-                        }
                     }
                 }
                 let stroke = m.stroke;
                 if flags.intersects(Flags::ALL_UNDERLINES) {
                     let uc = self.theme.underline_color(&cell.attrs, fg);
                     let uy = y + m.underline_y;
-                    self.push_solid(x, uy, width, stroke, uc);
-                    if flags.contains(Flags::DOUBLE_UNDERLINE) {
-                        self.push_solid(x, (uy - 2.0 * stroke).max(y), width, stroke, uc);
-                    }
-                    if flags.contains(Flags::CURLY_UNDERLINE) {
-                        // Approximate a wave with alternating short dashes.
-                        let seg = (cw / 4.0).max(1.0);
-                        let mut sx = x;
-                        let mut up = true;
+                    // Patterns are aligned to absolute x so they continue
+                    // seamlessly across cells.
+                    let pattern = |r: &mut Self, on: f32, off: f32, dy: f32| {
+                        let period = on + off;
+                        let mut sx = x - ((x - pad) % period);
                         while sx < x + width {
-                            let dy = if up { -stroke } else { 0.0 };
-                            self.push_solid(sx, uy + dy, seg.min(x + width - sx), stroke, uc);
-                            sx += seg;
-                            up = !up;
+                            let a = sx.max(x);
+                            let b = (sx + on).min(x + width);
+                            if b > a {
+                                r.push_solid(a, uy + dy, b - a, stroke, uc);
+                            }
+                            sx += period;
+                        }
+                    };
+                    if flags.contains(Flags::CURLY_UNDERLINE) {
+                        // A wave: alternating raised and lowered segments.
+                        let seg = (cw / 4.0).max(1.0);
+                        pattern(self, seg, seg, -stroke);
+                        let mut sx = x - ((x - pad) % (2.0 * seg)) + seg;
+                        while sx < x + width {
+                            let a = sx.max(x);
+                            let b = (sx + seg).min(x + width);
+                            if b > a {
+                                self.push_solid(a, uy, b - a, stroke, uc);
+                            }
+                            sx += 2.0 * seg;
+                        }
+                    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                        let dot = stroke.max(1.0);
+                        pattern(self, dot, dot, 0.0);
+                    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                        let dash = (cw * 0.5).round().max(2.0);
+                        pattern(self, dash, (cw * 0.25).round().max(1.0), 0.0);
+                    } else {
+                        self.push_solid(x, uy, width, stroke, uc);
+                        if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                            self.push_solid(x, (uy - 2.0 * stroke).max(y), width, stroke, uc);
                         }
                     }
+                }
+                if flags.contains(Flags::OVERLINE) {
+                    self.push_solid(x, y, width, stroke, fg);
                 }
                 if flags.contains(Flags::STRIKETHROUGH) {
                     self.push_solid(x, y + m.strike_y, width, stroke, fg);
@@ -543,6 +593,17 @@ impl Renderer {
         });
     }
 
+    /// The cached atlas entry for `key`, uploading it on first use.
+    /// `Err` means the atlas is full.
+    fn cached(&mut self, queue: &wgpu::Queue, key: GlyphKey) -> Result<Option<CachedGlyph>, ()> {
+        if let Some(g) = self.glyphs.get(&key) {
+            return Ok(*g);
+        }
+        let g = self.upload_glyph(queue, key).ok_or(())?;
+        self.glyphs.insert(key, g);
+        Ok(g)
+    }
+
     /// Returns false if the atlas is full.
     #[allow(clippy::too_many_arguments)]
     fn push_glyph(
@@ -556,18 +617,29 @@ impl Renderer {
         fg: Rgb,
     ) -> bool {
         let Some(key) = self.fonts.lookup(ch, style) else { return true };
-        let glyph = match self.glyphs.get(&key) {
-            Some(g) => *g,
-            None => {
-                let Some(g) = self.upload_glyph(queue, key) else { return false };
-                self.glyphs.insert(key, g);
-                g
-            }
-        };
+        self.push_key(queue, key, x, y, 0.0, 0.0, cell_w, fg)
+    }
+
+    /// Draw `key` with its pen at (`x + dx`, baseline - `dy`) in the cell at
+    /// (`x`, `y`). Color glyphs larger than the cell are fitted to it.
+    #[allow(clippy::too_many_arguments)]
+    fn push_key(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: GlyphKey,
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+        cell_w: f32,
+        fg: Rgb,
+    ) -> bool {
+        let Ok(glyph) = self.cached(queue, key) else { return false };
         let Some(g) = glyph else { return true };
         let m = self.fonts.metrics();
         let (mut w, mut h) = (g.rect.w as f32, g.rect.h as f32);
-        let (mut gx, mut gy) = (x + g.left as f32, y + m.baseline - g.top as f32);
+        let (mut gx, mut gy) =
+            ((x + dx).round() + g.left as f32, (y + m.baseline - dy).round() - g.top as f32);
         if g.color && (h > m.height || w > cell_w) {
             // Emoji bitmaps come in fixed strikes (e.g. 136px): fit to cell.
             let s = (m.height / h).min(cell_w / w);
@@ -579,6 +651,97 @@ impl Renderer {
         self.instances.push(Instance {
             rect: [gx, gy, w, h],
             uv: [g.rect.x as f32, g.rect.y as f32, g.rect.w as f32, g.rect.h as f32],
+            color: to_f32(fg, 1.0),
+            kind: if g.color { KIND_COLOR } else { KIND_MASK },
+            _pad: [0; 3],
+        });
+        true
+    }
+
+    /// Draw a multi-codepoint grapheme cluster (base + combining marks, or
+    /// an emoji sequence) as the font intends.
+    #[allow(clippy::too_many_arguments)]
+    fn push_cluster(
+        &mut self,
+        queue: &wgpu::Queue,
+        text: &str,
+        style: FontStyle,
+        x: f32,
+        y: f32,
+        cell_w: f32,
+        fg: Rgb,
+    ) -> bool {
+        let emoji = is_emoji_cluster(text);
+        if !emoji {
+            // A precomposed character (é for e + U+0301) in the cell's own
+            // font is the crispest result.
+            let mut nfc = text.nfc();
+            if let (Some(c), None) = (nfc.next(), nfc.next()) {
+                if let Some(key) = self.fonts.lookup(c, style) {
+                    return self.push_key(queue, key, x, y, 0.0, 0.0, cell_w, fg);
+                }
+            }
+        }
+        let Some(face) = self.fonts.lookup_cluster(text, style, emoji) else { return true };
+        let k = (face, text.to_owned());
+        let glyphs = match self.shaped.get(&k) {
+            Some(g) => g.clone(),
+            None => {
+                let g = self.fonts.shape(face, text);
+                if self.shaped.len() > 4096 {
+                    self.shaped.clear();
+                }
+                self.shaped.insert(k, g.clone());
+                g
+            }
+        };
+        let bold = style == FontStyle::Bold || style == FontStyle::BoldItalic;
+        for g in glyphs {
+            let key = GlyphKey { face, glyph: g.glyph, bold, size: 0 };
+            if !self.push_key(queue, key, x, y, g.x, g.y, cell_w, fg) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Draw a private-use (Nerd Font) icon scaled to fill `box_w` x cell
+    /// height, centered. Icon fonts' glyphs are sized and positioned for
+    /// their own metrics, not ours, so drawing them as-is makes them too
+    /// small or offset (sometimes nearly out of the cell).
+    #[allow(clippy::too_many_arguments)]
+    fn push_symbol(
+        &mut self,
+        queue: &wgpu::Queue,
+        ch: char,
+        style: FontStyle,
+        x: f32,
+        y: f32,
+        box_w: f32,
+        fg: Rgb,
+    ) -> bool {
+        let Some(key) = self.fonts.lookup(ch, style) else { return true };
+        let Ok(base) = self.cached(queue, key) else { return false };
+        let Some(b) = base else { return true };
+        let m = self.fonts.metrics();
+        let (w, h) = (b.rect.w as f32, b.rect.h as f32);
+        // Powerline glyphs fill the full cell height (no margin) so they join
+        // seamlessly with the rows of a segmented prompt.
+        let powerline = matches!(ch as u32, 0xE0A0..=0xE0D7);
+        let margin = if powerline { 0.0 } else { 1.0 };
+        let s = ((box_w - margin) / w).min((m.height - margin) / h).clamp(0.25, 4.0);
+        let key = if (s - 1.0).abs() > 0.05 {
+            let size = (self.fonts.size_px() * s * 4.0).round().clamp(4.0, u16::MAX as f32) as u16;
+            GlyphKey { size, ..key }
+        } else {
+            key
+        };
+        let Ok(glyph) = self.cached(queue, key) else { return false };
+        let Some(g) = glyph else { return true };
+        let (w, h) = (g.rect.w as f32, g.rect.h as f32);
+        self.instances.push(Instance {
+            rect: [x + ((box_w - w) / 2.0).round(), y + ((m.height - h) / 2.0).round(), w, h],
+            uv: [g.rect.x as f32, g.rect.y as f32, w, h],
             color: to_f32(fg, 1.0),
             kind: if g.color { KIND_COLOR } else { KIND_MASK },
             _pad: [0; 3],

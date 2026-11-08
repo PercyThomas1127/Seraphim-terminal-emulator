@@ -103,7 +103,9 @@ impl Row {
 
     pub(crate) fn push_combining(&mut self, col: usize, mark: char) {
         match self.combining.iter_mut().find(|(c, _)| *c as usize == col) {
-            Some((_, marks)) if marks.len() < 16 => {
+            // Long enough for the longest emoji sequences (tag flags,
+            // families), bounded against "zalgo" floods.
+            Some((_, marks)) if marks.len() < 32 => {
                 let mut v = marks.to_vec();
                 v.push(mark);
                 *marks = v.into_boxed_slice();

@@ -45,6 +45,7 @@ pub struct WindowOptions {
     pub allow_clipboard_read: bool,
     pub theme: Theme,
     pub scrollback: usize,
+    pub grapheme_clustering: bool,
 }
 
 impl Default for WindowOptions {
@@ -59,6 +60,7 @@ impl Default for WindowOptions {
             allow_clipboard_read: false,
             theme: Theme::default(),
             scrollback: seraphim_terminal::DEFAULT_SCROLLBACK,
+            grapheme_clustering: true,
         }
     }
 }
@@ -276,6 +278,7 @@ impl App {
                 notify: Some(notify),
                 color_scheme: Some(renderer.theme().scheme()),
                 scrollback: o.scrollback,
+                grapheme_clustering: o.grapheme_clustering,
             },
             &bus,
         )

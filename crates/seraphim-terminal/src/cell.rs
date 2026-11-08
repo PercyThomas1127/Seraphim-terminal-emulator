@@ -36,9 +36,20 @@ impl Flags {
     /// and wrapped to the next row. Not part of the text (copying or
     /// reflowing the line skips it).
     pub const WIDE_PADDING: Flags = Flags(1 << 12);
+    /// SGR 53.
+    pub const OVERLINE: Flags = Flags(1 << 13);
+    /// SGR 4:4.
+    pub const DOTTED_UNDERLINE: Flags = Flags(1 << 14);
+    /// SGR 4:5.
+    pub const DASHED_UNDERLINE: Flags = Flags(1 << 15);
 
-    pub const ALL_UNDERLINES: Flags =
-        Flags(Self::UNDERLINE.0 | Self::DOUBLE_UNDERLINE.0 | Self::CURLY_UNDERLINE.0);
+    pub const ALL_UNDERLINES: Flags = Flags(
+        Self::UNDERLINE.0
+            | Self::DOUBLE_UNDERLINE.0
+            | Self::CURLY_UNDERLINE.0
+            | Self::DOTTED_UNDERLINE.0
+            | Self::DASHED_UNDERLINE.0,
+    );
 
     pub const fn empty() -> Self {
         Flags(0)

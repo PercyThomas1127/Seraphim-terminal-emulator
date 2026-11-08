@@ -61,6 +61,8 @@ pub struct SessionConfig {
     /// Base colors used to answer OSC 10/11/4 color queries. Set before the
     /// program starts, so even its very first query sees the real theme.
     pub color_scheme: Option<seraphim_terminal::palette::ColorScheme>,
+    /// Initial (and RIS) state of grapheme clustering, mode 2027.
+    pub grapheme_clustering: bool,
 }
 
 impl Default for SessionConfig {
@@ -72,6 +74,7 @@ impl Default for SessionConfig {
             scrollback: seraphim_terminal::DEFAULT_SCROLLBACK,
             notify: None,
             color_scheme: None,
+            grapheme_clustering: true,
         }
     }
 }
@@ -130,6 +133,7 @@ impl Session {
         if let Some(scheme) = config.color_scheme.clone() {
             term.set_color_scheme(scheme);
         }
+        term.set_grapheme_clustering(config.grapheme_clustering);
         let terminal = Arc::new(Mutex::new(term));
         let reader = pty.reader()?;
         let writer = Arc::new(Mutex::new(pty.writer()?));

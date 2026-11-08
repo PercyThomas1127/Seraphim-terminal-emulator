@@ -204,6 +204,15 @@ impl Terminal {
         self.state.selection_text()
     }
 
+    /// Group grapheme clusters (emoji ZWJ sequences, flags, skin tones,
+    /// keycaps, VS16 emoji, combining marks) into single cells with the
+    /// cluster's width. On by default; applications can toggle it with
+    /// mode 2027. Turning it off gives strict per-codepoint widths.
+    pub fn set_grapheme_clustering(&mut self, on: bool) {
+        self.state.grapheme_default = on;
+        self.state.modes.grapheme_clusters = on;
+    }
+
     // ---- colors -------------------------------------------------------
 
     /// Set the base colors (normally from the renderer's theme) used to

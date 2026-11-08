@@ -20,6 +20,12 @@ padding = 6.0
 [terminal]
 # Lines of history kept per session.
 scrollback = 10000
+# Treat emoji sequences (flags, skin tones, ZWJ sequences like 👩‍💻, keycaps,
+# ❤️) and combining marks as single characters of the right width. Programs
+# that count widths per codepoint (some shells) may misplace the cursor after
+# such emoji; set to false for strict per-codepoint widths. Programs can
+# also switch this themselves with mode 2027.
+grapheme_clustering = true
 
 [shell]
 # Program to run; when unset, $SHELL (then your passwd entry, then /bin/sh).

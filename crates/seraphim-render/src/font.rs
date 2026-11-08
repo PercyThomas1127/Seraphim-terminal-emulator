@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use fontdb::{Database, Family, Query, Style, Weight, ID};
 use swash::scale::{image::Content, Render, ScaleContext, Source, StrikeWith};
+use swash::shape::ShapeContext;
+use swash::text::Codepoint;
 use swash::zeno::{Format, Vector};
 use swash::{CacheKey, FontRef};
 
@@ -80,6 +82,49 @@ struct Face {
     synthetic_bold: bool,
 }
 
+/// What kind of character a fallback search is for; decides which fonts
+/// are tried first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Preference {
+    Text,
+    /// Emoji presentation: color emoji fonts first.
+    Emoji,
+    /// Private-use icons: Nerd Font symbol fonts first.
+    Symbol,
+}
+
+/// A glyph produced by shaping, offset from the cell origin (pixels; `y`
+/// up).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapedGlyph {
+    pub glyph: u16,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Codepoints that are never drawn by themselves (joiners, variation
+/// selectors, tags, ...).
+pub fn is_ignorable(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x034F | 0x115F | 0x1160 | 0x180B..=0x180F | 0x200B..=0x200F | 0x202A..=0x202E
+        | 0x2060..=0x206F | 0xFE00..=0xFE0F | 0xFEFF | 0xE0000..=0xE0FFF)
+}
+
+/// Private Use Area (where Nerd Font icons live).
+pub fn is_private_use(c: char) -> bool {
+    matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
+}
+
+/// Does this cluster want emoji (color) presentation?
+pub fn is_emoji_cluster(text: &str) -> bool {
+    let mut chars = text.chars();
+    let base = chars.next().unwrap_or(' ');
+    let markers = text.chars().any(|c| {
+        matches!(c as u32, 0xFE0F | 0x200D | 0x20E3 | 0x1F1E6..=0x1F1FF | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F)
+    });
+    markers || matches!(base as u32, 0x1F000..=0x1FAFF)
+}
+
 impl Face {
     fn font_ref(&self) -> FontRef<'_> {
         FontRef { data: &self.data, offset: self.offset, key: self.key }
@@ -105,6 +150,9 @@ pub struct GlyphKey {
     pub face: u16,
     pub glyph: u16,
     pub bold: bool,
+    /// Rasterization size in quarter pixels; 0 = the configured size. Used
+    /// to fit icons to the cell without blurry bitmap scaling.
+    pub size: u16,
 }
 
 pub struct Fonts {
@@ -114,6 +162,8 @@ pub struct Fonts {
     /// Index into `faces` for each [`FontStyle`].
     primary: [u16; 4],
     fallback: HashMap<(char, FontStyle), Option<GlyphKey>>,
+    cluster_faces: HashMap<(String, FontStyle, bool), Option<u16>>,
+    shaper: ShapeContext,
     scale: ScaleContext,
     size_px: f32,
     metrics: CellMetrics,
@@ -144,6 +194,8 @@ impl Fonts {
             face_ids: HashMap::new(),
             primary: [0; 4],
             fallback: HashMap::new(),
+            cluster_faces: HashMap::new(),
+            shaper: ShapeContext::new(),
             scale: ScaleContext::new(),
             size_px: config.size_px.max(4.0),
             metrics: CellMetrics {
@@ -264,7 +316,12 @@ impl Fonts {
     /// Find the face and glyph for `ch` in `style`, falling back across
     /// system fonts. `None` means no installed font covers `ch`.
     pub fn lookup(&mut self, ch: char, style: FontStyle) -> Option<GlyphKey> {
-        let mk = |face: u16, glyph: u16, synthetic: bool| GlyphKey { face, glyph, bold: synthetic };
+        let mk = |face: u16, glyph: u16, synthetic: bool| GlyphKey {
+            face,
+            glyph,
+            bold: synthetic,
+            size: 0,
+        };
         let primary = self.primary[style as usize];
         let face = &self.faces[primary as usize];
         let g = face.font_ref().charmap().map(ch);
@@ -274,48 +331,166 @@ impl Fonts {
         if let Some(hit) = self.fallback.get(&(ch, style)) {
             return *hit;
         }
-        let hit = self.find_fallback(ch, style.is_bold());
+        let pref = if is_private_use(ch) { Preference::Symbol } else { Preference::Text };
+        let hit = self.find_fallback(ch, style.is_bold(), pref);
         self.fallback.insert((ch, style), hit);
         hit
     }
 
-    fn find_fallback(&mut self, ch: char, bold: bool) -> Option<GlyphKey> {
+    fn find_fallback(&mut self, ch: char, bold: bool, pref: Preference) -> Option<GlyphKey> {
         let regular = self.primary[0];
-        let g = self.faces[regular as usize].font_ref().charmap().map(ch);
-        if g != 0 {
-            return Some(GlyphKey { face: regular, glyph: g, bold });
+        // The configured font wins for text; icons and emoji go to fonts
+        // designed for them even if the configured font claims the
+        // codepoint with a placeholder.
+        if pref == Preference::Text {
+            let g = self.faces[regular as usize].font_ref().charmap().map(ch);
+            if g != 0 {
+                return Some(GlyphKey { face: regular, glyph: g, bold, size: 0 });
+            }
         }
-        // Prefer monospaced faces, then anything (emoji, CJK, symbols).
-        let mut candidates: Vec<(bool, ID)> =
-            self.db.faces().map(|f| (!f.monospaced, f.id)).collect();
-        candidates.sort_by_key(|c| c.0);
-        for (_, id) in candidates {
-            let glyph = self
+        let face = self.find_face(&[ch], pref)?;
+        let glyph = self.faces[face as usize].font_ref().charmap().map(ch);
+        (glyph != 0).then_some(GlyphKey { face, glyph, bold, size: 0 })
+    }
+
+    /// System faces in the order to try for `pref`.
+    fn candidates(&self, pref: Preference) -> Vec<ID> {
+        let family = |f: &fontdb::FaceInfo| {
+            f.families.first().map(|(n, _)| n.to_ascii_lowercase()).unwrap_or_default()
+        };
+        let mut c: Vec<(u8, ID)> = self
+            .db
+            .faces()
+            .map(|f| {
+                let name = family(f);
+                let rank = match pref {
+                    Preference::Symbol if name.contains("nerd") && name.contains("mono") => 0,
+                    Preference::Symbol if name.contains("nerd") => 1,
+                    Preference::Emoji if name.contains("emoji") => 0,
+                    _ if f.monospaced => 2,
+                    _ => 3,
+                };
+                (rank, f.id)
+            })
+            .collect();
+        c.sort_by_key(|x| x.0);
+        c.into_iter().map(|x| x.1).collect()
+    }
+
+    /// First face (in `pref` order) that maps every char in `need`.
+    fn find_face(&mut self, need: &[char], pref: Preference) -> Option<u16> {
+        self.find_face_filtered(need, pref, |_| true)
+    }
+
+    fn find_face_filtered(
+        &mut self,
+        need: &[char],
+        pref: Preference,
+        accept: impl Fn(&str) -> bool,
+    ) -> Option<u16> {
+        let ids: Vec<ID> = self
+            .candidates(pref)
+            .into_iter()
+            .filter(|id| {
+                self.db.face(*id).is_some_and(|f| {
+                    accept(
+                        &f.families
+                            .first()
+                            .map(|(n, _)| n.to_ascii_lowercase())
+                            .unwrap_or_default(),
+                    )
+                })
+            })
+            .collect();
+        for id in ids {
+            let covers = self
                 .db
                 .with_face_data(id, |data, index| {
-                    FontRef::from_index(data, index as usize).map(|f| f.charmap().map(ch))
+                    FontRef::from_index(data, index as usize)
+                        .map(|f| need.iter().all(|&c| f.charmap().map(c) != 0))
                 })
                 .flatten()
-                .unwrap_or(0);
-            if glyph != 0 {
-                let face = self.load_face(id, false).ok()?;
-                return Some(GlyphKey { face, glyph, bold });
+                .unwrap_or(false);
+            if covers {
+                return self.load_face(id, false).ok();
             }
         }
         None
+    }
+
+    /// Choose the face for a multi-codepoint grapheme cluster.
+    pub fn lookup_cluster(&mut self, text: &str, style: FontStyle, emoji: bool) -> Option<u16> {
+        let k = (text.to_owned(), style, emoji);
+        if let Some(hit) = self.cluster_faces.get(&k) {
+            return *hit;
+        }
+        let need: Vec<char> = text.chars().filter(|&c| !is_ignorable(c)).collect();
+        let covers = |fonts: &Fonts, face: u16| {
+            let f = fonts.faces[face as usize].font_ref();
+            need.iter().all(|&c| f.charmap().map(c) != 0)
+        };
+        let base = need.first().copied().unwrap_or(' ');
+        // Emoji presentation only if an emoji font has the base character;
+        // otherwise (e.g. `a` + ZWJ) the cluster is ordinary text.
+        let emoji_face = if emoji {
+            self.find_face_filtered(&[base], Preference::Emoji, |name| name.contains("emoji"))
+        } else {
+            None
+        };
+        let hit = if emoji_face.is_some() {
+            emoji_face
+        } else if covers(self, self.primary[style as usize]) {
+            Some(self.primary[style as usize])
+        } else if covers(self, self.primary[0]) {
+            Some(self.primary[0])
+        } else {
+            let pref = if is_private_use(base) { Preference::Symbol } else { Preference::Text };
+            self.find_face(&need, pref).or_else(|| self.lookup(base, style).map(|g| g.face))
+        };
+        if self.cluster_faces.len() > 4096 {
+            self.cluster_faces.clear();
+        }
+        self.cluster_faces.insert(k, hit);
+        hit
+    }
+
+    /// Shape `text` with `face` (marks positioned by the font's GPOS rules,
+    /// emoji sequences combined by its GSUB rules).
+    pub fn shape(&mut self, face: u16, text: &str) -> Vec<ShapedGlyph> {
+        let f = &self.faces[face as usize];
+        let font = f.font_ref();
+        // Invisible codepoints the font has no glyph for would shape to
+        // .notdef boxes: drop them.
+        let text: String =
+            text.chars().filter(|&c| !(is_ignorable(c) && font.charmap().map(c) == 0)).collect();
+        let script = text.chars().next().map(|c| c.script()).unwrap_or(swash::text::Script::Latin);
+        let mut shaper = self.shaper.builder(font).script(script).size(self.size_px).build();
+        shaper.add_str(&text);
+        let mut out = Vec::new();
+        let mut pen = 0.0;
+        shaper.shape_with(|cluster| {
+            for g in cluster.glyphs {
+                if g.id != 0 {
+                    out.push(ShapedGlyph { glyph: g.id, x: pen + g.x, y: g.y });
+                }
+                pen += g.advance;
+            }
+        });
+        out
     }
 
     /// Rasterize a glyph at the configured size.
     pub fn rasterize(&mut self, key: GlyphKey) -> Option<RasterGlyph> {
         let face = &self.faces[key.face as usize];
         let font = face.font_ref();
-        let mut scaler = self.scale.builder(font).size(self.size_px).hint(true).build();
+        let size = if key.size == 0 { self.size_px } else { key.size as f32 / 4.0 };
+        let mut scaler = self.scale.builder(font).size(size).hint(true).build();
         let sources =
             [Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline];
         let mut render = Render::new(&sources);
         render.format(Format::Alpha).offset(Vector::new(0.0, 0.0));
         if key.bold || face.synthetic_bold {
-            render.embolden((self.size_px / 28.0).max(0.6));
+            render.embolden((size / 28.0).max(0.6));
         }
         let image = render.render(&mut scaler, key.glyph)?;
         let (w, h) = (image.placement.width, image.placement.height);

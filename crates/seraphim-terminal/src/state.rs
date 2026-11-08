@@ -2,7 +2,8 @@
 
 use std::collections::VecDeque;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vte::{Params, Perform};
 
 use crate::cell::{Attrs, Cell, Color, Flags};
@@ -95,6 +96,9 @@ pub struct Modes {
     pub mouse: MouseMode,
     pub mouse_encoding: MouseEncoding,
     pub synchronized_output: bool,
+    /// Mode 2027: group grapheme clusters (emoji sequences, combining
+    /// marks) into one cell with the cluster's width.
+    pub grapheme_clusters: bool,
     /// Kitty keyboard protocol flags in effect (0 = legacy encoding).
     pub kitty_keyboard: u8,
 }
@@ -118,6 +122,7 @@ impl Default for Modes {
             mouse_encoding: MouseEncoding::Default,
             synchronized_output: false,
             kitty_keyboard: 0,
+            grapheme_clusters: true,
         }
     }
 }
@@ -198,6 +203,8 @@ pub(crate) struct State {
     /// have their own (per the protocol).
     kitty_main: Vec<u8>,
     kitty_alt: Vec<u8>,
+    /// Configured default for mode 2027 (restored by RIS).
+    pub grapheme_default: bool,
     /// Lines scrolled back into history in the viewport (0 = bottom).
     pub display_offset: usize,
     pub selection: Option<Selection>,
@@ -241,6 +248,7 @@ impl State {
             fast_print: true,
             kitty_main: Vec::new(),
             kitty_alt: Vec::new(),
+            grapheme_default: true,
             display_offset: 0,
             selection: None,
             scheme: ColorScheme::default(),
@@ -711,10 +719,13 @@ impl State {
         let (cols, rows, limit) = (self.cols, self.rows, self.scrollback_limit);
         let scrollback = std::mem::take(&mut self.scrollback);
         let scheme = std::mem::take(&mut self.scheme);
+        let clusters = self.grapheme_default;
         let was_alt = self.alt_active;
         *self = State::new(cols, rows, limit);
         self.scrollback = scrollback;
         self.scheme = scheme;
+        self.grapheme_default = clusters;
+        self.modes.grapheme_clusters = clusters;
         if was_alt {
             self.events.push(TerminalEvent::AlternateScreen(false));
         }
@@ -733,6 +744,21 @@ impl State {
             Some(w) => w,
             None => return,
         };
+        // Grapheme clustering: extend the previous cell's cluster (emoji
+        // sequences, combining marks) instead of starting a new cell.
+        // Cheap per-character test first: only zero-width extenders and
+        // emoji can ever join a previous cluster (CJK, Greek, ... cannot).
+        if self.modes.grapheme_clusters
+            && self.last_printed.is_some()
+            && c as u32 >= 0x300
+            && (width == 0
+                || is_regional_indicator(c)
+                || is_emoji_modifier(c)
+                || is_pictographic(c))
+            && self.extend_cluster(c, width)
+        {
+            return;
+        }
         if width == 0 {
             self.attach_combining(c);
             return;
@@ -807,6 +833,72 @@ impl State {
         self.linefeed();
     }
 
+    /// Try to add `c` to the grapheme cluster printed immediately before.
+    /// Returns false if `c` starts a new cluster.
+    fn extend_cluster(&mut self, c: char, width: usize) -> bool {
+        let row = self.cursor.row;
+        let mut col = if self.cursor.pending_wrap {
+            self.cursor.col
+        } else if self.cursor.col > 0 {
+            self.cursor.col - 1
+        } else {
+            return false;
+        };
+        let cols = self.cols;
+        let grid = if self.alt_active { &mut self.alternate } else { &mut self.primary };
+        if grid.cell(row, col).is_wide_spacer() && col > 0 {
+            col -= 1;
+        }
+        let cell = *grid.cell(row, col);
+        if cell.is_wide_spacer() || cell.is_wide_padding() {
+            return false;
+        }
+        let marks = grid.row(row).combining(col);
+        let last = marks.last().copied().unwrap_or(cell.ch);
+        // Only zero-width extenders and emoji sequences join. A visible
+        // character with its own width keeps its own cell, so the cell
+        // count matches what applications compute with wcwidth.
+        let eligible = width == 0
+            || (is_regional_indicator(c) && is_regional_indicator(cell.ch) && marks.is_empty())
+            || (is_emoji_modifier(c) && is_pictographic(cell.ch) && marks.is_empty())
+            || (last == '\u{200d}' && is_pictographic(c));
+        if !eligible {
+            return false;
+        }
+        let mut cluster = String::with_capacity(16);
+        cluster.push(cell.ch);
+        cluster.extend(marks.iter());
+        cluster.push(c);
+        if cluster.graphemes(true).nth(1).is_some() {
+            return false;
+        }
+        let old_width = if cell.is_wide() { 2 } else { 1 };
+        let new_width = cluster.width().clamp(1, 2);
+        grid.row_mut(row).push_combining(col, c);
+        // Emoji presentation (VS16, flags, ...) makes the cell wide, if
+        // there is room right after it.
+        if new_width > old_width && !self.cursor.pending_wrap && col + 1 < cols {
+            grid.split_wide(row, col + 1);
+            let lead = grid.cell_mut(row, col);
+            lead.attrs.flags.insert(Flags::WIDE);
+            let mut spacer = *lead;
+            spacer.ch = ' ';
+            spacer.attrs.flags.remove(Flags::WIDE);
+            spacer.attrs.flags.insert(Flags::WIDE_SPACER);
+            *grid.cell_mut(row, col + 1) = spacer;
+            if col + 2 >= cols {
+                self.cursor.col = cols - 1;
+                self.cursor.pending_wrap = self.modes.autowrap;
+            } else {
+                self.cursor.col = col + 2;
+            }
+            self.last_wide_at = Some(col);
+        }
+        self.last_printed = Some(c);
+        self.content_changed(row);
+        true
+    }
+
     fn attach_combining(&mut self, c: char) {
         let row = self.cursor.row;
         let mut col = if self.cursor.pending_wrap {
@@ -854,7 +946,9 @@ impl State {
                     match g.get(1).copied() {
                         Some(0) => {}
                         Some(2) => a.flags.insert(Flags::DOUBLE_UNDERLINE),
-                        Some(3..=5) => a.flags.insert(Flags::CURLY_UNDERLINE),
+                        Some(3) => a.flags.insert(Flags::CURLY_UNDERLINE),
+                        Some(4) => a.flags.insert(Flags::DOTTED_UNDERLINE),
+                        Some(5) => a.flags.insert(Flags::DASHED_UNDERLINE),
                         _ => a.flags.insert(Flags::UNDERLINE),
                     }
                 }
@@ -877,6 +971,8 @@ impl State {
                 39 => a.fg = Color::Default,
                 40..=47 => a.bg = Color::Indexed((code - 40) as u8),
                 49 => a.bg = Color::Default,
+                53 => a.flags.insert(Flags::OVERLINE),
+                55 => a.flags.remove(Flags::OVERLINE),
                 59 => a.underline_color = Color::Default,
                 90..=97 => a.fg = Color::Indexed((code - 90 + 8) as u8),
                 100..=107 => a.bg = Color::Indexed((code - 100 + 8) as u8),
@@ -965,6 +1061,7 @@ impl State {
             }
             2004 => self.modes.bracketed_paste = on,
             2026 => self.modes.synchronized_output = on,
+            2027 => self.modes.grapheme_clusters = on,
             _ => return,
         }
         self.events.push(TerminalEvent::ModeChanged);
@@ -1750,6 +1847,7 @@ impl State {
             1007 => m.alternate_scroll,
             2004 => m.bracketed_paste,
             2026 => m.synchronized_output,
+            2027 => m.grapheme_clusters,
             _ => return 0,
         };
         if on {
@@ -1799,10 +1897,13 @@ fn sgr_string(a: &Attrs) -> String {
         (Flags::UNDERLINE, "4"),
         (Flags::DOUBLE_UNDERLINE, "21"),
         (Flags::CURLY_UNDERLINE, "4:3"),
+        (Flags::DOTTED_UNDERLINE, "4:4"),
+        (Flags::DASHED_UNDERLINE, "4:5"),
         (Flags::BLINK, "5"),
         (Flags::INVERSE, "7"),
         (Flags::HIDDEN, "8"),
         (Flags::STRIKETHROUGH, "9"),
+        (Flags::OVERLINE, "53"),
     ] {
         if f.contains(flag) {
             parts.push(code.to_owned());
@@ -1825,4 +1926,17 @@ fn sgr_string(a: &Attrs) -> String {
         parts.push(format!("58:5:{i}"));
     }
     parts.join(";")
+}
+
+fn is_regional_indicator(c: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+}
+
+fn is_emoji_modifier(c: char) -> bool {
+    ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+}
+
+/// Approximation of Extended_Pictographic: the emoji blocks.
+fn is_pictographic(c: char) -> bool {
+    matches!(c as u32, 0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2300..=0x23FF | 0x2B00..=0x2BFF | 0x2190..=0x21FF | 0x3030 | 0x303D | 0x3297 | 0x3299 | 0xA9 | 0xAE | 0x203C | 0x2049 | 0x2122 | 0x2139 | 0x24C2 | 0x25AA..=0x25FE)
 }

@@ -47,6 +47,8 @@ pub struct Window {
 #[serde(default, deny_unknown_fields)]
 pub struct TerminalConfig {
     pub scrollback: usize,
+    /// Group emoji sequences and combining marks into single cells.
+    pub grapheme_clustering: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Default, Deserialize)]
@@ -98,7 +100,7 @@ impl Default for Window {
 
 impl Default for TerminalConfig {
     fn default() -> Self {
-        TerminalConfig { scrollback: 10_000 }
+        TerminalConfig { scrollback: 10_000, grapheme_clustering: true }
     }
 }
 

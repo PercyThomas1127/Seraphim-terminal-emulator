@@ -37,6 +37,10 @@ applications.
 | Fuzzing with invariant checks (stable Rust) | `examples/fuzz.rs`, `tests/fuzz.rs` | 250k+ runs clean |
 | Reflow on resize: soft-wrapped lines rewrap/rejoin across scrollback + screen; wide chars never split (wrap padding is not text); cursor and screen top tracked; growing pulls history back; primary reflows under an active alternate screen; 0.44 ms per resize with 10k lines of history | core `reflow.rs` | `tests/reflow.rs`, fuzzer, Xvfb |
 | Kitty keyboard protocol: push/pop/set/query (`CSI > u`, `CSI < u`, `CSI = u`, `CSI ? u`) with separate main/alternate stacks; disambiguation, event types (press/repeat/release), alternate keys, all-keys mode, associated text, modifier keys | core `input.rs`, window | `tests/kitty_keyboard.rs`; exact bytes via Xvfb |
+| Grapheme clusters (mode 2027, on by default, `terminal.grapheme_clustering`): flags, ZWJ sequences, skin tones, keycaps, VS16 emoji and combining marks are one cell with the cluster's width; only zero-width extenders and emoji sequences join, so text keeps wcwidth-compatible cells | core `state.rs` | `tests/graphemes.rs` |
+| Cluster rendering: NFC precomposition in the cell's font, else swash shaping (GPOS marks, GSUB emoji ligatures) with a face covering the cluster; emoji presentation only when an emoji font covers the base; invisible codepoints never drawn | renderer `font.rs`, `lib.rs` | pixel tests |
+| Font fallback by purpose: Nerd Font families first for private-use icons, emoji fonts for emoji; icons fitted to the cell (or two cells when followed by a space), Powerline separators full height and one cell | renderer | pixel tests; Powerline prompt screenshot |
+| SGR 53/55 overline, 4:4 dotted, 4:5 dashed underline (patterns aligned across cells) | core + renderer | unit + pixel tests |
 | Config file `~/.config/seraphim/config.toml`: font, window, colors, scrollback, shell, clipboard; typos are errors with line/column; broken config falls back to defaults with a message | `seraphim-config` | unit tests; Xvfb |
 
 ## Remaining for the Phase I milestone
@@ -71,6 +75,9 @@ Ordered by dependency. Each needs its acceptance check before it's done.
 
 ## Known limitations (today)
 
+* No bidirectional text or Arabic joining: it needs line-level BiDi
+  reordering with cursor/selection mapping (see the terminal-wg BiDi
+  proposal); the shaper added for emoji is the building block.
 * Remaining follow-ups (not blocking): procedural box-drawing glyphs and
   ligatures (item 2), auto-scroll while drag-selecting, Ctrl+click on OSC 8
   links, a right-click menu, vttest menus 3/6/11.

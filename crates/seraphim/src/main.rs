@@ -211,6 +211,7 @@ fn options_from_config(c: &seraphim_config::Config) -> window::WindowOptions {
         allow_clipboard_read: c.clipboard.allow_read,
         theme,
         scrollback: c.terminal.scrollback,
+        grapheme_clustering: c.terminal.grapheme_clustering,
     }
 }
 

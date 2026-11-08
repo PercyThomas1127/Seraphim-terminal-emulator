@@ -245,3 +245,137 @@ fn application_color_overrides_are_rendered() {
     assert_eq!(rgb(img.pixel(0, 0)), Theme::default().background);
     assert_eq!(rgb(img.pixel(x, y)), Theme::default().ansi[1]);
 }
+
+// ---- grapheme clusters, emoji, icons, decorations --------------------------
+
+fn render_text(h: &mut Headless, cols: usize, s: &str) -> Image {
+    let mut t = Terminal::new(cols, 1);
+    t.advance(format!("{s}\x1b[?25l").as_bytes());
+    render(h, &t, true)
+}
+
+/// Number of strongly colored (saturated) pixels in a pixel rectangle.
+fn colorful(img: &Image, (x, y, w, h): (u32, u32, u32, u32)) -> usize {
+    let mut n = 0;
+    for yy in y..y + h {
+        for xx in x..x + w {
+            let p = img.pixel(xx, yy);
+            let (mx, mn) = (p[0].max(p[1]).max(p[2]), p[0].min(p[1]).min(p[2]));
+            // Theme text and its antialiasing stay near-grey (spread < 20).
+            if mx as i32 - mn as i32 > 30 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+fn have_font(word: &str) -> bool {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    let ok = db.faces().any(|f| f.families.iter().any(|(n, _)| n.to_lowercase().contains(word)));
+    if !ok {
+        eprintln!("skipping: no {word} font installed");
+    }
+    ok
+}
+
+#[test]
+fn combining_accent_renders_like_the_precomposed_character() {
+    let Some(mut h) = headless() else { return };
+    let decomposed = render_text(&mut h, 4, "e\u{301}");
+    let precomposed = render_text(&mut h, 4, "é");
+    let diff = decomposed.rgba.iter().zip(&precomposed.rgba).filter(|(a, b)| a != b).count();
+    assert_eq!(diff, 0, "e + U+0301 must look exactly like é ({diff} bytes differ)");
+}
+
+#[test]
+fn invisible_codepoints_are_never_drawn() {
+    let Some(mut h) = headless() else { return };
+    let plain = render_text(&mut h, 4, "ab");
+    for s in ["a\u{200d}b", "a\u{fe0f}b", "a\u{200b}b"] {
+        let img = render_text(&mut h, 4, s);
+        let diff = img.rgba.iter().zip(&plain.rgba).filter(|(a, b)| a != b).count();
+        assert_eq!(diff, 0, "{s:?} differs from \"ab\" in {diff} bytes");
+    }
+}
+
+#[test]
+fn emoji_sequences_draw_one_color_glyph_in_two_cells() {
+    if !have_font("emoji") {
+        return;
+    }
+    let Some(mut h) = headless() else { return };
+    let m = h.renderer.cell_metrics();
+    let two = |h: &Headless, col| {
+        let (x, y, _, ch) = cell(h, 0, col);
+        (x, y, (2.0 * m.width) as u32, ch)
+    };
+    for seq in ["🇯🇵", "👩\u{200d}💻", "👍🏽", "❤\u{fe0f}", "1\u{fe0f}\u{20e3}"] {
+        // Sequence in cells 0-1, then nothing: cells 2-5 must stay empty
+        // (no second emoji, no box for a joiner or selector).
+        let img = render_text(&mut h, 6, seq);
+        assert!(colorful(&img, two(&h, 0)) > 20, "{seq:?} should be a color glyph");
+        let theme = Theme::default();
+        for col in 2..6 {
+            assert_eq!(
+                ink(&img, cell(&h, 0, col), theme.background),
+                0,
+                "{seq:?}: stray glyph in col {col}"
+            );
+        }
+    }
+    // Text presentation stays monochrome.
+    let img = render_text(&mut h, 6, "❤");
+    assert_eq!(colorful(&img, cell(&h, 0, 0)), 0);
+}
+
+#[test]
+fn nerd_font_icons_fill_the_cell_height() {
+    if !have_font("nerd") {
+        return;
+    }
+    let Some(mut h) = headless() else { return };
+    let theme = Theme::default();
+    let m = h.renderer.cell_metrics();
+    for icon in ['\u{f004}', '\u{f113}', '\u{e702}'] {
+        let img = render_text(&mut h, 4, &format!("{icon} x"));
+        // Vertical extent of the icon's ink within cells 0-1.
+        let (x0, y0, _, ch) = cell(&h, 0, 0);
+        let rows: Vec<u32> = (y0..y0 + ch)
+            .filter(|&yy| {
+                (x0..x0 + 2 * m.width as u32).any(|xx| rgb(img.pixel(xx, yy)) != theme.background)
+            })
+            .collect();
+        let extent = rows.last().unwrap_or(&0).saturating_sub(*rows.first().unwrap_or(&0)) + 1;
+        assert!(
+            extent as f32 >= 0.6 * m.height,
+            "U+{:X} only {extent}px of {}px",
+            icon as u32,
+            m.height
+        );
+    }
+}
+
+#[test]
+fn overline_dotted_and_dashed_are_drawn() {
+    let Some(mut h) = headless() else { return };
+    let theme = Theme::default();
+    let m = h.renderer.cell_metrics();
+    let img = render_text(&mut h, 8, "\x1b[53m \x1b[0;4:4m    \x1b[0;4:5m   ");
+    let (x, y, w, _) = cell(&h, 0, 0);
+    assert_eq!(rgb(img.pixel(x + w / 2, y)), theme.foreground, "overline at the top of the cell");
+    // Dotted: the underline row alternates ink and gaps.
+    let uy = y + m.underline_y as u32;
+    let (dx, _, _, _) = cell(&h, 0, 1);
+    let row: Vec<bool> =
+        (dx..dx + 4 * w).map(|xx| rgb(img.pixel(xx, uy)) != theme.background).collect();
+    let transitions = row.windows(2).filter(|p| p[0] != p[1]).count();
+    assert!(transitions > 8, "dotted underline should be broken ({transitions} transitions)");
+    // Dashed: fewer, longer pieces than dotted, but still broken.
+    let (sx, _, _, _) = cell(&h, 0, 5);
+    let row: Vec<bool> =
+        (sx..sx + 3 * w).map(|xx| rgb(img.pixel(xx, uy)) != theme.background).collect();
+    let t2 = row.windows(2).filter(|p| p[0] != p[1]).count();
+    assert!(t2 >= 3 && t2 < transitions, "dashed: {t2} transitions");
+}

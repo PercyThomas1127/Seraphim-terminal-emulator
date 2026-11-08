@@ -13,3 +13,4 @@ fontdb.workspace = true
 bytemuck.workspace = true
 pollster.workspace = true
 png.workspace = true
+unicode-normalization.workspace = true

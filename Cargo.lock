@@ -1880,6 +1880,7 @@ dependencies = [
  "pollster",
  "seraphim-terminal",
  "swash",
+ "unicode-normalization",
  "wgpu",
 ]
 
@@ -1897,6 +1898,7 @@ dependencies = [
 name = "seraphim-terminal"
 version = "0.1.0"
 dependencies = [
+ "unicode-segmentation",
  "unicode-width",
  "vte",
 ]
