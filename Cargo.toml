@@ -13,8 +13,19 @@ seraphim-terminal = { path = "crates/seraphim-terminal" }
 seraphim-pty = { path = "crates/seraphim-pty" }
 seraphim-events = { path = "crates/seraphim-events" }
 seraphim-session = { path = "crates/seraphim-session" }
+seraphim-render = { path = "crates/seraphim-render" }
 vte = "0.15"
 unicode-width = "0.2"
 nix = { version = "0.31", features = ["term", "process", "signal", "fs", "ioctl"] }
 libc = "0.2"
 serde_json = "1"
+wgpu = "30"
+winit = "0.30"
+swash = "0.2"
+fontdb = "0.24"
+bytemuck = "1"
+pollster = "1"
+png = "0.18"
+
+[profile.release]
+debug = "line-tables-only"

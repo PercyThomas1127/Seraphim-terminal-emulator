@@ -76,18 +76,19 @@ pub struct Attrs {
 }
 
 /// One character cell of the grid.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Deliberately `Copy`: blanking, scrolling and overwriting cells must be
+/// plain memory operations (see the throughput example). The rare zero-width
+/// combining marks live beside the cells, in [`crate::Row`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
-    /// Zero-width combining characters attached to `ch` (rare; boxed to keep
-    /// the common cell small).
-    pub combining: Option<Box<[char]>>,
     pub attrs: Attrs,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Cell { ch: ' ', combining: None, attrs: Attrs::default() }
+        Cell { ch: ' ', attrs: Attrs::default() }
     }
 }
 
@@ -95,7 +96,7 @@ impl Cell {
     /// A blank cell for erase operations. Following xterm's
     /// background-color-erase behaviour, only the background survives.
     pub fn blank(template: &Attrs) -> Self {
-        Cell { ch: ' ', combining: None, attrs: Attrs { bg: template.bg, ..Attrs::default() } }
+        Cell { ch: ' ', attrs: Attrs { bg: template.bg, ..Attrs::default() } }
     }
 
     pub fn is_wide(&self) -> bool {
@@ -104,25 +105,5 @@ impl Cell {
 
     pub fn is_wide_spacer(&self) -> bool {
         self.attrs.flags.contains(Flags::WIDE_SPACER)
-    }
-
-    pub(crate) fn push_combining(&mut self, c: char) {
-        let mut v: Vec<char> = self.combining.take().map(Vec::from).unwrap_or_default();
-        // Bound pathological input (e.g. "zalgo" floods).
-        if v.len() < 16 {
-            v.push(c);
-        }
-        self.combining = Some(v.into_boxed_slice());
-    }
-
-    /// Append the visible text of this cell to `out` (spacers produce nothing).
-    pub fn push_text(&self, out: &mut String) {
-        if self.is_wide_spacer() {
-            return;
-        }
-        out.push(self.ch);
-        if let Some(c) = &self.combining {
-            out.extend(c.iter());
-        }
     }
 }

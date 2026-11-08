@@ -1,0 +1,15 @@
+[package]
+name = "seraphim-render"
+description = "Seraphim Rendering Engine: GPU text renderer for terminal state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seraphim-terminal.workspace = true
+wgpu.workspace = true
+swash.workspace = true
+fontdb.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+png.workspace = true

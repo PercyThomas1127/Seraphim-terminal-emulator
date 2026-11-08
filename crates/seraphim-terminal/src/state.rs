@@ -310,12 +310,21 @@ impl State {
     fn scroll_up(&mut self, n: usize) {
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
         let attrs = self.cursor.attrs;
-        let removed = self.grid().scroll_up(top, bottom, n, &attrs);
-        if top == 0 && !self.alt_active {
-            for row in removed {
-                self.push_scrollback(row);
+        let keep = top == 0 && !self.alt_active && self.scrollback_limit > 0;
+        let limit = self.scrollback_limit;
+        let scrollback = &mut self.scrollback;
+        let grid = if self.alt_active { &mut self.alternate } else { &mut self.primary };
+        grid.scroll_up(top, bottom, n, &attrs, |row| {
+            if keep {
+                // Recycle the oldest scrollback line's buffer once full.
+                let buf = if scrollback.len() >= limit {
+                    scrollback.pop_front().unwrap_or_else(|| Row::empty(0))
+                } else {
+                    Row::empty(row.cells.len())
+                };
+                scrollback.push_back(std::mem::replace(row, buf));
             }
-        }
+        });
         self.damage_range(top, bottom);
     }
 
@@ -390,8 +399,16 @@ impl State {
         let grid = self.grid();
         grid.split_wide(row, from);
         grid.split_wide(row, to - 1);
-        for col in from..to {
-            *grid.cell_mut(row, col) = Cell::blank(&attrs);
+        if attrs.bg == Color::Default {
+            // Writing default blanks never breaks the `occ` invariant.
+            grid.clear_combining(row, from, to);
+            for col in from..to {
+                *grid.cell_mut_untracked(row, col) = Cell::default();
+            }
+        } else {
+            let r = grid.row_mut(row);
+            r.cells[from..to].fill(Cell::blank(&attrs));
+            r.clear_combining(from, to);
         }
         self.damage_row(row);
     }
@@ -411,13 +428,14 @@ impl State {
         let attrs = self.cursor.attrs;
         let grid = self.grid();
         grid.split_wide(row, col);
-        let line = &mut grid.row_mut(row).cells;
-        line.truncate(cols - n);
-        for _ in 0..n {
-            line.insert(col, Cell::blank(&attrs));
-        }
+        let r = grid.row_mut(row);
+        r.shift_combining(col, n as isize, cols);
+        let line = &mut r.cells;
+        line[col..].rotate_right(n);
+        line[col..col + n].fill(Cell::blank(&attrs));
         if line[cols - 1].is_wide() {
             line[cols - 1] = Cell::blank(&attrs);
+            r.clear_combining(cols - 1, cols);
         }
         self.cursor.pending_wrap = false;
         self.damage_row(row);
@@ -432,9 +450,12 @@ impl State {
         if col + n < cols {
             grid.split_wide(row, col + n);
         }
-        let line = &mut grid.row_mut(row).cells;
-        line.drain(col..col + n);
-        line.resize(cols, Cell::blank(&attrs));
+        let r = grid.row_mut(row);
+        r.clear_combining(col, col + n);
+        r.shift_combining(col + n, -(n as isize), cols);
+        let line = &mut r.cells;
+        line[col..].rotate_left(n);
+        line[cols - n..].fill(Cell::blank(&attrs));
         self.cursor.pending_wrap = false;
         self.damage_row(row);
     }
@@ -460,7 +481,7 @@ impl State {
         // Lines deleted mid-screen never go to scrollback.
         let attrs = self.cursor.attrs;
         let (t, b) = (self.scroll_top, self.scroll_bottom);
-        self.grid().scroll_up(t, b, n, &attrs);
+        self.grid().scroll_up(t, b, n, &attrs, |_| {});
         self.damage_range(t, b);
         self.scroll_top = top;
         self.cursor.col = 0;
@@ -589,11 +610,12 @@ impl State {
             if width == 2 {
                 lead.flags.insert(Flags::WIDE);
             }
-            *grid.cell_mut(row, col) = Cell { ch: c, combining: None, attrs: lead };
+            *grid.cell_mut(row, col) = Cell { ch: c, attrs: lead };
+            grid.clear_combining(row, col, col + width);
             if width == 2 {
                 let mut spacer = attrs;
                 spacer.flags.insert(Flags::WIDE_SPACER);
-                *grid.cell_mut(row, col + 1) = Cell { ch: ' ', combining: None, attrs: spacer };
+                *grid.cell_mut(row, col + 1) = Cell { ch: ' ', attrs: spacer };
             }
         }
         self.damage_row(row);
@@ -627,14 +649,22 @@ impl State {
         if self.grid().cell(row, col).is_wide_spacer() && col > 0 {
             col -= 1;
         }
-        self.grid().cell_mut(row, col).push_combining(c);
+        self.grid().row_mut(row).push_combining(col, c);
         self.damage_row(row);
     }
 
     // ---- SGR -----------------------------------------------------------
 
     fn sgr(&mut self, params: &Params) {
-        let groups: Vec<&[u16]> = params.iter().collect();
+        // vte caps parameters at 32; keep them on the stack (no allocation
+        // per SGR sequence).
+        let mut storage: [&[u16]; 32] = [&[]; 32];
+        let mut len = 0;
+        for g in params.iter().take(32) {
+            storage[len] = g;
+            len += 1;
+        }
+        let groups = &storage[..len];
         if groups.is_empty() {
             self.cursor.attrs = Attrs { link: self.cursor.attrs.link, ..Attrs::default() };
             return;
@@ -958,7 +988,29 @@ fn arg(params: &[u16], i: usize, default: u16) -> u16 {
 }
 
 impl Perform for State {
+    #[inline]
     fn print(&mut self, c: char) {
+        // Fast path: printable ASCII in the ASCII charset, no insert mode,
+        // no pending wrap, onto a narrow cell. This is nearly all output.
+        if matches!(c, ' '..='~')
+            && !self.cursor.pending_wrap
+            && !self.modes.insert
+            && self.charsets[self.active_charset] == Charset::Ascii
+        {
+            let (row, col) = (self.cursor.row, self.cursor.col);
+            let cell = Cell { ch: c, attrs: self.cursor.attrs };
+            let grid = if self.alt_active { &mut self.alternate } else { &mut self.primary };
+            if grid.put_narrow(row, col, cell) {
+                self.damage[row] = true;
+                self.last_printed = Some(c);
+                if col + 1 >= self.cols {
+                    self.cursor.pending_wrap = self.modes.autowrap;
+                } else {
+                    self.cursor.col = col + 1;
+                }
+                return;
+            }
+        }
         self.print_char(c);
     }
 
@@ -991,8 +1043,14 @@ impl Perform for State {
             self.sgr(params);
             return;
         }
-        let p: Vec<u16> = params.iter().map(|g| g[0]).collect();
-        let n = |i: usize| arg(&p, i, 1) as usize;
+        let mut storage = [0u16; 32];
+        let mut len = 0;
+        for g in params.iter().take(32) {
+            storage[len] = g[0];
+            len += 1;
+        }
+        let p = &storage[..len];
+        let n = |i: usize| arg(p, i, 1) as usize;
         match (intermediates, action) {
             ([], '@') => self.insert_blank(n(0)),
             ([], 'A') => self.move_up(n(0)),
@@ -1064,11 +1122,11 @@ impl Perform for State {
                     }
                 }
             }
-            ([], 'c') if arg(&p, 0, 0) == 0 => {
+            ([], 'c') if arg(p, 0, 0) == 0 => {
                 // Primary DA: VT220 with ANSI color.
                 self.responses.extend_from_slice(b"\x1b[?62;22c");
             }
-            ([b'>'], 'c') if arg(&p, 0, 0) == 0 => {
+            ([b'>'], 'c') if arg(p, 0, 0) == 0 => {
                 self.responses.extend_from_slice(b"\x1b[>1;10;0c");
             }
             ([], 'd') => self.goto_row(n(0) - 1),
@@ -1099,7 +1157,7 @@ impl Perform for State {
             },
             ([], 'r') => {
                 let top = n(0) - 1;
-                let bottom = (arg(&p, 1, self.rows as u16) as usize).min(self.rows) - 1;
+                let bottom = (arg(p, 1, self.rows as u16) as usize).min(self.rows) - 1;
                 if top < bottom {
                     self.scroll_top = top;
                     self.scroll_bottom = bottom;
@@ -1169,8 +1227,9 @@ impl Perform for State {
                 let cols = self.cols;
                 for r in 0..self.rows {
                     let row = self.grid().row_mut(r);
-                    row.cells = vec![Cell { ch: 'E', ..Cell::default() }; cols];
-                    row.wrapped = false;
+                    row.reset(cols, &Attrs::default());
+                    row.cells.fill(Cell { ch: 'E', ..Cell::default() });
+                    row.touch(cols);
                 }
                 self.scroll_top = 0;
                 self.scroll_bottom = self.rows - 1;

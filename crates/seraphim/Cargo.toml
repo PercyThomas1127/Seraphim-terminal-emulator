@@ -1,6 +1,6 @@
 [package]
 name = "seraphim"
-description = "Seraphim terminal environment (Phase I headless driver)"
+description = "Seraphim terminal environment"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,7 @@ license.workspace = true
 seraphim-terminal.workspace = true
 seraphim-session.workspace = true
 seraphim-events.workspace = true
+seraphim-render.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true

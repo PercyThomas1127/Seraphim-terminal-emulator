@@ -40,12 +40,24 @@ pub use seraphim_pty::PtyCommand as Command;
 
 pub type SessionId = u64;
 
+/// Called from the session's I/O thread whenever terminal state changes
+/// (e.g. to wake a UI event loop). Must be cheap and non-blocking.
+#[derive(Clone)]
+pub struct Notifier(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Notifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Notifier")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub command: PtyCommand,
     pub cols: u16,
     pub rows: u16,
     pub scrollback: usize,
+    pub notify: Option<Notifier>,
 }
 
 impl Default for SessionConfig {
@@ -55,6 +67,7 @@ impl Default for SessionConfig {
             cols: 80,
             rows: 24,
             scrollback: seraphim_terminal::DEFAULT_SCROLLBACK,
+            notify: None,
         }
     }
 }
@@ -117,6 +130,7 @@ impl Session {
             shell_pid: pid,
             command: None,
             root: None,
+            notify: config.notify,
         };
         let io_thread = std::thread::Builder::new()
             .name(format!("seraphim-session-{id}"))
@@ -198,6 +212,16 @@ struct IoLoop {
     shell_pid: u32,
     command: Option<(Option<String>, Instant)>,
     root: Option<bool>,
+    notify: Option<Notifier>,
+}
+
+impl IoLoop {
+    fn changed(&self) {
+        self.shared.generation.fetch_add(1, Ordering::Release);
+        if let Some(n) = &self.notify {
+            (n.0)();
+        }
+    }
 }
 
 impl IoLoop {
@@ -217,7 +241,7 @@ impl IoLoop {
                 term.advance(&buf[..n]);
                 (term.take_events(), term.take_responses())
             };
-            self.shared.generation.fetch_add(1, Ordering::Release);
+            self.changed();
             if !responses.is_empty() {
                 let _ = self.writer.lock().unwrap().write_all(&responses);
             }
@@ -239,7 +263,7 @@ impl IoLoop {
         );
         *self.shared.exit.lock().unwrap() = Some(info);
         self.shared.exited.notify_all();
-        self.shared.generation.fetch_add(1, Ordering::Release);
+        self.changed();
     }
 
     fn handle(&mut self, ev: TerminalEvent) {

@@ -21,19 +21,23 @@ applications.
 | Shell integration (OSC 133 + OSC 7) | `shell-integration/` | Bash: e2e test. Zsh/Fish: **untested** |
 | Event Bus (non-blocking, filtered, trusted source) | `seraphim-events` | unit tests |
 | Real-app compatibility: vim, less, tmux, nano | — | `seraphim-session/tests/compat.rs` |
+| GPU text renderer: font discovery + fallback, glyph atlas, colors/attributes, wide + combining chars, color emoji scaling, cursor shapes, focus-hollow cursor | `seraphim-render` | pixel tests in `tests/render.rs` (real wgpu pipeline) |
+| Window: winit + wgpu surface, keyboard (named keys, Ctrl/Alt, IME commit), resize → PTY, focus reporting, title, drag-and-drop paths, redraw only on change | `seraphim/src/window.rs` | driven under Xvfb with `xdotool`; key bytes verified exactly |
+| Performance baseline | `examples/throughput.rs`, `examples/frame_time.rs` | parity with `alacritty_terminal` on the same machine; see ADR 0004 |
 
 ## Remaining for the Phase I milestone
 
 Ordered by dependency. Each needs its acceptance check before it's done.
 
-1. **Rendering spike → accept/reject ADR 0004.** winit window, wgpu
-   surface, glyph atlas, draw a `Terminal` grid using `take_damage()`.
-   *Check:* the five ADR 0004 criteria.
-2. **Font stack:** shaping, fallback chain, bold/italic faces, Nerd
-   Font/emoji, ligatures, box-drawing drawn procedurally (pixel-exact).
-3. **Window input → `input::encode_key`**, IME commit text, mouse
-   reporting encoder (X10/normal/SGR from `Modes`), selection + copy,
-   OSC 52 policy (store allowed by default, load denied by default).
+1. **Measure ADR 0004 on real hardware:** keypress-to-photon latency,
+   cold start, Wayland fractional scaling. (The spike itself is done.)
+2. **Font stack, remaining:** ligatures (shaping over same-attribute
+   runs), procedural box-drawing/block glyphs (pixel-exact joins),
+   configurable fallback list.
+3. **Clipboard, selection, scrollback viewing, mouse:** mouse reporting
+   encoder (X10/normal/SGR from `Modes`), selection + copy/paste
+   (Ctrl+Shift+C/V), Shift+PageUp scrollback, OSC 52 policy (store
+   allowed by default, load denied by default), cursor blink.
 4. **Kitty keyboard protocol** (`CSI > u` push/pop, `CSI ? u` query):
    separate encoder; do *not* answer the `CSI ? u` query until
    implemented, so apps don't detect support we don't have.
@@ -41,16 +45,20 @@ Ordered by dependency. Each needs its acceptance check before it's done.
    colour queries OSC 4/10/11/12, DECRQM, XTVERSION, DECSCUSR already done.
 6. **Robustness:** `cargo-fuzz` target on `Terminal::advance` +
    `resize`; OSC length cap (ADR 0002 gap 3).
-7. **Performance baseline:** bytes/sec through `advance()` on a 100 MB
-   corpus (`cargo bench`); target ≥ 500 MB/s parse-only in release.
+7. **Performance tracking:** keep `examples/throughput.rs` within 10% of
+   `alacritty_terminal` on the same machine (absolute MB/s depends on the
+   host; the old "500 MB/s" target was uncalibrated). Add partial
+   redraws via `take_damage()` if frame-build time becomes significant.
 8. **Reflow on resize** using `Row::wrapped` (currently truncates).
 9. **Minimal config:** `~/.config/seraphim/config.toml` with font, size,
    palette, shell, scrollback — just enough for Phase II profiles to build on.
 
 ## Known limitations (today)
 
-* No window yet; the `seraphim` binary is a headless driver
-  (`seraphim run -- PROGRAM`, `seraphim replay FILE`).
+* No copy/paste, selection, mouse reporting or scrollback viewing in the
+  window yet (item 3).
+* Only tested on X11 (Xvfb) with software Vulkan; Wayland and real GPUs
+  untested.
 * No reflow on resize; no graphics protocols; Kitty graphics is blocked
   on the APC gap (ADR 0002).
 * OSC 8 hyperlink table grows for the session's lifetime (needs GC with

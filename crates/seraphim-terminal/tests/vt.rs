@@ -353,3 +353,22 @@ fn garbage_does_not_panic() {
         t.resize(1 + (chunk[0] as usize % 9), 1 + (chunk[1 % chunk.len()] as usize % 5));
     }
 }
+
+#[test]
+fn combining_marks_follow_their_cell() {
+    // Overwrite clears the mark.
+    let t = term(6, 1, "e\u{301}x\x1b[1GE");
+    assert_eq!(t.screen_text(), "Ex");
+    // Insert/delete characters move the mark with its base character.
+    let t = term(8, 1, "ab\u{308}c\x1b[1G\x1b[2@");
+    assert_eq!(t.screen_text(), "  ab\u{308}c");
+    let t = term(8, 1, "xyab\u{308}c\x1b[1G\x1b[2P");
+    assert_eq!(t.screen_text(), "ab\u{308}c");
+    // Erase removes it.
+    let t = term(8, 1, "ab\u{308}c\x1b[2G\x1b[X");
+    assert_eq!(t.screen_text(), "a c");
+    // Scrolling keeps it attached to its line.
+    let t = term(4, 2, "a\u{301}\r\nb\r\nc");
+    assert_eq!(t.scrollback()[0].text(), "a\u{301}");
+    assert_eq!(t.screen_text(), "b\nc");
+}

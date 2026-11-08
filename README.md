@@ -5,10 +5,12 @@ The programmable terminal environment of Divinity OS.
 > *A terminal that doesn't just let you customize its appearance. It lets you program its personality.*
 
 This repository is at **Phase I (Functional Foundation)**: the Terminal Core,
-PTY layer, Session Manager and Event Bus are implemented and tested; the GPU
-renderer is next. See [`docs/phase-1-plan.md`](docs/phase-1-plan.md) for
+PTY layer, Session Manager, Event Bus and a first GPU renderer and window are
+implemented and tested. See [`docs/phase-1-plan.md`](docs/phase-1-plan.md) for
 what's done and what's left, and [`docs/adr/`](docs/adr/) for the
 architecture decisions that settle spec §18.
+
+![Seraphim renderer output](docs/images/renderer.png)
 
 ## Layout
 
@@ -18,7 +20,8 @@ crates/
   seraphim-pty/        PTY creation, shell launch, resize, process metadata
   seraphim-events/     Event Bus: non-blocking, pattern-filtered pub/sub
   seraphim-session/    Sessions: PTY <-> Terminal I/O thread, event publishing, root detection
-  seraphim/            Application binary (currently a headless driver)
+  seraphim-render/     GPU text renderer (wgpu): fonts + fallback, glyph atlas, one instanced draw
+  seraphim/            Application: window (winit + wgpu), plus headless `run` / `replay` tools
 shell-integration/     Bash/Zsh/Fish scripts emitting OSC 133 + OSC 7
 docs/                  ADRs and phase plans
 ```
@@ -30,14 +33,37 @@ cargo test --workspace
 ```
 
 The compatibility tests drive real `vim`, `less`, `tmux` and `nano` when they
-are installed, and skip otherwise.
+are installed, and skip otherwise. Renderer pixel tests need a GPU adapter
+(any Vulkan/GL driver, including lavapipe) and skip without one.
 
-## Try it
+Benchmarks:
 
-The binary is a headless driver until the renderer lands: it runs a program in
-a PTY-backed session, then prints the final screen and every published event.
-This example emits by hand the same sequences the shell integration sends
-around a command:
+```bash
+cargo run --release -p seraphim-terminal --example throughput
+```
+
+```bash
+cargo run --release -p seraphim-render --example frame_time
+```
+
+## Run it
+
+```bash
+cargo run --release -p seraphim
+```
+
+opens a window running your shell. Options: `--font FAMILY`,
+`--font-size PT`, `--cols N`, `--rows N`, `-e PROGRAM [ARGS...]`.
+
+Linux build dependencies: a Vulkan or GL driver, plus the usual X11/Wayland
+client libraries (`libxkbcommon`, `libwayland-client`). With no GPU,
+Mesa's software Vulkan (`mesa-vulkan-drivers`, "lavapipe") works.
+
+### Headless tools
+
+`seraphim run` runs a program in a PTY-backed session without a window, then
+prints the final screen and every published event. This example emits by
+hand the same sequences the shell integration sends around a command:
 
 ```bash
 cargo run -p seraphim -- run --cols 40 --rows 4 --events -- sh -c 'printf "\033]133;C;cmdline_url=gabriel%%20bestow%%20firefox\a"; sleep 0.3; printf "installing...\n\033]133;D;0\a"'

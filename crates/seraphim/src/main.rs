@@ -1,9 +1,9 @@
-//! Seraphim Phase I headless driver.
-//!
-//! Until the GPU renderer lands, this binary exercises the Terminal Core
-//! end-to-end:
+//! Seraphim terminal.
 //!
 //! ```text
+//! seraphim [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [-e PROGRAM [ARGS...]]
+//!     Open a window running PROGRAM (default: your shell).
+//!
 //! seraphim run [--cols N] [--rows N] [--timeout SECS] [--events] -- PROGRAM [ARGS...]
 //!     Run PROGRAM in a PTY-backed session, then print the final screen.
 //!     --events also prints every event published on the bus.
@@ -16,6 +16,8 @@
 
 use std::process::ExitCode;
 use std::time::Duration;
+
+mod window;
 
 use seraphim_events::EventBus;
 use seraphim_session::{Command, Session, SessionConfig};
@@ -61,8 +63,8 @@ fn print_screen(term: &Terminal) {
         // Every cell occupies one column; a wide glyph's spacer cell emits
         // nothing, so the line is exactly `width` columns.
         let mut line = String::new();
-        for cell in &row.cells {
-            cell.push_text(&mut line);
+        for col in 0..row.cells.len() {
+            row.push_cell_text(col, &mut line);
         }
         println!("│{line}│");
     }
@@ -121,9 +123,38 @@ fn replay(o: Opts) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
+    let mut o = window::WindowOptions::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value =
+            |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
+        match a.as_str() {
+            "--font" => o.font_family = Some(value("--font")?),
+            "--font-size" => {
+                o.font_size = value("--font-size")?
+                    .parse::<f32>()
+                    .map_err(|_| "--font-size needs a number")?
+                    .clamp(4.0, 200.0)
+            }
+            "--cols" => o.cols = value("--cols")?.parse().map_err(|_| "--cols needs a number")?,
+            "--rows" => o.rows = value("--rows")?.parse().map_err(|_| "--rows needs a number")?,
+            "-e" | "--" => {
+                let rest: Vec<&String> = it.by_ref().collect();
+                let (prog, args) = rest.split_first().ok_or("-e needs a PROGRAM")?;
+                o.command = Some(Command::new(prog.as_str()).args(args.iter().map(|s| s.as_str())));
+            }
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    o.cols = o.cols.clamp(10, 1000);
+    o.rows = o.rows.clamp(3, 1000);
+    Ok(o)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [-e PROGRAM [ARGS...]]\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),
@@ -131,10 +162,13 @@ fn main() -> ExitCode {
             println!("seraphim {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        _ => {
-            eprintln!("{usage}");
-            return ExitCode::from(2);
+        Some("-h") | Some("--help") => {
+            println!("{usage}");
+            Ok(ExitCode::SUCCESS)
         }
+        _ => parse_window(&args)
+            .and_then(window::run)
+            .map(|code| ExitCode::from(code.clamp(0, 255) as u8)),
     };
     result.unwrap_or_else(|e| {
         eprintln!("seraphim: {e}");
