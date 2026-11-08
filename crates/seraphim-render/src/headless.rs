@@ -98,6 +98,18 @@ impl Headless {
         view: View,
         background: &mut dyn FnMut(&mut wgpu::RenderPass<'_>),
     ) -> Image {
+        self.render_with_encoder(term, view, &mut |_| {}, background)
+    }
+
+    /// Like [`Headless::render_with`], with `pre` recording offscreen work
+    /// (e.g. a visual engine's compositing) before the frame's pass.
+    pub fn render_with_encoder(
+        &mut self,
+        term: &Terminal,
+        view: View,
+        pre: &mut dyn FnMut(&mut wgpu::CommandEncoder),
+        background: &mut dyn FnMut(&mut wgpu::RenderPass<'_>),
+    ) -> Image {
         let (width, height) = (view.width.max(1), view.height.max(1));
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
@@ -113,6 +125,7 @@ impl Headless {
         self.renderer.prepare(&self.device, &self.queue, term, view);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        pre(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("cells"),

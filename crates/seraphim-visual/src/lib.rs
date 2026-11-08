@@ -17,7 +17,10 @@
 //!   motion).
 
 pub mod animation;
+mod compose;
 pub mod picture;
+
+pub use compose::{TransitionStyle, BUILTIN_TRANSITIONS};
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -162,6 +165,9 @@ pub enum LayerKind {
         fit: Fit,
         blur: f32,
     },
+    /// Blurs everything drawn beneath it (backdrop blur); parameter
+    /// `radius` in pixels. Opacity mixes blurred and sharp.
+    Blur,
     /// A built-in shader by name, or WGSL source implementing `shade`.
     Shader {
         name: String,
@@ -226,9 +232,18 @@ struct GpuLayer {
     params: Vec<(String, Animated)>,
     /// The shader reads `u.time`, so it changes every frame.
     uses_time: bool,
+    /// Parameters that make the layer change over time when non-zero
+    /// (a gradient's spin and flow).
+    time_params: Vec<usize>,
     static_data: Uniforms,
     /// Being faded out after a scene change; removed when invisible.
     leaving: bool,
+    /// A backdrop blur layer (drawn by the compositor, not its pipeline).
+    blur: bool,
+    /// Current blur radius (from the `radius` parameter).
+    radius: f32,
+    /// Current opacity, for the compositor.
+    shown: f32,
 }
 
 /// Engine clock: seconds since creation, minus time spent paused.
@@ -274,6 +289,16 @@ pub struct VisualEngine {
     fixed_time: Option<f64>,
     /// Multiplies every layer's opacity (window background opacity).
     global_opacity: f32,
+    /// The outgoing scene during a styled transition.
+    outgoing: Vec<GpuLayer>,
+    /// Styled transition progress 0..1.
+    progress: Animated,
+    style: TransitionStyle,
+    /// Created on first need (blur layer or styled transition).
+    compositor: Option<compose::Compositor>,
+    size: (u32, u32),
+    /// This frame goes through the compositor.
+    composing: bool,
 }
 
 impl VisualEngine {
@@ -337,7 +362,32 @@ impl VisualEngine {
             reduced_motion: false,
             fixed_time: None,
             global_opacity: 1.0,
+            outgoing: Vec::new(),
+            progress: Animated::new(1.0),
+            style: TransitionStyle::Fade,
+            compositor: None,
+            size: (1, 1),
+            composing: false,
         }
+    }
+
+    fn compositor(&mut self) -> &mut compose::Compositor {
+        if self.compositor.is_none() {
+            let empty = create_texture(&self.device, &self.queue, 1, 1, &[0, 0, 0, 0]);
+            self.compositor = Some(compose::Compositor::new(&self.device, self.format, empty));
+        }
+        self.compositor.as_mut().unwrap()
+    }
+
+    /// How scene changes look (spec 6.3). Custom shaders are compiled now;
+    /// on error the style stays as it was.
+    pub fn set_transition_style(&mut self, style: TransitionStyle) -> Result<(), String> {
+        if style != TransitionStyle::Fade {
+            let device = self.device.clone();
+            self.compositor().prepare_transition(&device, &style)?;
+        }
+        self.style = style;
+        Ok(())
     }
 
     /// Current time on the engine clock, in seconds.
@@ -383,16 +433,35 @@ impl VisualEngine {
     pub fn set_layers(&mut self, specs: &[LayerSpec], transition: Transition) -> Vec<String> {
         let now = self.time();
         let transition = self.effective(transition);
-        for l in &mut self.layers {
-            l.leaving = true;
-            l.opacity.set(0.0, transition, now);
+        // A styled transition renders the old and the new scene whole and
+        // mixes them; fade crossfades each layer's opacity.
+        let styled = self.style != TransitionStyle::Fade
+            && transition != Transition::Instant
+            && self.layers.iter().any(|l| !l.leaving);
+        if styled {
+            self.outgoing = std::mem::take(&mut self.layers);
+            self.outgoing.retain(|l| !l.leaving);
+            self.progress = Animated::new(0.0);
+            self.progress.set(1.0, transition, now);
+        } else {
+            self.outgoing.clear();
+            self.progress = Animated::new(1.0);
+            for l in &mut self.layers {
+                l.leaving = true;
+                l.opacity.set(0.0, transition, now);
+            }
         }
         let mut errors = Vec::new();
         for spec in specs {
             match self.build(spec) {
                 Ok(mut layer) => {
-                    layer.opacity = Animated::new(0.0);
-                    layer.opacity.set(spec.opacity.clamp(0.0, 1.0) as f64, transition, now);
+                    let target = spec.opacity.clamp(0.0, 1.0) as f64;
+                    if styled {
+                        layer.opacity = Animated::new(target);
+                    } else {
+                        layer.opacity = Animated::new(0.0);
+                        layer.opacity.set(target, transition, now);
+                    }
                     self.layers.push(layer);
                 }
                 Err(e) => errors.push(format!("layer {:?}: {e}", spec.id)),
@@ -444,19 +513,55 @@ impl VisualEngine {
     /// Whether the scene changes over time right now; the window keeps
     /// drawing frames only while this is true.
     pub fn animating(&self) -> bool {
+        self.next_frame_in().is_some()
+    }
+
+    /// How long until the scene next changes, in seconds: `Some(0.0)` when
+    /// it moves continuously (draw at the frame-rate cap), the time to the
+    /// next animated-image frame, or `None` when it is still.
+    pub fn next_frame_in(&self) -> Option<f64> {
         if self.fixed_time.is_none() && (self.paused || self.reduced_motion) {
-            // A paused clock: only explicit transitions could still move,
-            // and they are frozen too.
-            return false;
+            // A paused clock: nothing moves (transitions are instant).
+            return None;
         }
         let now = self.time();
-        self.layers.iter().any(|l| {
-            l.uses_time || l.opacity.active(now) || l.params.iter().any(|(_, a)| a.active(now))
-        })
+        let mut next: Option<f64> = None;
+        for l in &self.layers {
+            let moving_param = l
+                .time_params
+                .iter()
+                .any(|&i| l.params.get(i).is_some_and(|(_, a)| a.target() != 0.0));
+            if l.uses_time
+                || moving_param
+                || self.progress.active(now)
+                || l.opacity.active(now)
+                || l.params.iter().any(|(_, a)| a.active(now))
+            {
+                return Some(0.0);
+            }
+            if l.period > 0.0 {
+                // Time left in the current frame of an animated image.
+                let mut t = (now as f32).rem_euclid(l.period);
+                let mut left = 0.0;
+                for d in &l.delays {
+                    if t < *d {
+                        left = d - t;
+                        break;
+                    }
+                    t -= d;
+                }
+                let left = (left as f64).max(0.001);
+                next = Some(next.map_or(left, |n: f64| n.min(left)));
+            }
+        }
+        next
     }
 
     fn drop_finished(&mut self, now: f64) {
         self.layers.retain(|l| !(l.leaving && !l.opacity.active(now) && l.opacity.target() == 0.0));
+        if !self.outgoing.is_empty() && !self.progress.active(now) {
+            self.outgoing.clear();
+        }
     }
 
     /// Update uniforms for a `width` x `height` target. Call once per frame
@@ -464,8 +569,15 @@ impl VisualEngine {
     pub fn prepare(&mut self, width: u32, height: u32) {
         let now = self.time();
         self.drop_finished(now);
+        self.size = (width.max(1), height.max(1));
         let shader_time = now as f32;
-        for l in &mut self.layers {
+        let global = self.global_opacity;
+        for l in self.layers.iter_mut().chain(self.outgoing.iter_mut()) {
+            l.shown = l.opacity.value(now) as f32 * global;
+            if l.blur {
+                l.radius = l.params.first_mut().map_or(0.0, |(_, a)| a.value(now) as f32);
+                continue;
+            }
             let mut u = l.static_data;
             u.resolution = [width.max(1) as f32, height.max(1) as f32];
             u.time = shader_time;
@@ -487,14 +599,103 @@ impl VisualEngine {
             }
             self.queue.write_buffer(&l.uniforms, 0, bytemuck::bytes_of(&u));
         }
+        self.composing =
+            !self.outgoing.is_empty() || self.layers.iter().any(|l| l.blur && l.shown > 0.0);
     }
 
-    /// Draw all layers into the current pass (before the text).
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Offscreen work for this frame (blur layers, styled transitions).
+    /// Call after [`VisualEngine::prepare`] and before the frame's render
+    /// pass; does nothing for plain scenes.
+    pub fn encode(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.composing {
+            return;
+        }
+        let size = self.size;
+        let two = !self.outgoing.is_empty();
+        let (device, queue) = (self.device.clone(), self.queue.clone());
+        self.compositor();
+        let mut comp = self.compositor.take().expect("created above");
+        comp.begin_frame();
+        comp.ensure_targets(&device, size, two);
+        if two {
+            Self::render_scene(&mut comp, &device, &queue, encoder, &self.outgoing, true);
+        }
+        Self::render_scene(&mut comp, &device, &queue, encoder, &self.layers, false);
+        self.compositor = Some(comp);
+    }
+
+    /// Draw `layers` into scene target A or B, running blur layers as they
+    /// come.
+    fn render_scene(
+        comp: &mut compose::Compositor,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        layers: &[GpuLayer],
+        use_a: bool,
+    ) {
+        let mut clear = true;
+        let mut i = 0;
+        while i <= layers.len() {
+            // A run of ordinary layers up to the next blur (or the end).
+            let end = layers[i..].iter().position(|l| l.blur).map_or(layers.len(), |p| i + p);
+            {
+                let target =
+                    if use_a { comp.a.as_ref() } else { comp.b.as_ref() }.expect("targets");
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if clear {
+                                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                for l in &layers[i..end] {
+                    Self::draw_layer(&mut pass, l);
+                }
+            }
+            clear = false;
+            if end == layers.len() {
+                break;
+            }
+            let b = &layers[end];
+            comp.blur(device, queue, encoder, use_a, b.radius, b.shown);
+            i = end + 1;
+        }
+    }
+
+    fn draw_layer(pass: &mut wgpu::RenderPass<'_>, l: &GpuLayer) {
+        if l.blur {
+            return;
+        }
+        pass.set_pipeline(&l.pipeline);
+        pass.set_bind_group(0, &l.frames[l.current.min(l.frames.len() - 1)], &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Draw the background into the current pass (before the text).
+    pub fn render(&mut self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.composing {
+            let (device, queue) = (self.device.clone(), self.queue.clone());
+            let now = self.time();
+            let progress = self.progress.value(now) as f32;
+            let style = (!self.outgoing.is_empty()).then_some(&self.style);
+            if let Some(c) = self.compositor.as_mut() {
+                c.present(&device, &queue, pass, style, progress, now as f32);
+            }
+            return;
+        }
         for l in &self.layers {
-            pass.set_pipeline(&l.pipeline);
-            pass.set_bind_group(0, &l.frames[l.current.min(l.frames.len() - 1)], &[]);
-            pass.draw(0..3, 0..1);
+            Self::draw_layer(pass, l);
         }
     }
 
@@ -502,6 +703,8 @@ impl VisualEngine {
         let mut data: Uniforms = bytemuck::Zeroable::zeroed();
         let mut textures: Vec<wgpu::TextureView> = Vec::new();
         let mut delays: Vec<f32> = Vec::new();
+        let mut time_params: Vec<usize> = Vec::new();
+        let mut blur = false;
         let mut params: Vec<(String, f32)> = Vec::new();
         let mut colors: Vec<(String, Rgba)> = Vec::new();
         let body: String = match &spec.kind {
@@ -510,6 +713,10 @@ impl VisualEngine {
                 include_str!("shaders/solid.wgsl").into()
             }
             LayerKind::Gradient { colors, angle } => {
+                const MOTION: &[(&str, f32)] = &[("spin", 0.0), ("flow", 0.0)];
+                params = with_defaults(MOTION, &spec.params, false)
+                    .map_err(|n| no_such("gradient", "parameter", n, MOTION))?;
+                time_params = vec![0, 1];
                 if colors.is_empty() || colors.len() > MAX_STOPS {
                     return Err(format!("a gradient needs 1 to {MAX_STOPS} colors"));
                 }
@@ -551,6 +758,13 @@ impl VisualEngine {
                 params = with_defaults(GRADING, &spec.params, false)
                     .map_err(|n| no_such("image", "parameter", n, GRADING))?;
                 include_str!("shaders/image.wgsl").into()
+            }
+            LayerKind::Blur => {
+                const RADIUS: &[(&str, f32)] = &[("radius", 8.0)];
+                params = with_defaults(RADIUS, &spec.params, false)
+                    .map_err(|n| no_such("blur", "parameter", n, RADIUS))?;
+                blur = true;
+                include_str!("shaders/solid.wgsl").into()
             }
             LayerKind::Shader { name, source } => {
                 let (src, param_defaults, color_defaults): (&str, Params, Colors) = match source {
@@ -594,7 +808,9 @@ impl VisualEngine {
             data.colors[i] = *c;
         }
         let source = format!("{PRELUDE}\n{consts}\n{body}");
-        let uses_time = body.contains("u.time") || !delays.is_empty();
+        // Gradients read u.time only through spin/flow (see time_params);
+        // animated images change at frame boundaries (see next_frame_in).
+        let uses_time = time_params.is_empty() && body.contains("u.time");
 
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -666,10 +882,14 @@ impl VisualEngine {
             delays,
             period,
             current: 0,
+            blur,
+            radius: 0.0,
+            shown: 0.0,
             uniforms,
             opacity: Animated::new(spec.opacity as f64),
             params: params.into_iter().map(|(n, v)| (n, Animated::new(v as f64))).collect(),
             uses_time,
+            time_params,
             static_data: data,
             leaving: false,
         })

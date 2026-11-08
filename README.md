@@ -160,6 +160,13 @@ To tweak a preset's layer, give a `[[background]]` the same `id` in your
 config, e.g. `params = { style = 2 }` for the nebula. See ADR 0008 for the
 design and the Lua/CSS authoring plan.
 
+A `kind = "blur"` layer blurs everything beneath it (frosted glass over a
+shader or wallpaper). Gradients animate with `spin` and `flow` parameters.
+Scene changes use `visual.transition`: `fade`, `slide`, `wipe`,
+`dissolve`, `zoom`, `blur`, `fade-through`, or your own `.wgsl` file
+implementing `fn transition(uv, p)` with `from_scene(uv)` and
+`to_scene(uv)`.
+
 Profiles in `~/.config/seraphim/profiles/<name>.toml` override any part of
 the config; switch with `--profile NAME` or **Ctrl+Shift+P** at runtime
 (the background crossfades), reload with **Ctrl+Shift+R**. Animation only

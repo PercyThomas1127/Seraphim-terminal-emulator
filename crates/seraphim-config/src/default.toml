@@ -83,8 +83,13 @@ max_fps = 60
 animate_unfocused = false
 # Background opacity of the window (needs a compositor; text stays opaque).
 window_opacity = 1.0
-# Crossfade duration when switching profiles, in milliseconds.
+# Duration of scene changes when switching profiles, in milliseconds.
 transition_ms = 400
+# How scenes change: fade, slide, wipe, dissolve, zoom, blur, fade-through,
+# or a .wgsl file (in transitions/ or next to this file) implementing
+#   fn transition(uv: vec2<f32>, p: f32) -> vec4<f32>
+# with from_scene(uv) / to_scene(uv) (premultiplied RGBA) and u.time.
+transition = "fade"
 
 [cursor]
 # Glide between cells over this many milliseconds (0 jumps).
@@ -110,7 +115,8 @@ selection_fade_ms = 90
 # "theme.foreground", "theme.cursor", "theme.selection", "theme.normal.0"-"7"
 # or "theme.bright.0"-"7").
 # Every layer takes opacity (0-1) and blend ("normal", "add", "multiply",
-# "screen").
+# "screen"). kind = "blur" blurs everything beneath it (params = { radius =
+# 12 }); its opacity mixes blurred and sharp.
 #
 # [[background]]
 # kind = "gradient"

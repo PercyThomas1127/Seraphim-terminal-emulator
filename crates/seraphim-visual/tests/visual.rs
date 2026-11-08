@@ -32,8 +32,10 @@ impl Rig {
         let (width, height) = self.h.size_for(&t, 4.0);
         let view = View { width, height, padding: 4.0, focused: true, cursor_on: true };
         self.v.prepare(width, height);
-        let v = &self.v;
-        self.h.render_with(&t, view, &mut |pass| v.render(pass))
+        let v = std::cell::RefCell::new(&mut self.v);
+        self.h.render_with_encoder(&t, view, &mut |e| v.borrow_mut().encode(e), &mut |pass| {
+            v.borrow_mut().render(pass)
+        })
     }
 }
 
@@ -287,8 +289,10 @@ mod heavens {
         let (width, height) = r.h.size_for(&term, 4.0);
         let view = View { width, height, padding: 4.0, focused: true, cursor_on: true };
         r.v.prepare(width, height);
-        let v = &r.v;
-        r.h.render_with(&term, view, &mut |pass| v.render(pass))
+        let v = std::cell::RefCell::new(&mut r.v);
+        r.h.render_with_encoder(&term, view, &mut |e| v.borrow_mut().encode(e), &mut |pass| {
+            v.borrow_mut().render(pass)
+        })
     }
 
     fn mean(img: &Image) -> [f32; 3] {
@@ -474,5 +478,168 @@ mod pictures {
         let row: Vec<u8> = (mid - 6..mid + 6).map(|x| img.pixel(x, 1)[0]).collect();
         let distinct = row.windows(2).filter(|w| w[0] != w[1]).count();
         assert!(distinct >= 5, "soft edge {row:?}");
+    }
+}
+
+#[test]
+fn frame_pacing_and_animated_gradients() {
+    let Some(mut r) = rig() else { return };
+    let still = LayerSpec::new(
+        "g",
+        LayerKind::Gradient {
+            colors: vec![[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+            angle: 0.0,
+        },
+    );
+    assert!(r.v.set_layers(std::slice::from_ref(&still), Transition::Instant).is_empty());
+    assert_eq!(r.v.next_frame_in(), None, "a plain gradient is still");
+    let a = r.frame("");
+    // Spinning 90 degrees per second: after a second it runs top to bottom.
+    r.v.set_param("g", "spin", 90.0, Transition::Instant);
+    assert_eq!(r.v.next_frame_in(), Some(0.0), "spinning: continuous");
+    r.v.set_fixed_time(Some(1.0));
+    let b = r.frame("");
+    let (w, h) = (a.width, a.height);
+    assert!(
+        rgb(a.pixel(1, h / 2))[0] > 200 && rgb(a.pixel(w - 2, h / 2))[2] > 200,
+        "left to right at t=0"
+    );
+    assert!(
+        rgb(b.pixel(w / 2, 1))[0] > 150 && rgb(b.pixel(w / 2, h - 2))[2] > 150,
+        "top to bottom at t=1"
+    );
+    // Flow drifts the bands.
+    let flowing = LayerSpec { params: vec![("flow".into(), 0.5)], ..still };
+    r.v.set_layers(&[flowing], Transition::Instant);
+    r.v.set_fixed_time(Some(0.0));
+    let c = r.frame("");
+    r.v.set_fixed_time(Some(0.5));
+    let d = r.frame("");
+    assert_ne!(c.pixel(w / 2, h / 2), d.pixel(w / 2, h / 2), "bands moved");
+    // Animated image: the time to its next frame, not "continuous".
+    let dir = std::env::temp_dir().join(format!("seraphim-pace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("p.gif");
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut enc = image::codecs::gif::GifEncoder::new(file);
+        let f = |c: [u8; 4]| {
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(2, 2, image::Rgba(c)),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(250, 1),
+            )
+        };
+        enc.encode_frames([f([255, 0, 0, 255]), f([0, 255, 0, 255])]).unwrap();
+    }
+    r.v.set_layers(
+        &[LayerSpec::new("i", LayerKind::Image { path, fit: Fit::Stretch, blur: 0.0 })],
+        Transition::Instant,
+    );
+    r.v.set_fixed_time(Some(0.1));
+    let left = r.v.next_frame_in().unwrap();
+    assert!((left - 0.15).abs() < 0.01, "{left}");
+}
+
+mod compositing {
+    use super::*;
+
+    fn halves() -> LayerSpec {
+        // A hard edge: left white, right black.
+        let dir = std::env::temp_dir().join(format!("seraphim-halves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.png");
+        image::RgbaImage::from_fn(64, 4, |x, _| {
+            image::Rgba(if x < 32 { [255; 4] } else { [0, 0, 0, 255] })
+        })
+        .save(&path)
+        .unwrap();
+        LayerSpec::new("g", LayerKind::Image { path, fit: Fit::Stretch, blur: 0.0 })
+    }
+
+    fn edge_softness(img: &Image) -> usize {
+        let y = img.height / 2;
+        (0..img.width).filter(|&x| (20..235).contains(&img.pixel(x, y)[0])).count()
+    }
+
+    #[test]
+    fn blur_layer_blurs_what_is_beneath() {
+        let Some(mut r) = rig() else { return };
+        r.v.set_layers(&[halves()], Transition::Instant);
+        let sharp = edge_softness(&r.frame(""));
+        let blur = LayerSpec {
+            params: vec![("radius".into(), 12.0)],
+            ..LayerSpec::new("b", LayerKind::Blur)
+        };
+        assert!(r.v.set_layers(&[halves(), blur], Transition::Instant).is_empty());
+        let soft = r.frame("");
+        assert!(edge_softness(&soft) > sharp + 8, "softened: {sharp} -> {}", edge_softness(&soft));
+        // Half opacity: between the two.
+        r.v.set_opacity("b", 0.5, Transition::Instant);
+        let half = edge_softness(&r.frame(""));
+        assert!(half > sharp && half <= edge_softness(&soft) + 2, "{sharp} {half}");
+        // A layer above the blur stays sharp.
+        let top = LayerSpec::new("t", LayerKind::Solid([1.0, 0.0, 0.0, 1.0]));
+        let blur = LayerSpec {
+            params: vec![("radius".into(), 12.0)],
+            ..LayerSpec::new("b", LayerKind::Blur)
+        };
+        r.v.set_layers(&[halves(), blur, top], Transition::Instant);
+        assert_eq!(rgb(r.frame("").pixel(1, 1)), [255, 0, 0]);
+        let e = r.v.set_layers(
+            &[LayerSpec {
+                params: vec![("sigma".into(), 1.0)],
+                ..LayerSpec::new("x", LayerKind::Blur)
+            }],
+            Transition::Instant,
+        );
+        assert!(e[0].contains("radius"), "{e:?}");
+    }
+
+    #[test]
+    fn styled_transitions() {
+        let Some(mut r) = rig() else { return };
+        let red = LayerSpec::new("r", LayerKind::Solid([1.0, 0.0, 0.0, 1.0]));
+        let blue = LayerSpec::new("b", LayerKind::Solid([0.0, 0.0, 1.0, 1.0]));
+        assert!(r.v.set_transition_style(TransitionStyle::Builtin("slide".into())).is_ok());
+        r.v.set_layers(std::slice::from_ref(&red), Transition::Instant);
+        r.v.set_fixed_time(Some(10.0));
+        r.v.set_layers(
+            std::slice::from_ref(&blue),
+            Transition::Tween { duration: 1.0, easing: Easing::Linear },
+        );
+        assert!(r.v.animating());
+        r.v.set_fixed_time(Some(10.5));
+        let img = r.frame("");
+        let w = img.width;
+        assert_eq!(rgb(img.pixel(2, 2)), [255, 0, 0], "old scene on the left");
+        assert_eq!(rgb(img.pixel(w - 3, 2)), [0, 0, 255], "new one slides in from the right");
+        r.v.set_fixed_time(Some(11.5));
+        assert_eq!(rgb(r.frame("").pixel(2, 2)), [0, 0, 255], "done");
+        assert!(!r.v.animating(), "outgoing scene dropped");
+
+        // A user transition: a plain mix.
+        let mix = "fn transition(uv: vec2<f32>, p: f32) -> vec4<f32> { return mix(from_scene(uv), to_scene(uv), p); }";
+        r.v.set_transition_style(TransitionStyle::Custom {
+            name: "mix".into(),
+            source: mix.into(),
+        })
+        .unwrap();
+        r.v.set_layers(&[red], Transition::Tween { duration: 1.0, easing: Easing::Linear });
+        r.v.set_fixed_time(Some(12.0));
+        let c = rgb(r.frame("").pixel(2, 2));
+        assert!(c[0] > 100 && c[2] > 100, "half-way mix {c:?}");
+        // A broken one is refused and the style stays.
+        let e = r.v.set_transition_style(TransitionStyle::Custom {
+            name: "bad".into(),
+            source: "fn transition(".into(),
+        });
+        assert!(e.unwrap_err().contains("did not compile"));
+        // Every built-in compiles.
+        for (name, _) in BUILTIN_TRANSITIONS {
+            r.v.set_transition_style(TransitionStyle::Builtin(name.to_string()))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 }

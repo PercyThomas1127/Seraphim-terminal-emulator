@@ -372,8 +372,12 @@ pub struct Visual {
     /// Opacity of the window background (needs a compositor). Text and
     /// cell colors stay opaque.
     pub window_opacity: f32,
-    /// Duration of crossfades when switching profiles, in milliseconds.
+    /// Duration of scene changes (profile switches), in milliseconds.
     pub transition_ms: u32,
+    /// How scenes change: `fade`, `slide`, `wipe`, `dissolve`, `zoom`,
+    /// `blur`, `fade-through`, or a `.wgsl` file implementing
+    /// `fn transition(uv, p)` (in `transitions/` or the config directory).
+    pub transition: String,
 }
 
 /// Cursor and selection effects (`[cursor]`). Reduced motion turns the
@@ -416,6 +420,7 @@ impl Default for Visual {
             animate_unfocused: false,
             window_opacity: 1.0,
             transition_ms: 400,
+            transition: "fade".into(),
         }
     }
 }
@@ -793,6 +798,15 @@ impl Config {
         }
         if c.glide_ms > 1000 || c.blink_fade_ms > 1000 || c.selection_fade_ms > 1000 {
             return Err("cursor durations must be at most 1000 ms".into());
+        }
+        const TRANSITIONS: &[&str] =
+            &["fade", "slide", "wipe", "dissolve", "zoom", "blur", "fade-through"];
+        if !TRANSITIONS.contains(&v.transition.as_str()) && !v.transition.ends_with(".wgsl") {
+            return Err(format!(
+                "visual.transition must be {} or a .wgsl file (got {:?})",
+                TRANSITIONS.join(", "),
+                v.transition
+            ));
         }
         if !(0.0..=1.0).contains(&v.window_opacity) {
             return Err(format!("visual.window_opacity must be 0-1 (got {})", v.window_opacity));
@@ -1328,8 +1342,11 @@ impl Background {
                     }
                 }
             }
-            "" => return Err("missing `kind` (solid, gradient, image or shader)".into()),
-            k => return Err(format!("unknown kind {k:?} (solid, gradient, image or shader)")),
+            "blur" => {}
+            "" => return Err("missing `kind` (solid, gradient, image, blur or shader)".into()),
+            k => {
+                return Err(format!("unknown kind {k:?} (solid, gradient, image, blur or shader)"))
+            }
         }
         Ok(())
     }

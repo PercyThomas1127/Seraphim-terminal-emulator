@@ -79,6 +79,7 @@ pub fn options_from_config(
         watch: files,
         live_reload: c.live_reload,
         notice: None,
+        transition: transition_style(&c.visual.transition, config_dir),
         cursor: c.cursor.clone(),
         menu_bar: c.window.menu_bar,
         menus: crate::menu::merge(&seraphim_config::builtin_menu(), &c.menu),
@@ -116,6 +117,7 @@ fn layers(
                 files.push(path.clone());
                 LayerKind::Image { path, fit: Fit::parse(&b.fit).unwrap_or_default(), blur: b.blur }
             }
+            "blur" => LayerKind::Blur,
             _ => {
                 let name = b.shader.clone().unwrap_or_default();
                 if name.ends_with(".wgsl") {
@@ -148,6 +150,24 @@ fn layers(
         });
     }
     (out, warnings, files)
+}
+
+/// `visual.transition` as a style: a built-in name, or a WGSL file from
+/// `transitions/` or the config directory. Unreadable files fall back to
+/// fade (with a message).
+pub fn transition_style(
+    name: &str,
+    config_dir: Option<&Path>,
+) -> Result<seraphim_visual::TransitionStyle, String> {
+    if let Some(s) = seraphim_visual::TransitionStyle::named(name) {
+        return Ok(s);
+    }
+    let dir = config_dir.map(Path::to_path_buf).unwrap_or_default();
+    let candidates = [dir.join("transitions").join(name), dir.join(name)];
+    let path = candidates.iter().find(|p| p.exists()).unwrap_or(&candidates[1]);
+    std::fs::read_to_string(path)
+        .map(|source| seraphim_visual::TransitionStyle::Custom { name: name.to_owned(), source })
+        .map_err(|e| format!("transition {}: {e}", path.display()))
 }
 
 /// A palette color: `#rrggbb[aa]` or a theme color such as

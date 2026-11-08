@@ -75,6 +75,8 @@ pub struct WindowOptions {
     /// Shown in the window at startup (e.g. a config error).
     pub notice: Option<String>,
     pub cursor: seraphim_config::CursorFx,
+    /// How scenes change (or why the configured transition failed).
+    pub transition: Result<seraphim_visual::TransitionStyle, String>,
 }
 
 impl WindowOptions {
@@ -125,6 +127,7 @@ impl Default for WindowOptions {
             live_reload: true,
             notice: None,
             cursor: Default::default(),
+            transition: Ok(Default::default()),
         }
     }
 }
@@ -296,6 +299,9 @@ struct Active {
     bindings: crate::bindings::Bindings,
     /// The compositor says no part of the window is visible.
     occluded: bool,
+    /// When the background next changes (animated images); cleared by
+    /// each redraw.
+    visual_due: Option<Instant>,
 }
 
 impl Active {
@@ -432,6 +438,9 @@ impl App {
         let mut visual = VisualEngine::new(&gpu.device, &gpu.queue, gpu.config.format);
         visual.set_reduced_motion(o.visual.reduced_motion);
         visual.set_global_opacity(o.visual.window_opacity);
+        if let Err(e) = o.transition.clone().and_then(|t| visual.set_transition_style(t)) {
+            eprintln!("seraphim: {e}; using fade");
+        }
         for e in visual.set_layers(&o.layers, Transition::Instant) {
             eprintln!("seraphim: {e}");
         }
@@ -473,6 +482,7 @@ impl App {
             interactions,
             bindings,
             occluded: false,
+            visual_due: None,
         };
         active.rebuild_menu();
         Ok(active)
@@ -655,6 +665,12 @@ impl App {
         let files_changed = matches!(&request_kind, Request::Files(f)
             if f.iter().any(|p| p.extension().is_none_or(|e| e != "toml")));
         let mut layer_error = None;
+        let mut transition_error = None;
+        let style = o.transition.clone().and_then(|t| a.visual.set_transition_style(t));
+        if let Err(e) = style {
+            let _ = a.visual.set_transition_style(Default::default());
+            transition_error = Some(format!("{e}; using fade"));
+        }
         let rebuilt = o.layers != self.options.layers || files_changed || !live;
         if rebuilt {
             for e in a.visual.set_layers(&o.layers, fade) {
@@ -689,7 +705,7 @@ impl App {
             Some(a.session.id()),
             seraphim_events::json!({ "profile": self.options.profile }),
         );
-        let msg = match (&request_kind, layer_error.or(first_warning)) {
+        let msg = match (&request_kind, layer_error.or(transition_error).or(first_warning)) {
             (_, Some(problem)) => problem,
             (Request::Files(_), None) => "Configuration reloaded".to_owned(),
             (Request::Reload, None) => "Configuration reloaded".to_owned(),
@@ -1542,6 +1558,7 @@ impl ApplicationHandler<UserEvent> for App {
                     a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
                 }
                 a.last_frame = Instant::now();
+                a.visual_due = None;
                 draw(a);
             }
             _ => {}
@@ -1595,9 +1612,22 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Animated background or cursor effects: draw frames at up to
         // max_fps while something moves.
-        if a.visual.animating() || a.renderer.effects_animating() {
-            let next =
+        // Animated images only change at their frame boundaries, so they
+        // wake the loop then, not at the frame-rate cap.
+        let visual_next = a.visual.next_frame_in();
+        let effects = a.renderer.effects_animating();
+        if visual_next.is_some() || effects {
+            let cap =
                 a.last_frame + Duration::from_secs_f64(1.0 / a.visual_cfg.max_fps.max(1) as f64);
+            let next = match visual_next {
+                Some(d) if d > 0.0 && !effects => {
+                    // Remember the deadline: once it passes, the time left
+                    // in the (new) frame would be a whole frame again.
+                    let due = *a.visual_due.get_or_insert(now + Duration::from_secs_f64(d));
+                    cap.max(due)
+                }
+                _ => cap,
+            };
             if now >= next {
                 a.window.request_redraw();
             }
@@ -1653,6 +1683,8 @@ fn draw(a: &mut Active) {
     };
     let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
     let mut encoder = a.gpu.device.create_command_encoder(&Default::default());
+    // Offscreen background work (blur layers, styled transitions).
+    a.visual.encode(&mut encoder);
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("frame"),
