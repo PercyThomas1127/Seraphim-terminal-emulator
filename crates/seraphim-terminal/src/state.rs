@@ -8,6 +8,7 @@ use vte::{Params, Perform};
 use crate::cell::{Attrs, Cell, Color, Flags};
 use crate::grid::{Grid, Row};
 use crate::palette::{format_color, parse_color, xterm_256, ColorOverrides, ColorScheme, Rgb};
+use crate::reflow;
 use crate::selection::{Lines, Selection, SelectionRange};
 
 /// Semantic events surfaced to higher layers. The Terminal Core only
@@ -94,6 +95,8 @@ pub struct Modes {
     pub mouse: MouseMode,
     pub mouse_encoding: MouseEncoding,
     pub synchronized_output: bool,
+    /// Kitty keyboard protocol flags in effect (0 = legacy encoding).
+    pub kitty_keyboard: u8,
 }
 
 impl Default for Modes {
@@ -114,6 +117,7 @@ impl Default for Modes {
             mouse: MouseMode::Off,
             mouse_encoding: MouseEncoding::Default,
             synchronized_output: false,
+            kitty_keyboard: 0,
         }
     }
 }
@@ -190,6 +194,10 @@ pub(crate) struct State {
     /// take the fast path. Recomputed after every control/CSI/ESC dispatch,
     /// the only places those settings change.
     fast_print: bool,
+    /// Kitty keyboard flag stacks; the main and alternate screens each
+    /// have their own (per the protocol).
+    kitty_main: Vec<u8>,
+    kitty_alt: Vec<u8>,
     /// Lines scrolled back into history in the viewport (0 = bottom).
     pub display_offset: usize,
     pub selection: Option<Selection>,
@@ -231,6 +239,8 @@ impl State {
             last_printed: None,
             last_wide_at: None,
             fast_print: true,
+            kitty_main: Vec::new(),
+            kitty_alt: Vec::new(),
             display_offset: 0,
             selection: None,
             scheme: ColorScheme::default(),
@@ -337,16 +347,66 @@ impl State {
         self.display_offset = 0;
         self.last_printed = None;
         self.last_wide_at = None;
-        // Keep the cursor on screen when shrinking: drop lines from the top
-        // of the primary screen into scrollback.
-        // (Only the active grid is shifted; drop_top <= cursor.row always.)
-        let drop_top = (self.cursor.row + 1).saturating_sub(rows);
-        let (primary_drop, alt_drop) = if self.alt_active { (0, drop_top) } else { (drop_top, 0) };
-        for row in self.primary.resize(cols, rows, primary_drop) {
-            self.push_scrollback(row);
+        let old_rows = self.rows;
+
+        // Primary screen: reflow scrollback + screen as one text, tracking
+        // the primary cursor and the old screen's first row.
+        let (pcur_row, pcur_col, pending) = if self.alt_active {
+            let c = self.saved_primary.cursor;
+            (c.row, c.col, c.pending_wrap)
+        } else {
+            (self.cursor.row, self.cursor.col, self.cursor.pending_wrap)
+        };
+        let history = self.scrollback.len();
+        let mut all: Vec<Row> = self.scrollback.drain(..).collect();
+        all.extend(self.primary.take_lines());
+        let anchors = [
+            // A pending wrap means the cursor is logically past the last cell.
+            reflow::Anchor { row: history + pcur_row, col: pcur_col + pending as usize },
+            reflow::Anchor { row: history, col: 0 },
+        ];
+        let (mut lines, mapped) = reflow::reflow(all, cols, &anchors);
+        let (crow, ccol) = mapped[0];
+        let old_top = mapped[1].0;
+        // Blank rows below the cursor carry nothing.
+        while lines.len() > crow + 1
+            && lines
+                .last()
+                .is_some_and(|r| !r.wrapped && r.cells.iter().all(|c| *c == Cell::default()))
+        {
+            lines.pop();
         }
-        self.alternate.resize(cols, rows, alt_drop);
-        self.cursor.row -= drop_top;
+        let total = lines.len();
+        let mut top = old_top.min(total.saturating_sub(1));
+        if crow >= top + rows {
+            top = crow + 1 - rows; // keep the cursor visible
+        }
+        if rows > old_rows && total - top < rows {
+            top = top.min(total.saturating_sub(rows)); // growing: pull history back in
+        }
+        if crow < top {
+            top = crow;
+        }
+        let mut screen: Vec<Row> = lines.split_off(top);
+        screen.truncate(rows);
+        while screen.len() < rows {
+            screen.push(Row::new(cols, &Attrs::default()));
+        }
+        let keep = lines.len().saturating_sub(self.scrollback_limit);
+        self.scrollback.extend(lines.drain(keep..));
+        self.primary.set_lines(cols, screen);
+        let (new_row, new_col) = (crow - top, ccol.min(cols - 1));
+        // The alternate screen is not reflowed: full-screen programs redraw.
+        self.alternate.resize(cols, rows, (self.cursor.row + 1).saturating_sub(rows));
+        if self.alt_active {
+            self.saved_primary.cursor.row = new_row;
+            self.saved_primary.cursor.col = new_col;
+            self.saved_primary.cursor.pending_wrap = false;
+            self.cursor.row = self.cursor.row.min(rows - 1);
+        } else {
+            self.cursor.row = new_row;
+            self.cursor.col = new_col;
+        }
         self.cols = cols;
         self.rows = rows;
         self.cursor.row = self.cursor.row.min(rows - 1);
@@ -364,16 +424,6 @@ impl State {
             self.tabs[i] = i % 8 == 0 && i != 0;
         }
         self.damage = vec![true; rows];
-    }
-
-    fn push_scrollback(&mut self, row: Row) {
-        if self.scrollback_limit == 0 {
-            return;
-        }
-        if self.scrollback.len() >= self.scrollback_limit {
-            self.scrollback.pop_front();
-        }
-        self.scrollback.push_back(row);
     }
 
     // ---- primitive operations -----------------------------------------
@@ -646,6 +696,7 @@ impl State {
             return;
         }
         self.alt_active = enable;
+        self.sync_kitty();
         self.selection = None;
         self.display_offset = 0;
         if enable && clear {
@@ -696,7 +747,12 @@ impl State {
         if width == 2 && self.cursor.col + 1 >= self.cols {
             if self.modes.autowrap {
                 // Wide char does not fit: wrap, leaving the last column as
-                // it is (xterm keeps whatever was there).
+                // it is (xterm keeps whatever was there). If it is blank,
+                // mark it as padding so copy and reflow ignore it.
+                let (row, col) = (self.cursor.row, self.cursor.col);
+                if *self.grid().cell(row, col) == Cell::default() {
+                    self.grid().cell_mut(row, col).attrs.flags.insert(Flags::WIDE_PADDING);
+                }
                 self.wrap_line();
             } else if let Some(start) = self.last_wide_at.filter(|&s| s + 2 <= self.cols) {
                 // xterm: replace the wide character printed just before.
@@ -1182,7 +1238,7 @@ fn arg(params: &[u16], i: usize, default: u16) -> u16 {
 }
 
 impl Perform for State {
-    #[inline]
+    #[inline(always)]
     fn print(&mut self, c: char) {
         // Fast path: printable ASCII in the ASCII charset, no insert mode,
         // no pending wrap, onto a narrow cell. This is nearly all output.
@@ -1248,6 +1304,19 @@ impl Perform for State {
 }
 
 impl State {
+    fn kitty_stack(&mut self) -> &mut Vec<u8> {
+        if self.alt_active {
+            &mut self.kitty_alt
+        } else {
+            &mut self.kitty_main
+        }
+    }
+
+    fn sync_kitty(&mut self) {
+        let stack = if self.alt_active { &self.kitty_alt } else { &self.kitty_main };
+        self.modes.kitty_keyboard = stack.last().copied().unwrap_or(0);
+    }
+
     fn update_fast_print(&mut self) {
         self.fast_print =
             !self.modes.insert && self.charsets[self.active_charset] == Charset::Ascii;
@@ -1425,6 +1494,43 @@ impl State {
                     _ => 0,
                 };
                 self.responses.extend_from_slice(format!("\x1b[{mode};{state}$y").as_bytes());
+            }
+            // Kitty keyboard protocol.
+            ([b'?'], 'u') => {
+                let reply = format!("\x1b[?{}u", self.modes.kitty_keyboard);
+                self.responses.extend_from_slice(reply.as_bytes());
+            }
+            ([b'>'], 'u') => {
+                let flags = (p.first().copied().unwrap_or(0) & 31) as u8;
+                let stack = self.kitty_stack();
+                if stack.len() >= 16 {
+                    stack.remove(0); // bounded, oldest dropped
+                }
+                stack.push(flags);
+                self.sync_kitty();
+            }
+            ([b'<'], 'u') => {
+                let n = arg(p, 0, 1) as usize;
+                let stack = self.kitty_stack();
+                let keep = stack.len().saturating_sub(n);
+                stack.truncate(keep);
+                self.sync_kitty();
+            }
+            ([b'='], 'u') => {
+                let flags = (p.first().copied().unwrap_or(0) & 31) as u8;
+                let mode = arg(p, 1, 1);
+                let stack = self.kitty_stack();
+                if stack.is_empty() {
+                    stack.push(0);
+                }
+                let top = stack.last_mut().unwrap();
+                match mode {
+                    1 => *top = flags,
+                    2 => *top |= flags,
+                    3 => *top &= !flags,
+                    _ => {}
+                }
+                self.sync_kitty();
             }
             ([b'>'], 'q') if arg(p, 0, 0) == 0 => {
                 // XTVERSION

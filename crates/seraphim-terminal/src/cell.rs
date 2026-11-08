@@ -32,6 +32,10 @@ impl Flags {
     pub const WIDE: Flags = Flags(1 << 10);
     /// Trailing placeholder cell of a double-width character.
     pub const WIDE_SPACER: Flags = Flags(1 << 11);
+    /// Blank left at the end of a row because a wide character did not fit
+    /// and wrapped to the next row. Not part of the text (copying or
+    /// reflowing the line skips it).
+    pub const WIDE_PADDING: Flags = Flags(1 << 12);
 
     pub const ALL_UNDERLINES: Flags =
         Flags(Self::UNDERLINE.0 | Self::DOUBLE_UNDERLINE.0 | Self::CURLY_UNDERLINE.0);
@@ -105,5 +109,9 @@ impl Cell {
 
     pub fn is_wide_spacer(&self) -> bool {
         self.attrs.flags.contains(Flags::WIDE_SPACER)
+    }
+
+    pub fn is_wide_padding(&self) -> bool {
+        self.attrs.flags.contains(Flags::WIDE_PADDING)
     }
 }

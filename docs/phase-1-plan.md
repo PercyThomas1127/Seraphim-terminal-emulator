@@ -35,6 +35,8 @@ applications.
 | OSC payload cap (2 MiB) via a pre-filter in front of vte | core `prefilter.rs` | unit tests |
 | Conformance vs xterm: 427/427 golden screens, vttest 34/35 (132-col by design), 300/300 triage streams | `seraphim-conformance` | see `docs/conformance.md` |
 | Fuzzing with invariant checks (stable Rust) | `examples/fuzz.rs`, `tests/fuzz.rs` | 250k+ runs clean |
+| Reflow on resize: soft-wrapped lines rewrap/rejoin across scrollback + screen; wide chars never split (wrap padding is not text); cursor and screen top tracked; growing pulls history back; primary reflows under an active alternate screen; 0.44 ms per resize with 10k lines of history | core `reflow.rs` | `tests/reflow.rs`, fuzzer, Xvfb |
+| Kitty keyboard protocol: push/pop/set/query (`CSI > u`, `CSI < u`, `CSI = u`, `CSI ? u`) with separate main/alternate stacks; disambiguation, event types (press/repeat/release), alternate keys, all-keys mode, associated text, modifier keys | core `input.rs`, window | `tests/kitty_keyboard.rs`; exact bytes via Xvfb |
 | Config file `~/.config/seraphim/config.toml`: font, window, colors, scrollback, shell, clipboard; typos are errors with line/column; broken config falls back to defaults with a message | `seraphim-config` | unit tests; Xvfb |
 
 ## Remaining for the Phase I milestone
@@ -43,6 +45,7 @@ Ordered by dependency. Each needs its acceptance check before it's done.
 
 1. **Measure ADR 0004 on real hardware:** keypress-to-photon latency,
    cold start, Wayland fractional scaling. (The spike itself is done.)
+   **This is the only Phase I item left; it needs a real machine.**
 2. **Font stack, remaining:** ligatures (shaping over same-attribute
    runs), procedural box-drawing/block glyphs (pixel-exact joins),
    configurable fallback list.
@@ -50,9 +53,7 @@ Ordered by dependency. Each needs its acceptance check before it's done.
    done (see table above). Follow-ups: auto-scroll while drag-selecting
    past the window edge, Ctrl+click to open OSC 8 hyperlinks, a
    right-click menu.
-4. **Kitty keyboard protocol** (`CSI > u` push/pop, `CSI ? u` query):
-   separate encoder; do *not* answer the `CSI ? u` query until
-   implemented, so apps don't detect support we don't have.
+4. ~~Kitty keyboard protocol~~ — done.
 5. ~~Conformance~~ — done (see `docs/conformance.md`). Follow-ups:
    vttest menus 3 (character sets), 6 (reports) and 11 (xterm extensions)
    need menu-aware driving; esctest needs DECRQCRA.
@@ -62,16 +63,17 @@ Ordered by dependency. Each needs its acceptance check before it's done.
    `alacritty_terminal` on the same machine (absolute MB/s depends on the
    host; the old "500 MB/s" target was uncalibrated). Add partial
    redraws via `take_damage()` if frame-build time becomes significant.
-8. **Reflow on resize** using `Row::wrapped` (currently truncates).
+8. ~~Reflow on resize~~ — done.
 9. ~~Minimal config~~ — done. Live reload and profiles come with Phase II.
-10. **Throughput regression:** after this stage the parser is ~3–8% slower
-    than the previous commit and ~10–15% behind `alacritty_terminal` on this
-    VM (noise ±8%). Instruction counts per byte went *down*, so look at code
-    layout/inlining of `Perform::print` first (`valgrind --tool=callgrind`,
-    `PROFILE_NO_NEWLINE=1 ... --example throughput -- --profile`).
+10. ~~Throughput regression~~ — fixed by inlining the print fast path
+    into vte's dispatch loop: 87–102% of `alacritty_terminal` (avg ~94%)
+    across interleaved runs on the same machine.
 
 ## Known limitations (today)
 
+* Remaining follow-ups (not blocking): procedural box-drawing glyphs and
+  ligatures (item 2), auto-scroll while drag-selecting, Ctrl+click on OSC 8
+  links, a right-click menu, vttest menus 3/6/11.
 * Synthetic X11 wheel clicks (XTest: xdotool, some remote-desktop
   servers) count twice, because winit's X11 backend reports both the
   press and the release of buttons 4/5. Physical wheels under libinput

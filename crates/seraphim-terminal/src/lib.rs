@@ -24,6 +24,7 @@ mod grid;
 pub mod input;
 pub mod palette;
 mod prefilter;
+mod reflow;
 mod selection;
 mod state;
 

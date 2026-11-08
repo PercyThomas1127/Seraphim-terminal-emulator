@@ -25,6 +25,44 @@ pub enum Key {
     PageDown,
     /// F1..=F12
     F(u8),
+    /// A modifier key itself (only reported in Kitty "report all keys" mode).
+    Modifier(ModifierKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModifierKey {
+    LeftShift,
+    RightShift,
+    LeftCtrl,
+    RightCtrl,
+    LeftAlt,
+    RightAlt,
+    LeftSuper,
+    RightSuper,
+}
+
+/// Press, auto-repeat or release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum KeyKind {
+    #[default]
+    Press,
+    Repeat,
+    Release,
+}
+
+/// Everything known about one key event, for [`encode_key_input`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyInput<'a> {
+    /// For character keys, the *unshifted* character of the key (what the
+    /// Kitty protocol reports as the key code, e.g. `a` for Shift+A).
+    pub key: Key,
+    pub mods: Mods,
+    pub kind: KeyKind,
+    /// The character with modifiers applied (`A` for Shift+a, `!` for
+    /// Shift+1), if any.
+    pub shifted: Option<char>,
+    /// Composed text the key produces (IME/dead keys/layouts), if any.
+    pub text: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -32,6 +70,8 @@ pub struct Mods {
     pub shift: bool,
     pub alt: bool,
     pub ctrl: bool,
+    /// Super/Windows/Command key (only the Kitty protocol can report it).
+    pub super_key: bool,
 }
 
 impl Mods {
@@ -116,9 +156,178 @@ pub fn encode_key(key: Key, mods: Mods, modes: &Modes) -> Vec<u8> {
             }
         }
         Key::F(n @ 5..=12) => tilde(&mut out, [15, 17, 18, 19, 20, 21, 23, 24][(n - 5) as usize]),
-        Key::F(_) => {}
+        Key::F(_) | Key::Modifier(_) => {}
     }
     out
+}
+
+/// Encode a key event using whichever protocol the application selected:
+/// legacy xterm encoding, or the Kitty keyboard protocol when it pushed
+/// flags (`CSI > flags u`).
+pub fn encode_key_input(ev: &KeyInput, modes: &Modes) -> Vec<u8> {
+    if modes.kitty_keyboard != 0 {
+        return kitty(ev, modes.kitty_keyboard);
+    }
+    if ev.kind == KeyKind::Release {
+        return Vec::new();
+    }
+    match ev.key {
+        Key::Modifier(_) => Vec::new(),
+        Key::Char(base) => {
+            let m = ev.mods;
+            if !(m.ctrl || m.alt) {
+                if let Some(t) = ev.text {
+                    return t.as_bytes().to_vec();
+                }
+            }
+            encode_key(Key::Char(ev.shifted.unwrap_or(base)), m, modes)
+        }
+        k => encode_key(k, ev.mods, modes),
+    }
+}
+
+/// Kitty keyboard protocol encoding.
+/// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
+fn kitty(ev: &KeyInput, flags: u8) -> Vec<u8> {
+    const DISAMBIGUATE: u8 = 1;
+    const EVENT_TYPES: u8 = 2;
+    const ALTERNATES: u8 = 4;
+    const ALL_KEYS: u8 = 8;
+    const TEXT: u8 = 16;
+    let has = |f: u8| flags & f != 0;
+    if ev.kind == KeyKind::Release && !has(EVENT_TYPES) {
+        return Vec::new();
+    }
+    let kind =
+        if ev.kind == KeyKind::Repeat && !has(EVENT_TYPES) { KeyKind::Press } else { ev.kind };
+    let m = ev.mods;
+    let modval = 1 + m.shift as u8 + 2 * m.alt as u8 + 4 * m.ctrl as u8 + 8 * m.super_key as u8;
+    let event = match kind {
+        KeyKind::Press => None,
+        KeyKind::Repeat => Some(2),
+        KeyKind::Release => Some(3),
+    };
+    // CSI code[:alternate] [; mods[:event]] [; text] final
+    let csi = |code: Option<u32>, alt: Option<u32>, text: Option<&str>, fin: char| -> Vec<u8> {
+        let mut s = String::from("\x1b[");
+        let need_mods = modval != 1 || event.is_some() || text.is_some();
+        match code {
+            Some(c) => s.push_str(&c.to_string()),
+            // Letter-final keys (arrows, Home, End, F1/F2/F4) use "1" as
+            // the key number, omitted when nothing else follows.
+            None if need_mods => s.push('1'),
+            None => {}
+        }
+        if let Some(a) = alt {
+            s.push_str(&format!(":{a}"));
+        }
+        if need_mods {
+            s.push(';');
+            if modval != 1 || event.is_some() {
+                s.push_str(&modval.to_string());
+            }
+            if let Some(e) = event {
+                s.push_str(&format!(":{e}"));
+            }
+        }
+        if let Some(t) = text {
+            let cps: Vec<String> = t.chars().map(|c| (c as u32).to_string()).collect();
+            s.push(';');
+            s.push_str(&cps.join(":"));
+        }
+        s.push(fin);
+        s.into_bytes()
+    };
+    let legacy = |k: Key| encode_key(k, m, &Modes::default());
+    match ev.key {
+        Key::Char(base) => {
+            let code = base.to_lowercase().next().unwrap_or(base) as u32;
+            let alt = (has(ALTERNATES) && m.shift)
+                .then_some(ev.shifted)
+                .flatten()
+                .filter(|&c| c as u32 != code)
+                .map(|c| c as u32);
+            if has(ALL_KEYS) {
+                let text = (has(TEXT) && kind != KeyKind::Release)
+                    .then_some(ev.text)
+                    .flatten()
+                    .filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+                return csi(Some(code), alt, text, 'u');
+            }
+            let modified = m.ctrl || m.alt || m.super_key;
+            if kind == KeyKind::Release || (has(DISAMBIGUATE) && modified) {
+                return csi(Some(code), alt, None, 'u');
+            }
+            // Plain (or Shift-only) typing is sent as text.
+            match ev.text {
+                Some(t) => t.as_bytes().to_vec(),
+                None => legacy(Key::Char(ev.shifted.unwrap_or(base))),
+            }
+        }
+        Key::Enter | Key::Tab | Key::Backspace => {
+            let code = match ev.key {
+                Key::Enter => 13,
+                Key::Tab => 9,
+                _ => 127,
+            };
+            // Unmodified Enter/Tab/Backspace stay legacy (so typing `reset`
+            // still works after a crashed program), and have no release
+            // events, unless every key is reported.
+            if has(ALL_KEYS) {
+                csi(Some(code), None, None, 'u')
+            } else if kind == KeyKind::Release {
+                Vec::new()
+            } else if has(DISAMBIGUATE) && modval != 1 {
+                csi(Some(code), None, None, 'u')
+            } else {
+                legacy(ev.key)
+            }
+        }
+        Key::Escape => {
+            if has(DISAMBIGUATE) || has(ALL_KEYS) {
+                csi(Some(27), None, None, 'u')
+            } else if kind == KeyKind::Release {
+                Vec::new()
+            } else {
+                legacy(Key::Escape)
+            }
+        }
+        Key::Up => csi(None, None, None, 'A'),
+        Key::Down => csi(None, None, None, 'B'),
+        Key::Right => csi(None, None, None, 'C'),
+        Key::Left => csi(None, None, None, 'D'),
+        Key::Home => csi(None, None, None, 'H'),
+        Key::End => csi(None, None, None, 'F'),
+        Key::F(1) => csi(None, None, None, 'P'),
+        Key::F(2) => csi(None, None, None, 'Q'),
+        // F3 is `CSI 13 ~` (its legacy SS3 R form collides with CPR).
+        Key::F(3) => csi(Some(13), None, None, '~'),
+        Key::F(4) => csi(None, None, None, 'S'),
+        Key::Insert => csi(Some(2), None, None, '~'),
+        Key::Delete => csi(Some(3), None, None, '~'),
+        Key::PageUp => csi(Some(5), None, None, '~'),
+        Key::PageDown => csi(Some(6), None, None, '~'),
+        Key::F(n @ 5..=12) => {
+            csi(Some([15, 17, 18, 19, 20, 21, 23, 24][(n - 5) as usize]), None, None, '~')
+        }
+        Key::F(_) => Vec::new(),
+        Key::Modifier(k) => {
+            if !has(ALL_KEYS) {
+                return Vec::new();
+            }
+            let code = match k {
+                ModifierKey::LeftShift => 57441,
+                ModifierKey::LeftCtrl => 57442,
+                ModifierKey::LeftAlt => 57443,
+                ModifierKey::LeftSuper => 57444,
+                ModifierKey::RightShift => 57447,
+                ModifierKey::RightCtrl => 57448,
+                ModifierKey::RightAlt => 57449,
+                ModifierKey::RightSuper => 57450,
+            };
+            csi(Some(code), None, None, 'u')
+        }
+    }
 }
 
 fn ctrl_byte(c: char) -> Option<u8> {

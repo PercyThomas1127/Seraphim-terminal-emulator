@@ -30,6 +30,27 @@ impl Row {
         Row { cells: vec![Cell::blank(template); cols], wrapped: false, combining: Vec::new(), occ }
     }
 
+    /// Build a row from cells and their combining marks (used by reflow).
+    pub(crate) fn from_parts(
+        cells: Vec<Cell>,
+        combining: Vec<(u16, Box<[char]>)>,
+        wrapped: bool,
+    ) -> Self {
+        let occ = cells.iter().rposition(|c| *c != Cell::default()).map_or(0, |i| i + 1);
+        Row { cells, wrapped, combining, occ }
+    }
+
+    /// Cells beyond this index are all `Cell::default()`.
+    #[inline]
+    pub(crate) fn occupied(&self) -> usize {
+        self.occ
+    }
+
+    /// Take the combining marks out (used by reflow).
+    pub(crate) fn take_combining(&mut self) -> Vec<(u16, Box<[char]>)> {
+        std::mem::take(&mut self.combining)
+    }
+
     /// An empty row (no cells) used as a reusable buffer.
     pub(crate) fn empty(capacity: usize) -> Self {
         Row { cells: Vec::with_capacity(capacity), wrapped: false, combining: Vec::new(), occ: 0 }
@@ -71,7 +92,7 @@ impl Row {
     /// Append the visible text of cell `col` (wide spacers produce nothing).
     pub fn push_cell_text(&self, col: usize, out: &mut String) {
         let cell = &self.cells[col];
-        if cell.is_wide_spacer() {
+        if cell.is_wide_spacer() || cell.is_wide_padding() {
             return;
         }
         out.push(cell.ch);
@@ -285,6 +306,18 @@ impl Grid {
         }
         self.cols = cols;
         removed
+    }
+
+    /// Remove all lines (for reflow); the grid is left with no rows.
+    pub(crate) fn take_lines(&mut self) -> Vec<Row> {
+        std::mem::take(&mut self.lines)
+    }
+
+    /// Install reflowed lines (exactly `rows` of `cols` cells).
+    pub(crate) fn set_lines(&mut self, cols: usize, lines: Vec<Row>) {
+        debug_assert!(lines.iter().all(|r| r.cells.len() == cols));
+        self.cols = cols;
+        self.lines = lines;
     }
 
     /// Erase a wide character pair if `col` is either half of one, so a

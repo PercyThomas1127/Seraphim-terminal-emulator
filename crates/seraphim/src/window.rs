@@ -14,8 +14,8 @@ use seraphim_events::EventBus;
 use seraphim_render::{FontConfig, Fonts, Renderer, Theme, View};
 use seraphim_session::{ClipboardRequest, Command, Notifier, Session, SessionConfig};
 use seraphim_terminal::input::{
-    encode_focus, encode_key, encode_mouse, encode_paste, mouse_reporting, Key, Mods, MouseAction,
-    MouseButton,
+    encode_focus, encode_key, encode_key_input, encode_mouse, encode_paste, mouse_reporting, Key,
+    KeyInput, KeyKind, ModifierKey, Mods, MouseAction, MouseButton,
 };
 use seraphim_terminal::{MouseMode, Point};
 use winit::application::ApplicationHandler;
@@ -359,6 +359,7 @@ impl Active {
             shift: self.modifiers.shift_key(),
             alt: self.modifiers.alt_key(),
             ctrl: self.modifiers.control_key(),
+            super_key: self.modifiers.super_key(),
         }
     }
 
@@ -578,6 +579,16 @@ impl Active {
 
     fn on_key(&mut self, event: &KeyEvent) {
         if event.state != ElementState::Pressed {
+            // Releases only matter to apps using the Kitty protocol with
+            // event reporting.
+            if self.session.terminal().modes().kitty_keyboard & 2 != 0 {
+                if let Some(input) = key_input(event, self.mods()) {
+                    let bytes = encode_key_input(&input, self.session.terminal().modes());
+                    if !bytes.is_empty() {
+                        let _ = self.session.write(&bytes);
+                    }
+                }
+            }
             return;
         }
         let m = actions::Modifiers {
@@ -601,7 +612,9 @@ impl Active {
             self.run_action(action);
             return;
         }
-        if let Some(bytes) = key_bytes(event, self.modifiers, &self.session) {
+        if let Some(input) = key_input(event, self.mods()) {
+            let modes = self.session.terminal().modes().clone();
+            let bytes = encode_key_input(&input, &modes);
             self.write(&bytes);
         }
     }
@@ -859,52 +872,97 @@ fn draw(a: &mut Active) {
     a.gpu.queue.present(frame);
 }
 
-/// Translate a winit key press into bytes for the application.
-fn key_bytes(event: &KeyEvent, mods: ModifiersState, session: &Session) -> Option<Vec<u8>> {
-    if event.state != ElementState::Pressed {
-        return None;
-    }
-    let m = Mods { shift: mods.shift_key(), alt: mods.alt_key(), ctrl: mods.control_key() };
-    let modes = session.terminal().modes().clone();
-    let named = |k: Key| Some(encode_key(k, m, &modes));
-    match &event.logical_key {
+/// Translate a winit key event into a protocol-neutral [`KeyInput`].
+fn key_input(event: &KeyEvent, mods: Mods) -> Option<KeyInput<'_>> {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+
+    let kind = match (event.state, event.repeat) {
+        (ElementState::Released, _) => KeyKind::Release,
+        (ElementState::Pressed, true) => KeyKind::Repeat,
+        (ElementState::Pressed, false) => KeyKind::Press,
+    };
+    let side = |left: KeyCode| event.physical_key == PhysicalKey::Code(left);
+    let key = match &event.logical_key {
         WKey::Named(n) => match n {
-            NamedKey::Enter => named(Key::Enter),
-            NamedKey::Tab => named(Key::Tab),
-            NamedKey::Backspace => named(Key::Backspace),
-            NamedKey::Escape => named(Key::Escape),
-            NamedKey::ArrowUp => named(Key::Up),
-            NamedKey::ArrowDown => named(Key::Down),
-            NamedKey::ArrowLeft => named(Key::Left),
-            NamedKey::ArrowRight => named(Key::Right),
-            NamedKey::Home => named(Key::Home),
-            NamedKey::End => named(Key::End),
-            NamedKey::Insert => named(Key::Insert),
-            NamedKey::Delete => named(Key::Delete),
-            NamedKey::PageUp => named(Key::PageUp),
-            NamedKey::PageDown => named(Key::PageDown),
-            NamedKey::Space => named(Key::Char(' ')),
-            NamedKey::F1 => named(Key::F(1)),
-            NamedKey::F2 => named(Key::F(2)),
-            NamedKey::F3 => named(Key::F(3)),
-            NamedKey::F4 => named(Key::F(4)),
-            NamedKey::F5 => named(Key::F(5)),
-            NamedKey::F6 => named(Key::F(6)),
-            NamedKey::F7 => named(Key::F(7)),
-            NamedKey::F8 => named(Key::F(8)),
-            NamedKey::F9 => named(Key::F(9)),
-            NamedKey::F10 => named(Key::F(10)),
-            NamedKey::F11 => named(Key::F(11)),
-            NamedKey::F12 => named(Key::F(12)),
-            _ => None,
+            NamedKey::Enter => Key::Enter,
+            NamedKey::Tab => Key::Tab,
+            NamedKey::Backspace => Key::Backspace,
+            NamedKey::Escape => Key::Escape,
+            NamedKey::ArrowUp => Key::Up,
+            NamedKey::ArrowDown => Key::Down,
+            NamedKey::ArrowLeft => Key::Left,
+            NamedKey::ArrowRight => Key::Right,
+            NamedKey::Home => Key::Home,
+            NamedKey::End => Key::End,
+            NamedKey::Insert => Key::Insert,
+            NamedKey::Delete => Key::Delete,
+            NamedKey::PageUp => Key::PageUp,
+            NamedKey::PageDown => Key::PageDown,
+            NamedKey::Space => Key::Char(' '),
+            NamedKey::F1 => Key::F(1),
+            NamedKey::F2 => Key::F(2),
+            NamedKey::F3 => Key::F(3),
+            NamedKey::F4 => Key::F(4),
+            NamedKey::F5 => Key::F(5),
+            NamedKey::F6 => Key::F(6),
+            NamedKey::F7 => Key::F(7),
+            NamedKey::F8 => Key::F(8),
+            NamedKey::F9 => Key::F(9),
+            NamedKey::F10 => Key::F(10),
+            NamedKey::F11 => Key::F(11),
+            NamedKey::F12 => Key::F(12),
+            NamedKey::Shift => Key::Modifier(if side(KeyCode::ShiftLeft) {
+                ModifierKey::LeftShift
+            } else {
+                ModifierKey::RightShift
+            }),
+            NamedKey::Control => Key::Modifier(if side(KeyCode::ControlLeft) {
+                ModifierKey::LeftCtrl
+            } else {
+                ModifierKey::RightCtrl
+            }),
+            NamedKey::Alt => Key::Modifier(if side(KeyCode::AltLeft) {
+                ModifierKey::LeftAlt
+            } else {
+                ModifierKey::RightAlt
+            }),
+            NamedKey::Super | NamedKey::Meta => Key::Modifier(if side(KeyCode::SuperLeft) {
+                ModifierKey::LeftSuper
+            } else {
+                ModifierKey::RightSuper
+            }),
+            _ => return None,
         },
-        WKey::Character(s) if m.ctrl || m.alt => {
-            let c = s.chars().next()?;
-            Some(encode_key(Key::Char(c), m, &modes))
+        WKey::Character(s) => {
+            // The unshifted key (Kitty reports `a` for Shift+A).
+            let base = match event.key_without_modifiers() {
+                WKey::Character(b) => b.chars().next(),
+                _ => None,
+            };
+            Key::Char(base.or_else(|| s.chars().next())?)
         }
-        // Plain typing: use the composed text (dead keys, compose, layouts).
-        _ => event.text.as_ref().map(|t| t.as_bytes().to_vec()),
+        _ => return None,
+    };
+    let shifted = match &event.logical_key {
+        WKey::Character(s) => s.chars().next(),
+        WKey::Named(NamedKey::Space) => Some(' '),
+        _ => None,
+    };
+    // winit updates its modifier state *after* delivering a modifier key's
+    // own event; the Kitty protocol wants the state that results from it
+    // (press sets the key's bit, release clears it).
+    let mut mods = mods;
+    if let Key::Modifier(k) = key {
+        let on = kind != KeyKind::Release;
+        match k {
+            ModifierKey::LeftShift | ModifierKey::RightShift => mods.shift = on,
+            ModifierKey::LeftCtrl | ModifierKey::RightCtrl => mods.ctrl = on,
+            ModifierKey::LeftAlt | ModifierKey::RightAlt => mods.alt = on,
+            ModifierKey::LeftSuper | ModifierKey::RightSuper => mods.super_key = on,
+        }
     }
+    Some(KeyInput { key, mods, kind, shifted, text: event.text.as_deref() })
 }
 
 #[cfg(test)]

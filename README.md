@@ -4,9 +4,11 @@ The programmable terminal environment of Divinity OS.
 
 > *A terminal that doesn't just let you customize its appearance. It lets you program its personality.*
 
-This repository is at **Phase I (Functional Foundation)**: the Terminal Core,
-PTY layer, Session Manager, Event Bus and a first GPU renderer and window are
-implemented and tested. See [`docs/phase-1-plan.md`](docs/phase-1-plan.md) for
+This repository is at the end of **Phase I (Functional Foundation)**: the
+Terminal Core, PTY layer, Session Manager, Event Bus, GPU renderer, window,
+configuration and conformance suite are implemented and tested. The one
+remaining Phase I item is measuring latency, startup and Wayland scaling on
+real hardware. See [`docs/phase-1-plan.md`](docs/phase-1-plan.md) for
 what's done and what's left, and [`docs/adr/`](docs/adr/) for the
 architecture decisions that settle spec §18.
 
@@ -68,6 +70,11 @@ opens a window running your shell. Options: `--font FAMILY`,
 | Select | drag; double-click word; triple-click line; `Ctrl`+drag block; `Shift`+click extends |
 | Scroll history | wheel, `Shift+PageUp/PageDown`, `Shift+Home/End`, `Ctrl+Shift+Up/Down` |
 | Select while an app uses the mouse | hold `Shift` |
+
+Resizing the window reflows soft-wrapped lines (scrollback included).
+Applications that opt into the [Kitty keyboard
+protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) get
+unambiguous keys (Ctrl+I vs Tab, Esc vs Alt) and key release events.
 
 Applications may set the clipboard with OSC 52; reading it requires
 `--allow-clipboard-read` (or `clipboard.allow_read` in the config).
