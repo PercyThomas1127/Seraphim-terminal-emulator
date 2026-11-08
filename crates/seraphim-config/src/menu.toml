@@ -1,0 +1,61 @@
+# The built-in menu bar, laid out after Konsole's. Add to it from
+# config.toml: a [[menu]] with the same title appends its items (or set
+# `replace = true`); a new title is inserted before Help.
+#
+# An item runs an `action`, types text into the shell (`send`) or switches
+# to a `profile`. `action = "profiles"` expands to one item per profile.
+# `&` marks the access key (default: the first letter).
+
+[[menu]]
+title = "&File"
+items = [
+    { label = "&New Window", action = "new-window" },
+    { separator = true },
+    { label = "Open &File Manager", action = "open-file-manager" },
+    { separator = true },
+    { label = "&Close Window", action = "close-window" },
+]
+
+[[menu]]
+title = "&Edit"
+items = [
+    { label = "&Copy", action = "copy" },
+    { label = "&Paste", action = "paste" },
+    { separator = true },
+    { label = "Select &All", action = "select-all" },
+    { separator = true },
+    { label = "Clear &Scrollback", action = "clear-scrollback" },
+    { label = "Clear Scrollback and &Reset", action = "clear-and-reset" },
+]
+
+[[menu]]
+title = "&View"
+items = [
+    { label = "Show &Menubar", action = "toggle-menu-bar" },
+    { label = "F&ull Screen Mode", action = "fullscreen" },
+    { separator = true },
+    { label = "&Enlarge Font", action = "zoom-in" },
+    { label = "&Shrink Font", action = "zoom-out" },
+    { label = "&Reset Font Size", action = "zoom-reset" },
+    { separator = true },
+    { label = "Scroll to &Top", action = "scroll-top" },
+    { label = "Scroll to &Bottom", action = "scroll-bottom" },
+]
+
+[[menu]]
+title = "&Profiles"
+items = [
+    { action = "profiles" },
+    { separator = true },
+    { label = "&Next Profile", action = "next-profile" },
+    { label = "&Reload Configuration", action = "reload-config" },
+    { label = "&Open Configuration Folder", action = "open-config-folder" },
+]
+
+[[menu]]
+title = "&Help"
+items = [
+    { label = "&Keyboard Shortcuts", action = "shortcuts" },
+    { separator = true },
+    { label = "&About Seraphim", action = "about" },
+]

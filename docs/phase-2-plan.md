@@ -16,6 +16,7 @@
 | Shader failures reported, never fatal | error scopes |
 | Presets: `preset = "name"` / `--preset`, built-in `heavens` (merged from the `animated-background` branch), user `presets/<name>.toml` | config + `heavens.wgsl` |
 | Interaction rules `[[on]]`: bus events animate layer parameters or opacity (globs, conditions, easings, springs) | `seraphim/src/interaction.rs` |
+| Menu bar (File, Edit, View, Profiles, Help, after Konsole): Alt tap, mouse, access keys, check marks, user `[[menu]]` entries; zoom, full screen, new window, select all, clear and reset | `seraphim/src/menu.rs`, `menu.toml` |
 | Named shader colors (`palette`, `color(C_name)`), theme-relative | `seraphim-visual` |
 
 See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules.

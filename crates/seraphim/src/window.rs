@@ -31,6 +31,7 @@ use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::actions::{self, Action, ClickTracker, ShortcutKey};
+use crate::menu::{self, Command as MenuCommand, Hit, MenuBar, MenuKey, Outcome};
 
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
@@ -62,6 +63,10 @@ pub struct WindowOptions {
     pub cli_font_size: Option<f32>,
     /// `--preset`, kept across profile switches.
     pub cli_preset: Option<String>,
+    /// Show the menu bar.
+    pub menu_bar: bool,
+    /// Menu bar contents (built-in merged with `[[menu]]`).
+    pub menus: Vec<seraphim_config::Menu>,
 }
 
 impl Default for WindowOptions {
@@ -85,6 +90,8 @@ impl Default for WindowOptions {
             cli_font_family: None,
             cli_font_size: None,
             cli_preset: None,
+            menu_bar: true,
+            menus: seraphim_config::builtin_menu(),
         }
     }
 }
@@ -228,7 +235,19 @@ struct Active {
     last_frame: Instant,
     /// A profile switch or reload requested by a shortcut; applied by `App`,
     /// which owns the configuration.
-    pending: Option<ProfileRequest>,
+    pending: Option<Request>,
+    /// Draws the menu bar overlay (a separate text renderer on top).
+    overlay: Renderer,
+    menu: MenuBar,
+    /// The bar is pinned (reserves a row); otherwise it only appears
+    /// while a menu is open.
+    menu_pinned: bool,
+    /// Alt went down with nothing else pressed since: a release opens the
+    /// menu.
+    alt_tap: bool,
+    /// What the menus are built from: configuration, config path (for
+    /// the profile list) and the active profile.
+    menu_src: (Vec<seraphim_config::Menu>, Option<std::path::PathBuf>, String),
     /// `[[on]]` rules, fed from the bus.
     interactions: Interactions,
     /// The compositor says no part of the window is visible.
@@ -243,10 +262,18 @@ impl Active {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProfileRequest {
-    Next,
+/// Work for `App`, which owns the configuration and the event loop.
+#[derive(Clone, Debug, PartialEq)]
+enum Request {
+    NextProfile,
     Reload,
+    Profile(String),
+    /// Font size steps: +1, -1, or 0 to reset.
+    Zoom(i8),
+    ToggleMenuBar,
+    NewWindow,
+    OpenConfigFolder,
+    Quit,
 }
 
 struct App {
@@ -255,14 +282,22 @@ struct App {
     active: Option<Active>,
     error: Option<String>,
     exit_code: i32,
+    /// Points added to the configured font size (View → Enlarge Font).
+    zoom: f32,
 }
 
 pub fn run(options: WindowOptions) -> Result<i32, String> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|e| format!("cannot open a window: {e}"))?;
-    let mut app =
-        App { options, proxy: event_loop.create_proxy(), active: None, error: None, exit_code: 0 };
+    let mut app = App {
+        options,
+        proxy: event_loop.create_proxy(),
+        active: None,
+        error: None,
+        exit_code: 0,
+        zoom: 0.0,
+    };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     match app.error {
         Some(e) => Err(e),
@@ -286,9 +321,10 @@ impl App {
         .map_err(|e| e.to_string())?;
         let m = fonts.metrics();
         let pad = (o.padding as f64 * scale).round() as f32;
+        let bar = if o.menu_bar { m.height.ceil() } else { 0.0 };
         let size = PhysicalSize::new(
             (o.cols as f32 * m.width + 2.0 * pad) as u32,
-            (o.rows as f32 * m.height + 2.0 * pad) as u32,
+            (o.rows as f32 * m.height + 2.0 * pad + bar) as u32,
         );
         let attrs = Window::default_attributes()
             .with_title("Seraphim")
@@ -309,9 +345,13 @@ impl App {
         if (font_px(o.font_size, scale) - renderer.fonts().size_px()).abs() > 0.1 {
             renderer.set_fonts(self.fonts_for(scale)?);
         }
+        let overlay =
+            Renderer::new(&gpu.device, gpu.config.format, self.fonts_for(scale)?, o.theme.clone());
         let inner = window.inner_size();
         let pad = (o.padding as f64 * scale).round() as f32;
-        let (cols, rows) = renderer.grid_size(inner.width, inner.height, pad);
+        let bar = if o.menu_bar { renderer.cell_metrics().height.ceil() as u32 } else { 0 };
+        let (cols, rows) =
+            renderer.grid_size(inner.width, inner.height.saturating_sub(bar).max(1), pad);
 
         let bus = EventBus::new();
         let proxy = self.proxy.clone();
@@ -345,7 +385,7 @@ impl App {
         }
 
         window.request_redraw();
-        Ok(Active {
+        let mut active = Active {
             window,
             gpu,
             renderer,
@@ -366,23 +406,121 @@ impl App {
             visual_cfg: o.visual.clone(),
             last_frame: Instant::now(),
             pending: None,
+            overlay,
+            menu: MenuBar::default(),
+            menu_pinned: o.menu_bar,
+            alt_tap: false,
+            menu_src: (o.menus.clone(), o.config_path.clone(), o.profile.clone()),
             interactions,
             occluded: false,
-        })
+        };
+        active.rebuild_menu();
+        Ok(active)
     }
 
     /// Switch profile (or reload the current one) without restarting the
     /// shell: theme, fonts, background layers and visual settings change;
     /// the background crossfades.
-    fn apply_profile(&mut self, request: ProfileRequest) {
+    /// Handle a [`Request`] from the window.
+    fn handle(&mut self, request: Request, event_loop: &ActiveEventLoop) {
+        match request {
+            Request::Quit => event_loop.exit(),
+            Request::NextProfile | Request::Reload | Request::Profile(_) => {
+                self.apply_profile(request)
+            }
+            Request::Zoom(step) => {
+                self.zoom = match step {
+                    0 => 0.0,
+                    s => {
+                        let size =
+                            (self.options.font_size + self.zoom + s as f32).clamp(4.0, 200.0);
+                        size - self.options.font_size
+                    }
+                };
+                self.refresh_fonts();
+            }
+            Request::ToggleMenuBar => {
+                if let Some(a) = &mut self.active {
+                    a.menu_pinned = !a.menu_pinned;
+                }
+                self.resize_grid();
+            }
+            Request::NewWindow => {
+                let exe = std::env::current_exe();
+                let mut cmd = match exe {
+                    Ok(exe) => std::process::Command::new(exe),
+                    Err(e) => return eprintln!("seraphim: new window: {e}"),
+                };
+                if let Some(p) = &self.options.config_path {
+                    cmd.arg("--config").arg(p);
+                }
+                cmd.args(["--profile", &self.options.profile]);
+                if let Some(p) = &self.options.cli_preset {
+                    cmd.args(["--preset", p]);
+                }
+                if let Some(cwd) =
+                    self.active.as_ref().and_then(|a| a.session.terminal().cwd().map(str::to_owned))
+                {
+                    cmd.current_dir(cwd);
+                }
+                if let Err(e) = cmd.spawn() {
+                    eprintln!("seraphim: new window: {e}");
+                }
+            }
+            Request::OpenConfigFolder => {
+                let dir = self
+                    .options
+                    .config_path
+                    .as_deref()
+                    .and_then(|p| p.parent())
+                    .map(std::path::Path::to_path_buf);
+                match dir {
+                    Some(d) => {
+                        let _ = std::fs::create_dir_all(&d);
+                        open_path(&d);
+                    }
+                    None => eprintln!("seraphim: no configuration directory (HOME unset?)"),
+                }
+            }
+        }
+    }
+
+    /// Rebuild fonts at the configured size plus zoom, keeping the window.
+    fn refresh_fonts(&mut self) {
+        let Some(scale) = self.active.as_ref().map(|a| a.scale) else { return };
+        match (self.fonts_for(scale), self.fonts_for(scale)) {
+            (Ok(f), Ok(g)) => {
+                let a = self.active.as_mut().unwrap();
+                a.renderer.set_fonts(f);
+                a.overlay.set_fonts(g);
+                self.resize_grid();
+            }
+            (Err(e), _) | (_, Err(e)) => eprintln!("seraphim: {e}"),
+        }
+    }
+
+    /// Fit the grid to the window (after a resize, font or menu bar change).
+    fn resize_grid(&mut self) {
+        let Some(scale) = self.active.as_ref().map(|a| a.scale) else { return };
+        let pad = self.padding(scale);
+        let a = self.active.as_mut().unwrap();
+        let size = a.window.inner_size();
+        let top = a.top_inset();
+        let (cols, rows) =
+            a.renderer.grid_size(size.width, size.height.saturating_sub(top).max(1), pad);
+        let _ = a.session.resize(cols, rows);
+        a.window.request_redraw();
+    }
+
+    fn apply_profile(&mut self, request: Request) {
         if self.active.is_none() {
             return;
         }
         let path = self.options.config_path.clone();
         let current = self.options.profile.clone();
         let name = match request {
-            ProfileRequest::Reload => current.clone(),
-            ProfileRequest::Next => {
+            Request::Profile(name) => name,
+            Request::NextProfile => {
                 let all = path
                     .as_deref()
                     .map(seraphim_config::Config::profiles)
@@ -390,6 +528,7 @@ impl App {
                 let i = all.iter().position(|p| *p == current).map_or(0, |i| (i + 1) % all.len());
                 all[i].clone()
             }
+            _ => current.clone(),
         };
         let (mut o, warnings) = match crate::profile::load(
             path.as_deref(),
@@ -429,6 +568,14 @@ impl App {
         };
         let a = self.active.as_mut().unwrap();
         a.renderer.set_theme(o.theme.clone());
+        a.overlay.set_theme(o.theme.clone());
+        a.menu.close();
+        a.menu_src = (o.menus.clone(), o.config_path.clone(), o.profile.clone());
+        let bar_changed = o.menu_bar != self.options.menu_bar && o.menu_bar != a.menu_pinned;
+        if bar_changed {
+            a.menu_pinned = o.menu_bar;
+        }
+        a.rebuild_menu();
         {
             let mut t = a.session.terminal();
             t.set_color_scheme(o.theme.scheme());
@@ -447,15 +594,11 @@ impl App {
         a.interactions.replace(o.rules.clone(), &a.bus, &mut a.visual);
         let scale = a.scale;
         self.options = o;
+        let _ = scale;
         if font_changed {
-            if let Ok(fonts) = self.fonts_for(scale) {
-                let pad = self.padding(scale);
-                let a = self.active.as_mut().unwrap();
-                a.renderer.set_fonts(fonts);
-                let size = a.window.inner_size();
-                let (cols, rows) = a.renderer.grid_size(size.width, size.height, pad);
-                let _ = a.session.resize(cols, rows);
-            }
+            self.refresh_fonts();
+        } else if bar_changed {
+            self.resize_grid();
         }
         let a = self.active.as_mut().unwrap();
         a.bus.publisher("visual").publish(
@@ -470,7 +613,7 @@ impl App {
     fn fonts_for(&self, scale: f64) -> Result<Fonts, String> {
         Fonts::new(&FontConfig {
             family: self.options.font_family.clone(),
-            size_px: font_px(self.options.font_size, scale),
+            size_px: font_px(self.options.font_size + self.zoom, scale),
         })
         .map_err(|e| e.to_string())
     }
@@ -584,8 +727,71 @@ impl Active {
             a.window.request_redraw();
         };
         match action {
-            Action::NextProfile => self.pending = Some(ProfileRequest::Next),
-            Action::ReloadConfig => self.pending = Some(ProfileRequest::Reload),
+            Action::NextProfile => self.pending = Some(Request::NextProfile),
+            Action::ReloadConfig => self.pending = Some(Request::Reload),
+            Action::NewWindow => self.pending = Some(Request::NewWindow),
+            Action::CloseWindow => self.pending = Some(Request::Quit),
+            Action::ToggleMenuBar => self.pending = Some(Request::ToggleMenuBar),
+            Action::ZoomIn => self.pending = Some(Request::Zoom(1)),
+            Action::ZoomOut => self.pending = Some(Request::Zoom(-1)),
+            Action::ZoomReset => self.pending = Some(Request::Zoom(0)),
+            Action::OpenConfigFolder => self.pending = Some(Request::OpenConfigFolder),
+            Action::OpenFileManager => {
+                let cwd = self.session.terminal().cwd().map(std::path::PathBuf::from);
+                let dir = cwd
+                    .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+                    .unwrap_or_else(|| "/".into());
+                open_path(&dir);
+            }
+            Action::SelectAll => {
+                let mut t = self.session.terminal();
+                let history = t.scrollback().len() as i64;
+                let (rows, cols) = (t.rows() as i64, t.cols());
+                t.start_selection(
+                    seraphim_terminal::SelectionKind::Simple,
+                    Point::new(-history, 0),
+                );
+                t.update_selection(Point::new(rows - 1, cols.saturating_sub(1)));
+                drop(t);
+                self.copy_selection(Board::Primary);
+                self.window.request_redraw();
+            }
+            Action::ClearScrollback => {
+                self.session.terminal().advance(b"\x1b[3J");
+                self.window.request_redraw();
+            }
+            Action::ClearAndReset => {
+                // Konsole's "Clear Scrollback and Reset": RIS, then drop
+                // the history.
+                self.session.terminal().advance(b"\x1bc\x1b[3J");
+                self.window.request_redraw();
+            }
+            Action::Fullscreen => {
+                let full = self.window.fullscreen().is_some();
+                self.window
+                    .set_fullscreen((!full).then_some(winit::window::Fullscreen::Borderless(None)));
+            }
+            Action::Shortcuts => {
+                let lines = actions::SHORTCUT_HELP
+                    .iter()
+                    .map(|a| format!("{:<28}{}", a.description(), a.shortcut_label()))
+                    .collect();
+                self.menu.panel = Some(menu::Panel { title: "Keyboard Shortcuts".into(), lines });
+                self.window.request_redraw();
+            }
+            Action::About => {
+                self.menu.panel = Some(menu::Panel {
+                    title: "About Seraphim".into(),
+                    lines: vec![
+                        format!("Seraphim {}", env!("CARGO_PKG_VERSION")),
+                        "A programmable terminal for Divinity OS.".into(),
+                        String::new(),
+                        "Press any key to close.".into(),
+                    ],
+                });
+                self.window.request_redraw();
+            }
+            Action::OpenMenu => self.toggle_menu(),
             Action::Copy => self.copy_selection(Board::Clipboard),
             Action::Paste => self.paste(Board::Clipboard),
             Action::ScrollPageUp => scroll(self, rows - 1),
@@ -597,12 +803,154 @@ impl Active {
         }
     }
 
+    /// Pixels at the top reserved for the pinned menu bar.
+    fn top_inset(&self) -> u32 {
+        if self.menu_pinned {
+            self.renderer.cell_metrics().height.ceil() as u32
+        } else {
+            0
+        }
+    }
+
+    fn bar_visible(&self) -> bool {
+        self.menu_pinned || self.menu.engaged()
+    }
+
+    /// Fresh menus for the current state (profile list, check marks).
+    fn rebuild_menu(&mut self) {
+        let (menus, path, profile) = &self.menu_src;
+        let profiles = path
+            .as_deref()
+            .map(seraphim_config::Config::profiles)
+            .unwrap_or_else(|| vec!["default".into()]);
+        let ctx = menu::Context {
+            profiles,
+            profile: profile.clone(),
+            menu_bar: self.menu_pinned,
+            fullscreen: self.window.fullscreen().is_some(),
+        };
+        self.menu.menus = menu::build(menus, &ctx);
+    }
+
+    /// Tap Alt: open the first menu, or close an open one.
+    fn toggle_menu(&mut self) {
+        if self.menu.engaged() {
+            self.menu.close();
+        } else {
+            self.rebuild_menu();
+            self.menu.open_menu(0);
+        }
+        self.window.request_redraw();
+    }
+
+    fn run_menu_command(&mut self, cmd: MenuCommand) {
+        self.menu.close();
+        self.window.request_redraw();
+        match cmd {
+            MenuCommand::Action(a) => self.run_action(a),
+            MenuCommand::Send(text) => self.write(text.as_bytes()),
+            MenuCommand::Profile(name) => self.pending = Some(Request::Profile(name)),
+        }
+    }
+
+    fn apply_outcome(&mut self, o: Outcome) {
+        match o {
+            Outcome::Stay => self.window.request_redraw(),
+            Outcome::Close => {
+                self.menu.close();
+                self.window.request_redraw();
+            }
+            Outcome::Run(cmd) => self.run_menu_command(cmd),
+        }
+    }
+
+    /// Overlay grid size and the overlay cell under the pointer.
+    fn overlay_grid(&self) -> (usize, usize, usize, usize) {
+        let m = self.overlay.cell_metrics();
+        let size = self.window.inner_size();
+        let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
+        let rows = (size.height as f32 / m.height).floor().max(1.0) as usize;
+        let col = (self.mouse.pos.0 / m.width as f64).max(0.0) as usize;
+        let row = (self.mouse.pos.1 / m.height as f64).max(0.0) as usize;
+        (cols, rows, row, col)
+    }
+
+    /// Pointer motion for the menu. Returns true if the menu took it.
+    fn menu_motion(&mut self) -> bool {
+        if !self.bar_visible() || (self.mouse.left && !self.menu.engaged()) {
+            return false;
+        }
+        let (cols, rows, row, col) = self.overlay_grid();
+        let hit = self.menu.hit(row, col, cols, rows);
+        if self.menu.panel.is_some() {
+            return true;
+        }
+        if self.menu.open.is_some() {
+            match hit {
+                Hit::Title(i) if self.menu.open != Some(i) => self.menu.open_menu(i),
+                Hit::Item(i) => self.menu.hover = Some(i),
+                _ => {}
+            }
+            self.window.request_redraw();
+            return true;
+        }
+        if hit != Hit::Outside {
+            self.window.set_cursor(CursorIcon::Default);
+            self.mouse.reporting = true; // re-evaluated on the way out
+            return true;
+        }
+        false
+    }
+
+    /// A click for the menu. Returns true if the menu took it.
+    fn menu_button(&mut self, pressed: bool, button: WButton) -> bool {
+        if !self.bar_visible() {
+            return false;
+        }
+        let (cols, rows, row, col) = self.overlay_grid();
+        let hit = self.menu.hit(row, col, cols, rows);
+        if self.menu.panel.is_some() {
+            if pressed {
+                self.menu.close();
+                self.window.request_redraw();
+            }
+            return true;
+        }
+        if button != WButton::Left {
+            // Any other button closes an open menu.
+            if self.menu.open.is_some() && pressed {
+                self.menu.close();
+                self.window.request_redraw();
+            }
+            return self.menu.open.is_some() || hit != Hit::Outside;
+        }
+        match (hit, pressed, self.menu.open) {
+            (Hit::Title(i), true, Some(o)) if o == i => self.menu.close(),
+            (Hit::Title(i), true, open) => {
+                if open.is_none() {
+                    self.rebuild_menu();
+                }
+                self.menu.open_menu(i)
+            }
+            (Hit::Item(i), false, Some(_)) => {
+                if let Some(cmd) = self.menu.command(i) {
+                    self.run_menu_command(cmd);
+                }
+            }
+            (Hit::Outside | Hit::Bar, true, Some(_)) => self.menu.close(),
+            (Hit::Outside, _, None) => return false,
+            _ => {}
+        }
+        self.window.request_redraw();
+        true
+    }
+
     fn cell_at(&self, pad: f32) -> (usize, usize) {
         let m = self.renderer.cell_metrics();
         let t = self.session.terminal();
         actions::cell_at(
             self.mouse.pos.0,
-            self.mouse.pos.1,
+            self.mouse.pos.1 - self.top_inset() as f64,
             pad,
             m.width,
             m.height,
@@ -640,6 +988,9 @@ impl Active {
 
     fn on_cursor_moved(&mut self, x: f64, y: f64, pad: f32) {
         self.mouse.pos = (x, y);
+        if self.menu_motion() {
+            return;
+        }
         let cell = self.cell_at(pad);
         let moved = self.mouse.cell != Some(cell);
         self.mouse.cell = Some(cell);
@@ -670,6 +1021,12 @@ impl Active {
 
     fn on_mouse_button(&mut self, state: ElementState, button: WButton, pad: f32) {
         let pressed = state == ElementState::Pressed;
+        self.alt_tap = false;
+        // Releases of a press the terminal saw still go to the terminal.
+        let terminal_drag = !pressed && button == WButton::Left && self.mouse.left;
+        if !terminal_drag && self.menu_button(pressed, button) {
+            return;
+        }
         let cell = self.cell_at(pad);
         match button {
             WButton::Left => self.mouse.left = pressed,
@@ -756,6 +1113,43 @@ impl Active {
     }
 
     fn on_key(&mut self, event: &KeyEvent) {
+        let pressed = event.state == ElementState::Pressed;
+        // A tap of Alt (Option) on its own opens the menu bar, as in
+        // Konsole and most desktop apps. Alt+key chords still reach the
+        // shell. Apps that asked for every key (Kitty flag 8) keep Alt.
+        if event.logical_key == WKey::Named(NamedKey::Alt) {
+            if pressed && !event.repeat {
+                self.alt_tap = true;
+            } else if !pressed && std::mem::take(&mut self.alt_tap) {
+                let wants_all = self.session.terminal().modes().kitty_keyboard & 8 != 0;
+                if !wants_all {
+                    self.toggle_menu();
+                    return;
+                }
+            }
+        } else if pressed {
+            self.alt_tap = false;
+        }
+        if self.menu.engaged() {
+            if pressed {
+                let k = match &event.logical_key {
+                    WKey::Named(NamedKey::ArrowLeft) => Some(MenuKey::Left),
+                    WKey::Named(NamedKey::ArrowRight) => Some(MenuKey::Right),
+                    WKey::Named(NamedKey::ArrowUp) => Some(MenuKey::Up),
+                    WKey::Named(NamedKey::ArrowDown) => Some(MenuKey::Down),
+                    WKey::Named(NamedKey::Enter | NamedKey::Space) => Some(MenuKey::Enter),
+                    WKey::Named(NamedKey::Escape) => Some(MenuKey::Escape),
+                    WKey::Named(NamedKey::Alt | NamedKey::Shift | NamedKey::Control) => None,
+                    WKey::Character(s) => s.chars().next().map(MenuKey::Char),
+                    _ => Some(MenuKey::Escape),
+                };
+                if let Some(k) = k {
+                    let o = self.menu.key(k);
+                    self.apply_outcome(o);
+                }
+            }
+            return;
+        }
         if event.state != ElementState::Pressed {
             // Releases only matter to apps using the Kitty protocol with
             // event reporting.
@@ -783,6 +1177,8 @@ impl Active {
             WKey::Named(NamedKey::End) => Some(ShortcutKey::End),
             WKey::Named(NamedKey::ArrowUp) => Some(ShortcutKey::Up),
             WKey::Named(NamedKey::ArrowDown) => Some(ShortcutKey::Down),
+            WKey::Named(NamedKey::F10) => Some(ShortcutKey::F(10)),
+            WKey::Named(NamedKey::F11) => Some(ShortcutKey::F(11)),
             _ => None,
         };
         let alt_screen = self.session.terminal().is_alternate_screen();
@@ -828,6 +1224,14 @@ impl Active {
 }
 
 /// `SERAPHIM_DEBUG_INPUT=1` logs raw window input events to stderr.
+/// Open a folder in the desktop's file manager.
+fn open_path(path: &std::path::Path) {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    if let Err(e) = std::process::Command::new(opener).arg(path).spawn() {
+        eprintln!("seraphim: {opener} {}: {e}", path.display());
+    }
+}
+
 fn debug_input() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SERAPHIM_DEBUG_INPUT").is_some_and(|v| v != "0"))
@@ -902,18 +1306,20 @@ impl ApplicationHandler<UserEvent> for App {
                 a.gpu.config.width = size.width.max(1);
                 a.gpu.config.height = size.height.max(1);
                 a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
-                let (cols, rows) = a.renderer.grid_size(size.width, size.height, pad);
+                let h = size.height.saturating_sub(a.top_inset()).max(1);
+                let (cols, rows) = a.renderer.grid_size(size.width, h, pad);
                 let _ = a.session.resize(cols, rows);
                 a.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 a.scale = scale_factor;
-                let fonts = Fonts::new(&FontConfig {
+                let config = FontConfig {
                     family: self.options.font_family.clone(),
-                    size_px: font_px(self.options.font_size, scale_factor),
-                });
-                if let Ok(fonts) = fonts {
-                    a.renderer.set_fonts(fonts);
+                    size_px: font_px(self.options.font_size + self.zoom, scale_factor),
+                };
+                if let (Ok(f), Ok(g)) = (Fonts::new(&config), Fonts::new(&config)) {
+                    a.renderer.set_fonts(f);
+                    a.overlay.set_fonts(g);
                 }
                 a.window.request_redraw();
             }
@@ -926,6 +1332,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 a.focused = focused;
+                // Alt+Tab: the release happens in another window.
+                a.alt_tap = false;
+                if !focused && a.menu.engaged() {
+                    a.menu.close();
+                }
                 a.update_pause();
                 a.reset_blink();
                 let bytes = encode_focus(focused, a.session.terminal().modes());
@@ -958,7 +1369,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = a.window.inner_size();
                 let view = View {
                     width: size.width,
-                    height: size.height,
+                    height: size.height.saturating_sub(a.top_inset()).max(1),
                     padding: pad,
                     focused: a.focused,
                     cursor_on: a.blink_on,
@@ -974,13 +1385,27 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
                 }
+                if a.bar_visible() {
+                    let (cols, rows, _, _) = a.overlay_grid();
+                    let palette = menu::Palette::from_theme(a.renderer.theme());
+                    let mut t = seraphim_terminal::Terminal::with_scrollback(cols, rows, 0);
+                    t.advance(&a.menu.paint(cols, rows, a.menu_pinned, &palette));
+                    let view = View {
+                        width: size.width,
+                        height: size.height,
+                        padding: 0.0,
+                        focused: true,
+                        cursor_on: false,
+                    };
+                    a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
+                }
                 a.last_frame = Instant::now();
                 draw(a);
             }
             _ => {}
         }
         if let Some(req) = self.active.as_mut().and_then(|a| a.pending.take()) {
-            self.apply_profile(req);
+            self.handle(req, event_loop);
         }
     }
 
@@ -1082,7 +1507,17 @@ fn draw(a: &mut Active) {
             ..Default::default()
         });
         a.visual.render(&mut pass);
+        let top = a.top_inset().min(h.saturating_sub(1));
+        if top > 0 {
+            // The pinned menu bar takes the top row of pixels; the grid
+            // draws below it.
+            pass.set_viewport(0.0, top as f32, w as f32, (h - top) as f32, 0.0, 1.0);
+        }
         a.renderer.render(&mut pass);
+        if a.bar_visible() {
+            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            a.overlay.render(&mut pass);
+        }
     }
     a.gpu.queue.submit([encoder.finish()]);
     a.window.pre_present_notify();

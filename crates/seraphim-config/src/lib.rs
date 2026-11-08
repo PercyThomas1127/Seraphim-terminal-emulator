@@ -54,6 +54,104 @@ pub struct Config {
     pub background: Vec<Background>,
     /// Interaction rules: animate layers when events happen.
     pub on: Vec<Rule>,
+    /// Menu bar additions ([`BUILTIN_MENU`] is the base).
+    pub menu: Vec<Menu>,
+}
+
+/// The built-in menu bar, as TOML (`[[menu]]` entries).
+pub const BUILTIN_MENU: &str = include_str!("menu.toml");
+
+/// Menu actions an item can run (`action = "..."`).
+pub const MENU_ACTIONS: &[&str] = &[
+    "new-window",
+    "open-file-manager",
+    "close-window",
+    "copy",
+    "paste",
+    "select-all",
+    "clear-scrollback",
+    "clear-and-reset",
+    "toggle-menu-bar",
+    "fullscreen",
+    "zoom-in",
+    "zoom-out",
+    "zoom-reset",
+    "scroll-top",
+    "scroll-bottom",
+    "profiles",
+    "next-profile",
+    "reload-config",
+    "open-config-folder",
+    "shortcuts",
+    "about",
+];
+
+/// One menu of the menu bar.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Menu {
+    /// `&` marks the access key, e.g. `"&Tools"`.
+    pub title: String,
+    pub items: Vec<MenuItem>,
+    /// Replace a built-in menu of the same title instead of appending.
+    pub replace: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MenuItem {
+    pub label: Option<String>,
+    /// One of [`MENU_ACTIONS`].
+    pub action: Option<String>,
+    /// Text typed into the shell, e.g. `"htop\n"`.
+    pub send: Option<String>,
+    /// Switch to this profile.
+    pub profile: Option<String>,
+    pub separator: bool,
+}
+
+impl Menu {
+    fn validate(&self) -> Result<(), String> {
+        if self.title.replace('&', "").trim().is_empty() {
+            return Err("missing `title`".into());
+        }
+        for (i, it) in self.items.iter().enumerate() {
+            let what = [it.action.is_some(), it.send.is_some(), it.profile.is_some()];
+            let n = what.iter().filter(|b| **b).count();
+            let err = |e: String| Err(format!("item {}: {e}", i + 1));
+            if it.separator {
+                if n > 0 || it.label.is_some() {
+                    return err("a separator takes no label or command".into());
+                }
+                continue;
+            }
+            if n != 1 {
+                return err("needs exactly one of `action`, `send` or `profile`".into());
+            }
+            if let Some(a) = &it.action {
+                if !MENU_ACTIONS.contains(&a.as_str()) {
+                    return err(format!("unknown action {a:?} ({})", MENU_ACTIONS.join(", ")));
+                }
+                if a == "profiles" {
+                    continue; // expands to the profile list; no label
+                }
+            }
+            if it.label.as_deref().is_none_or(|l| l.trim().is_empty()) {
+                return err("missing `label`".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The built-in menus.
+pub fn builtin_menu() -> Vec<Menu> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct File {
+        menu: Vec<Menu>,
+    }
+    toml::from_str::<File>(BUILTIN_MENU).expect("valid built-in menu").menu
 }
 
 /// Built-in presets: (name, TOML).
@@ -239,6 +337,9 @@ pub struct Window {
     pub columns: u16,
     pub rows: u16,
     pub padding: f32,
+    /// Show the menu bar (toggle with Ctrl+Shift+M; tap Alt/Option to use
+    /// it while hidden).
+    pub menu_bar: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -292,7 +393,7 @@ impl Default for Font {
 
 impl Default for Window {
     fn default() -> Self {
-        Window { columns: 100, rows: 30, padding: 6.0 }
+        Window { columns: 100, rows: 30, padding: 6.0, menu_bar: true }
     }
 }
 
@@ -551,6 +652,9 @@ impl Config {
             }
             b.validate().map_err(|e| format!("background {name:?} ({}): {e}", b.kind))?;
         }
+        for m in &self.menu {
+            m.validate().map_err(|e| format!("menu {:?}: {e}", m.title))?;
+        }
         for (i, r) in self.on.iter().enumerate() {
             r.validate().map_err(|e| format!("on {} ({}): {e}", i + 1, r.event))?;
         }
@@ -697,6 +801,26 @@ mod tests {
         );
         assert_eq!(l.sources.len(), 2);
         assert_eq!(Config::profiles(&cfg), ["default", "work"]);
+    }
+
+    #[test]
+    fn menus() {
+        let builtin = builtin_menu();
+        let titles: Vec<String> = builtin.iter().map(|m| m.title.replace('&', "")).collect();
+        assert_eq!(titles, ["File", "Edit", "View", "Profiles", "Help"]);
+        for m in &builtin {
+            m.validate().unwrap();
+        }
+        let c = parse("[[menu]]\ntitle = \"&Tools\"\nitems = [{ label = \"htop\", send = \"htop\\n\" }, { separator = true }, { label = \"Work\", profile = \"work\" }]\n").unwrap();
+        assert_eq!(c.menu[0].items[0].send.as_deref(), Some("htop\n"));
+        let e = parse("[[menu]]\ntitle = \"T\"\nitems = [{ label = \"x\" }]\n").unwrap_err();
+        assert!(e.contains("exactly one"), "{e}");
+        let e =
+            parse("[[menu]]\ntitle = \"T\"\nitems = [{ label = \"x\", action = \"explode\" }]\n")
+                .unwrap_err();
+        assert!(e.contains("explode") && e.contains("new-window"), "{e}");
+        let e = parse("[[menu]]\ntitle = \"T\"\nitems = [{ send = \"x\" }]\n").unwrap_err();
+        assert!(e.contains("missing `label`"), "{e}");
     }
 
     #[test]

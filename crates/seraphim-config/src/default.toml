@@ -29,6 +29,9 @@ columns = 100
 rows = 30
 # Space around the text grid, in logical pixels.
 padding = 6.0
+# Show the menu bar (File, Edit, View, Profiles, Help). Toggle it with
+# Ctrl+Shift+M; tap Alt (Option) to open it, even while hidden.
+menu_bar = true
 
 [terminal]
 # Lines of history kept per session.
@@ -137,3 +140,21 @@ transition_ms = 400
 # to = 0.0
 # duration_ms = 600
 # easing = "ease-out"
+
+# Menu bar additions. A [[menu]] with the title of a built-in menu appends
+# to it (replace = true replaces it); a new title goes before Help. Items
+# run an action (listed below), type text into the shell, or switch profile. "&" marks the access key.
+#
+# [[menu]]
+# title = "&Tools"
+# items = [
+#     { label = "&System Monitor", send = "htop\n" },
+#     { separator = true },
+#     { label = "&Work Profile", profile = "work" },
+# ]
+#
+# Actions: new-window, open-file-manager, close-window, copy, paste,
+# select-all, clear-scrollback, clear-and-reset, toggle-menu-bar,
+# fullscreen, zoom-in, zoom-out, zoom-reset, scroll-top, scroll-bottom,
+# profiles (the profile list), next-profile, reload-config,
+# open-config-folder, shortcuts, about.

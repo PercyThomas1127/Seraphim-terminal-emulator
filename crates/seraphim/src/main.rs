@@ -25,6 +25,7 @@ use std::time::Duration;
 
 mod actions;
 mod interaction;
+mod menu;
 mod profile;
 mod window;
 

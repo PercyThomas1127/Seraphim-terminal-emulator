@@ -21,7 +21,136 @@ pub enum Action {
     NextProfile,
     /// Re-read the configuration files (Ctrl+Shift+R).
     ReloadConfig,
+    NewWindow,
+    OpenFileManager,
+    CloseWindow,
+    SelectAll,
+    ClearScrollback,
+    /// Reset the terminal (RIS) and drop the history, like Konsole.
+    ClearAndReset,
+    ToggleMenuBar,
+    Fullscreen,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    OpenConfigFolder,
+    Shortcuts,
+    About,
+    /// Open (or close) the menu bar from the keyboard: tap Alt (Option).
+    /// Not F10: htop and mc use it.
+    OpenMenu,
 }
+
+impl Action {
+    /// The `action = "..."` name used in menu configuration.
+    pub fn from_name(name: &str) -> Option<Action> {
+        use Action::*;
+        Some(match name {
+            "new-window" => NewWindow,
+            "open-file-manager" => OpenFileManager,
+            "close-window" => CloseWindow,
+            "copy" => Copy,
+            "paste" => Paste,
+            "select-all" => SelectAll,
+            "clear-scrollback" => ClearScrollback,
+            "clear-and-reset" => ClearAndReset,
+            "toggle-menu-bar" => ToggleMenuBar,
+            "fullscreen" => Fullscreen,
+            "zoom-in" => ZoomIn,
+            "zoom-out" => ZoomOut,
+            "zoom-reset" => ZoomReset,
+            "scroll-top" => ScrollTop,
+            "scroll-bottom" => ScrollBottom,
+            "next-profile" => NextProfile,
+            "reload-config" => ReloadConfig,
+            "open-config-folder" => OpenConfigFolder,
+            "shortcuts" => Shortcuts,
+            "about" => About,
+            _ => return None,
+        })
+    }
+
+    /// The default shortcut, as shown in menus ("" for none).
+    pub fn shortcut_label(self) -> &'static str {
+        use Action::*;
+        match self {
+            Copy => "Ctrl+Shift+C",
+            Paste => "Ctrl+Shift+V",
+            ScrollPageUp => "Shift+PgUp",
+            ScrollPageDown => "Shift+PgDown",
+            ScrollLineUp => "Ctrl+Shift+Up",
+            ScrollLineDown => "Ctrl+Shift+Down",
+            ScrollTop => "Shift+Home",
+            ScrollBottom => "Shift+End",
+            NextProfile => "Ctrl+Shift+P",
+            ReloadConfig => "Ctrl+Shift+R",
+            NewWindow => "Ctrl+Shift+N",
+            CloseWindow => "Ctrl+Shift+Q",
+            SelectAll => "Ctrl+Shift+A",
+            ClearAndReset => "Ctrl+Shift+K",
+            ToggleMenuBar => "Ctrl+Shift+M",
+            Fullscreen => "F11",
+            ZoomIn => "Ctrl+Shift++",
+            ZoomOut => "Ctrl+Shift+-",
+            ZoomReset => "Ctrl+Shift+0",
+            OpenMenu => "Tap Alt",
+            OpenFileManager | ClearScrollback | OpenConfigFolder | Shortcuts | About => "",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        use Action::*;
+        match self {
+            Copy => "Copy",
+            Paste => "Paste",
+            ScrollPageUp => "Scroll up a page",
+            ScrollPageDown => "Scroll down a page",
+            ScrollLineUp => "Scroll up a line",
+            ScrollLineDown => "Scroll down a line",
+            ScrollTop => "Scroll to top",
+            ScrollBottom => "Scroll to bottom",
+            NextProfile => "Next profile",
+            ReloadConfig => "Reload configuration",
+            NewWindow => "New window",
+            OpenFileManager => "Open file manager",
+            CloseWindow => "Close window",
+            SelectAll => "Select all",
+            ClearScrollback => "Clear scrollback",
+            ClearAndReset => "Clear scrollback and reset",
+            ToggleMenuBar => "Show/hide menu bar",
+            Fullscreen => "Full screen",
+            ZoomIn => "Enlarge font",
+            ZoomOut => "Shrink font",
+            ZoomReset => "Reset font size",
+            OpenConfigFolder => "Open configuration folder",
+            Shortcuts => "Keyboard shortcuts",
+            About => "About Seraphim",
+            OpenMenu => "Open the menu bar",
+        }
+    }
+}
+
+/// Shortcuts listed in Help → Keyboard Shortcuts, in order.
+pub const SHORTCUT_HELP: &[Action] = &[
+    Action::OpenMenu,
+    Action::Copy,
+    Action::Paste,
+    Action::SelectAll,
+    Action::ClearAndReset,
+    Action::NewWindow,
+    Action::CloseWindow,
+    Action::ToggleMenuBar,
+    Action::Fullscreen,
+    Action::ZoomIn,
+    Action::ZoomOut,
+    Action::ZoomReset,
+    Action::NextProfile,
+    Action::ReloadConfig,
+    Action::ScrollPageUp,
+    Action::ScrollPageDown,
+    Action::ScrollTop,
+    Action::ScrollBottom,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShortcutKey {
@@ -33,6 +162,7 @@ pub enum ShortcutKey {
     End,
     Up,
     Down,
+    F(u8),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,6 +183,16 @@ pub fn shortcut(key: ShortcutKey, m: Modifiers, alt_screen: bool) -> Option<Acti
         K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'v') => Some(Action::Paste),
         K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'p') => Some(Action::NextProfile),
         K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'r') => Some(Action::ReloadConfig),
+        K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'n') => Some(Action::NewWindow),
+        K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'q') => Some(Action::CloseWindow),
+        K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'a') => Some(Action::SelectAll),
+        K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'k') => Some(Action::ClearAndReset),
+        K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'m') => Some(Action::ToggleMenuBar),
+        // Shifted or not: layouts differ in what Shift does to these keys.
+        K::Char('+' | '=') if ctrl_shift => Some(Action::ZoomIn),
+        K::Char('-' | '_') if ctrl_shift => Some(Action::ZoomOut),
+        K::Char('0' | ')') if ctrl_shift => Some(Action::ZoomReset),
+        K::F(11) if m == Modifiers::default() => Some(Action::Fullscreen),
         K::Insert if shift_only => Some(Action::Paste),
         _ if alt_screen => None,
         K::PageUp if shift_only => Some(Action::ScrollPageUp),
@@ -155,8 +295,23 @@ mod tests {
         assert_eq!(shortcut(ShortcutKey::PageUp, SHIFT, false), Some(Action::ScrollPageUp));
         assert_eq!(shortcut(ShortcutKey::PageUp, SHIFT, true), None, "alt screen gets the key");
         assert_eq!(shortcut(ShortcutKey::PageUp, Modifiers::default(), false), None);
+        assert_eq!(shortcut(ShortcutKey::Char('N'), CTRL_SHIFT, true), Some(Action::NewWindow));
+        assert_eq!(shortcut(ShortcutKey::Char('+'), CTRL_SHIFT, false), Some(Action::ZoomIn));
+        assert_eq!(shortcut(ShortcutKey::Char('_'), CTRL_SHIFT, false), Some(Action::ZoomOut));
+        assert_eq!(shortcut(ShortcutKey::F(10), Modifiers::default(), false), None, "htop/mc quit");
+        assert_eq!(
+            shortcut(ShortcutKey::F(11), Modifiers::default(), true),
+            Some(Action::Fullscreen)
+        );
         let ctrl = Modifiers { ctrl: true, ..Default::default() };
         assert_eq!(shortcut(ShortcutKey::Char('c'), ctrl, false), None, "Ctrl+C is SIGINT");
+    }
+
+    #[test]
+    fn every_menu_action_name_maps() {
+        for name in seraphim_config::MENU_ACTIONS {
+            assert!(*name == "profiles" || Action::from_name(name).is_some(), "{name}");
+        }
     }
 
     #[test]

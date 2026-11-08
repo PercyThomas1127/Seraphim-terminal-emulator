@@ -67,6 +67,8 @@ pub fn options_from_config(
         visual: c.visual.clone(),
         layers,
         rules: c.on.iter().map(crate::interaction::Rule::from_config).collect(),
+        menu_bar: c.window.menu_bar,
+        menus: crate::menu::merge(&seraphim_config::builtin_menu(), &c.menu),
         profile: profile.to_owned(),
         config_path: None,
         cli_font_family: None,

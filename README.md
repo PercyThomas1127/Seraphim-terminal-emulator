@@ -146,6 +146,33 @@ the config; switch with `--profile NAME` or **Ctrl+Shift+P** at runtime
 draws frames while something moves, pauses when the window is unfocused, and
 stops entirely with `visual.reduced_motion = true`.
 
+### Menu bar
+
+![The menu bar](docs/images/menu.png)
+
+File, Edit, View, Profiles and Help, laid out after Konsole's. Tap **Alt**
+(Option) to open it from the keyboard: arrows move, Enter runs, the
+underlined letter jumps, Esc closes. Alt+key chords still go to the shell.
+Hide or show the bar with **Ctrl+Shift+M** (View → Show Menubar, or
+`window.menu_bar = false`); tapping Alt still opens it while it's hidden.
+
+The menus are data (`crates/seraphim-config/src/menu.toml`), so you can
+add your own from the config. An item runs an action, types text into the
+shell or switches profile:
+
+```toml
+[[menu]]
+title = "&Tools"
+items = [
+    { label = "&System Monitor", send = "htop\n" },
+    { separator = true },
+    { label = "&Work Profile", profile = "work" },
+]
+```
+
+A `[[menu]]` titled like a built-in one appends to it (`replace = true`
+replaces it).
+
 ### Configuration
 
 Settings live in `~/.config/seraphim/config.toml` (font, window size,
