@@ -769,10 +769,15 @@ fn init_gpu(
     }
     surface.configure(&device, &config);
     eprintln!(
-        "seraphim: {} ({:?}), surface {:?}",
+        "seraphim: {} ({:?}), surface {:?}{}",
         adapter.get_info().name,
         adapter.get_info().backend,
-        config.format
+        config.format,
+        if transparent {
+            format!(", alpha {:?} (offered {:?})", config.alpha_mode, caps.alpha_modes)
+        } else {
+            String::new()
+        }
     );
     Ok(Gpu { surface, device, queue, config })
 }

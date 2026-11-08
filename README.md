@@ -14,6 +14,13 @@ architecture decisions that settle spec §18.
 
 ![Seraphim renderer output](docs/images/renderer.png)
 
+## Status
+
+Phases I (functional terminal) and II (visual identity) of the
+specification are complete; Phase III (Lua scripting) is next. See
+[docs/progress.md](docs/progress.md) for where every part of the spec
+stands.
+
 ## Layout
 
 ```text

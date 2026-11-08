@@ -1,8 +1,12 @@
-# Phase II — Visual Identity: status and plan
+# Phase II — Visual Identity: complete
 
 **Goal (spec §15):** a beautiful, customizable terminal.
 
-## Done (first slice)
+Every Phase II task in the spec is done: Visual Engine, background
+management, GPU graphics, transparency, shader support, Animation Engine,
+themes and profiles. The table lists what was built and where.
+
+## Done
 
 | Spec item | Where |
 |---|---|
@@ -31,9 +35,24 @@
 
 See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules.
 
-## Next
+## Spec tasks → status
 
-2. **More background features:** video; blur of non-image layers (a
-   GPU post-process); animated gradients; frame pacing for animated
-   images (wake at the next frame instead of drawing at max_fps).
-6. **Measure animated scenes on real GPUs.**
+| Phase II task (spec §15) | Status |
+|---|---|
+| Visual Engine | Done: layered scenes, blend modes, compositing (blur layers, transitions) |
+| Background management | Done: solid, gradient (animated), image (PNG/JPEG/WebP/GIF, animated, blur, grading), video, shaders, presets |
+| GPU graphics | Done: wgpu renderer, Kitty graphics and Sixel inline images |
+| Transparency | Done: `visual.window_opacity`; verified under a compositor (xcompmgr): a 50 % window blends the terminal background with what's behind it exactly |
+| Basic shader support | Done: built-in and user WGSL layers and transitions, compiled safely |
+| Animation Engine | Done: tweens, springs, keyframes, event rules, bindings, transitions, cursor effects; time-based and paced |
+| Theme and profile system | Done: themes, profiles, presets, live reload, menu-bar profile switching |
+
+## Not done (deliberately, or needs hardware)
+
+* **Measuring on real GPUs.** Every number so far is from software
+  Vulkan (llvmpipe) in a container.
+* **Particle systems** (spec §5.4 lists them as a layer type): a shader
+  layer can draw particles today; a dedicated particle layer with
+  emitters is better done with Phase III scripting.
+* **Audio-reactive visuals** (spec §5.3): needs an audio capture source
+  for `[[bind]]`.

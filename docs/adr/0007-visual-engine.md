@@ -50,6 +50,13 @@
 | Same, window unfocused | 0 |
 | Same, `reduced_motion` | ~0 |
 
+## Transparency
+
+Verified under xcompmgr in Xvfb: the window gets a 32-bit ARGB visual, the
+surface uses premultiplied alpha, and with `window_opacity = 0.5` a pixel
+of the default background measures exactly the 50 % blend of the theme
+background and the desktop behind it.
+
 ## Not yet
 
 * (Done since: Kitty graphics protocol and Sixel inline images; see the
