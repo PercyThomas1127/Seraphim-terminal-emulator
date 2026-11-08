@@ -12,6 +12,9 @@ pollster.workspace = true
 png.workspace = true
 image.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 image.workspace = true
 seraphim-render.workspace = true

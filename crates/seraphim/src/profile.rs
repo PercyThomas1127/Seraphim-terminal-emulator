@@ -118,6 +118,11 @@ fn layers(
                 LayerKind::Image { path, fit: Fit::parse(&b.fit).unwrap_or_default(), blur: b.blur }
             }
             "blur" => LayerKind::Blur,
+            "video" => {
+                let path = b.resolve(b.path.as_deref().unwrap_or_default(), &dir);
+                files.push(path.clone());
+                LayerKind::Video { path, fit: Fit::parse(&b.fit).unwrap_or_default() }
+            }
             _ => {
                 let name = b.shader.clone().unwrap_or_default();
                 if name.ends_with(".wgsl") {

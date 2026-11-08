@@ -25,6 +25,7 @@
 | Graphics follow-ups: images move with scroll regions (and IL/DL/SD/RI); shared-memory transfer (`t=s`); Unicode placeholders (`U=1`, the 297 row/column diacritics, inferred rows/columns, aspect-fit) for tmux; animation frames and playback (`a=f` with base/background/blend/replace/gaps, `a=a` stop/run/loading/loops/current) | `graphics.rs`, `images.rs` |
 | Offscreen compositing (only when needed): backdrop blur layers (`kind = "blur"`, separable Gaussian, downsampled for large radii) and styled scene transitions (spec §6.3): fade, slide, wipe, dissolve, zoom, blur, fade-through, user WGSL `fn transition(uv, p)` | `seraphim-visual/src/compose.rs` |
 | Animated gradients (`spin`, `flow`); frame pacing (animated images wake the loop at their frame boundaries, not at the fps cap) | `seraphim-visual` |
+| Video backgrounds (`kind = "video"`): decoded by an ffmpeg subprocess into a bounded frame queue, paced by the engine clock, looped, graded like images; ffmpeg stops with Seraphim (PDEATHSIG on Linux) | `seraphim-visual/src/video.rs` |
 | Named shader colors (`palette`, `color(C_name)`), theme-relative | `seraphim-visual` |
 
 See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules.

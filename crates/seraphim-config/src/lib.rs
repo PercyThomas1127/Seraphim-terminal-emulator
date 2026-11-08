@@ -1343,9 +1343,18 @@ impl Background {
                 }
             }
             "blur" => {}
-            "" => return Err("missing `kind` (solid, gradient, image, blur or shader)".into()),
+            "video" => {
+                if self.path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                    return Err("a video layer needs `path`".into());
+                }
+            }
+            "" => {
+                return Err("missing `kind` (solid, gradient, image, video, blur or shader)".into())
+            }
             k => {
-                return Err(format!("unknown kind {k:?} (solid, gradient, image, blur or shader)"))
+                return Err(format!(
+                    "unknown kind {k:?} (solid, gradient, image, video, blur or shader)"
+                ))
             }
         }
         Ok(())

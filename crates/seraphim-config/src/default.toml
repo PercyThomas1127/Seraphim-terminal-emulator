@@ -139,6 +139,12 @@ selection_fade_ms = 90
 # Images: PNG, JPEG, WebP or GIF; animated GIF, WebP and APNG play.
 # blur is a radius in image pixels; brightness, contrast and saturation
 # (1 = unchanged) can be animated and bound like shader parameters.
+# Videos (anything ffmpeg plays; needs ffmpeg on PATH) loop silently:
+# [[background]]
+# kind = "video"
+# path = "~/Videos/rain.mp4"
+# params = { brightness = 0.5 }
+#
 # [[background]]
 # kind = "image"
 # path = "~/Pictures/wallpaper.jpg"

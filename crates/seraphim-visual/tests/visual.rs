@@ -643,3 +643,58 @@ mod compositing {
         }
     }
 }
+
+#[test]
+fn video_layer_plays_and_loops() {
+    let Some(mut r) = rig() else { return };
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping: no ffmpeg");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("seraphim-video-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v.mp4");
+    // 0.5 s red, then 0.5 s blue, 10 fps.
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=32x16:d=0.5:r=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:s=32x16:d=0.5:r=10",
+        ])
+        .args(["-filter_complex", "[0][1]concat=n=2:v=1", "-pix_fmt", "yuv420p"])
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "ffmpeg made the test clip");
+    r.v.set_fixed_time(Some(0.0));
+    let spec = LayerSpec::new("v", LayerKind::Video { path: path.clone(), fit: Fit::Stretch });
+    assert!(r.v.set_layers(&[spec], Transition::Instant).is_empty());
+    let red = |c: [i32; 3]| c[0] > 200 && c[2] < 60;
+    let blue = |c: [i32; 3]| c[2] > 200 && c[0] < 60;
+    assert!(red(rgb(r.frame("").pixel(1, 1))), "first frame");
+    assert!(r.v.next_frame_in().is_some_and(|d| d > 0.0 && d <= 0.1), "paced by its frame rate");
+    r.v.set_fixed_time(Some(0.75));
+    assert!(blue(rgb(r.frame("").pixel(1, 1))), "second half");
+    r.v.set_fixed_time(Some(1.25));
+    assert!(red(rgb(r.frame("").pixel(1, 1))), "loops");
+    let e = r.v.set_layers(
+        &[LayerSpec::new("x", LayerKind::Video { path: dir.join("missing.mp4"), fit: Fit::Cover })],
+        Transition::Instant,
+    );
+    assert_eq!(e.len(), 1, "{e:?}");
+    std::fs::write(dir.join("junk.mp4"), b"nope").unwrap();
+    let e = r.v.set_layers(
+        &[LayerSpec::new("y", LayerKind::Video { path: dir.join("junk.mp4"), fit: Fit::Cover })],
+        Transition::Instant,
+    );
+    assert_eq!(e.len(), 1, "{e:?}");
+}

@@ -19,6 +19,7 @@
 pub mod animation;
 mod compose;
 pub mod picture;
+mod video;
 
 pub use compose::{TransitionStyle, BUILTIN_TRANSITIONS};
 
@@ -165,6 +166,12 @@ pub enum LayerKind {
         fit: Fit,
         blur: f32,
     },
+    /// A video file, decoded by ffmpeg and looped; same fit and grading
+    /// parameters as images.
+    Video {
+        path: PathBuf,
+        fit: Fit,
+    },
     /// Blurs everything drawn beneath it (backdrop blur); parameter
     /// `radius` in pixels. Opacity mixes blurred and sharp.
     Blur,
@@ -244,6 +251,8 @@ struct GpuLayer {
     radius: f32,
     /// Current opacity, for the compositor.
     shown: f32,
+    /// A playing video: its stream, texture, and start time.
+    video: Option<(video::Stream, wgpu::Texture, f64)>,
 }
 
 /// Engine clock: seconds since creation, minus time spent paused.
@@ -455,6 +464,9 @@ impl VisualEngine {
         for spec in specs {
             match self.build(spec) {
                 Ok(mut layer) => {
+                    if let Some(v) = &mut layer.video {
+                        v.2 = now;
+                    }
                     let target = spec.opacity.clamp(0.0, 1.0) as f64;
                     if styled {
                         layer.opacity = Animated::new(target);
@@ -539,6 +551,10 @@ impl VisualEngine {
             {
                 return Some(0.0);
             }
+            if let Some((stream, _, start)) = &l.video {
+                let left = stream.next_in(now - start);
+                next = Some(next.map_or(left, |n: f64| n.min(left)));
+            }
             if l.period > 0.0 {
                 // Time left in the current frame of an animated image.
                 let mut t = (now as f32).rem_euclid(l.period);
@@ -584,6 +600,11 @@ impl VisualEngine {
             u.opacity = l.opacity.value(now) as f32 * self.global_opacity;
             for (i, (_, a)) in l.params.iter_mut().enumerate().take(MAX_PARAMS) {
                 u.params[i] = a.value(now) as f32;
+            }
+            if let Some((stream, tex, start)) = &mut l.video {
+                if let Some(frame) = stream.frame_for(now - *start, self.fixed_time.is_some()) {
+                    write_texture(&self.queue, tex, stream.width, stream.height, &frame);
+                }
             }
             if l.period > 0.0 {
                 // Animated image: the frame for this point in its loop.
@@ -705,6 +726,7 @@ impl VisualEngine {
         let mut delays: Vec<f32> = Vec::new();
         let mut time_params: Vec<usize> = Vec::new();
         let mut blur = false;
+        let mut video = None;
         let mut params: Vec<(String, f32)> = Vec::new();
         let mut colors: Vec<(String, Rgba)> = Vec::new();
         let body: String = match &spec.kind {
@@ -757,6 +779,20 @@ impl VisualEngine {
                     &[("brightness", 1.0), ("contrast", 1.0), ("saturation", 1.0)];
                 params = with_defaults(GRADING, &spec.params, false)
                     .map_err(|n| no_such("image", "parameter", n, GRADING))?;
+                include_str!("shaders/image.wgsl").into()
+            }
+            LayerKind::Video { path, fit } => {
+                let (stream, first) = video::Stream::open(path)?;
+                let (w, h) = (stream.width, stream.height);
+                let (tex, view) = create_texture_pair(&self.device, &self.queue, w, h, &first);
+                textures.push(view);
+                data.image = [w as f32, h as f32, 0.0, 0.0];
+                data.info[2] = *fit as u32 as f32;
+                const GRADING: &[(&str, f32)] =
+                    &[("brightness", 1.0), ("contrast", 1.0), ("saturation", 1.0)];
+                params = with_defaults(GRADING, &spec.params, false)
+                    .map_err(|n| no_such("video", "parameter", n, GRADING))?;
+                video = Some((stream, tex, 0.0));
                 include_str!("shaders/image.wgsl").into()
             }
             LayerKind::Blur => {
@@ -885,6 +921,7 @@ impl VisualEngine {
             blur,
             radius: 0.0,
             shown: 0.0,
+            video,
             uniforms,
             opacity: Animated::new(spec.opacity as f64),
             params: params.into_iter().map(|(n, v)| (n, Animated::new(v as f64))).collect(),
@@ -927,6 +964,46 @@ fn shader_error(raw: &str) -> String {
     let lines: Vec<&str> =
         raw.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
     format!("shader did not compile:\n{}", lines.join("\n"))
+}
+
+fn create_texture_pair(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("video"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    write_texture(queue, &texture, w, h, rgba);
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn write_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, w: u32, h: u32, rgba: &[u8]) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * w),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
 }
 
 fn create_texture(

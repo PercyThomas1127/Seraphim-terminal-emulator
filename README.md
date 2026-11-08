@@ -84,7 +84,8 @@ Applications may set the clipboard with OSC 52; reading it requires
 ![Seraphim visual engine](docs/images/visual.png)
 
 Layers behind the text — solid colors, gradients, images (PNG, JPEG,
-WebP, GIF; animated GIF/WebP/APNG play; blur and color grading) and WGSL
+WebP, GIF; animated GIF/WebP/APNG play; blur and color grading), videos
+(anything ffmpeg plays, looped, if ffmpeg is installed) and WGSL
 shaders (built-in `aurora`, `starfield` and `heavens`, or your own) — are declared in
 the config:
 
