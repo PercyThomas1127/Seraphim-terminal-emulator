@@ -1,0 +1,5 @@
+name = "error-flash"
+version = "1.0.0"
+description = "Flash the window red when a program prints ERROR (spec §8.4)."
+api = 1
+permissions = ["visual"]

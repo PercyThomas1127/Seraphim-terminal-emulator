@@ -59,6 +59,8 @@ pub fn options_from_config(
     theme.ansi[..8].copy_from_slice(&k.normal);
     theme.ansi[8..].copy_from_slice(&k.bright);
     let (layers, warnings, files) = layers(c, config_dir, &theme);
+    let binds =
+        c.bind.iter().filter_map(|b| crate::bindings::Bind::from_config(b, &theme)).collect();
     let o = WindowOptions {
         font_family: c.font.family.clone(),
         font_size: c.font.size,
@@ -75,7 +77,7 @@ pub fn options_from_config(
         visual: c.visual.clone(),
         layers,
         rules: c.on.iter().map(crate::interaction::Rule::from_config).collect(),
-        binds: c.bind.iter().filter_map(crate::bindings::Bind::from_config).collect(),
+        binds,
         watch: files,
         live_reload: c.live_reload,
         notice: None,
@@ -88,6 +90,9 @@ pub fn options_from_config(
         cli_font_family: None,
         cli_font_size: None,
         cli_preset: None,
+        scripting: c.scripting.clone(),
+        extensions: c.extensions.clone(),
+        cli_extensions: Vec::new(),
     };
     (o, warnings)
 }
@@ -103,58 +108,70 @@ fn layers(
     let mut warnings = Vec::new();
     let mut files = Vec::new();
     for (i, b) in c.background.iter().enumerate() {
-        let id = b.id.clone().unwrap_or_else(|| format!("{}-{}", b.kind, i + 1));
-        let kind = match b.kind.as_str() {
-            "solid" => {
-                LayerKind::Solid(b.color.as_deref().and_then(parse_rgba).unwrap_or([0.0; 4]))
-            }
-            "gradient" => LayerKind::Gradient {
-                colors: b.colors.iter().filter_map(|c| parse_rgba(c)).collect(),
-                angle: b.angle,
-            },
-            "image" => {
-                let path = b.resolve(b.path.as_deref().unwrap_or_default(), &dir);
-                files.push(path.clone());
-                LayerKind::Image { path, fit: Fit::parse(&b.fit).unwrap_or_default(), blur: b.blur }
-            }
-            "blur" => LayerKind::Blur,
-            "video" => {
-                let path = b.resolve(b.path.as_deref().unwrap_or_default(), &dir);
-                files.push(path.clone());
-                LayerKind::Video { path, fit: Fit::parse(&b.fit).unwrap_or_default() }
-            }
-            _ => {
-                let name = b.shader.clone().unwrap_or_default();
-                if name.ends_with(".wgsl") {
-                    let path = b.resolve(&name, &dir.join("shaders"));
-                    let path = if path.exists() { path } else { b.resolve(&name, &dir) };
-                    files.push(path.clone());
-                    match std::fs::read_to_string(&path) {
-                        Ok(src) => LayerKind::Shader { name, source: Some(src) },
-                        Err(e) => {
-                            warnings.push(format!("background {id:?}: {}: {e}", path.display()));
-                            continue;
-                        }
-                    }
-                } else {
-                    LayerKind::Shader { name, source: None }
-                }
-            }
-        };
-        out.push(LayerSpec {
-            id,
-            kind,
-            opacity: b.opacity,
-            blend: Blend::parse(&b.blend).unwrap_or_default(),
-            params: b.params.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-            colors: b
-                .palette
-                .iter()
-                .filter_map(|(k, v)| Some((k.clone(), resolve_color(v, theme)?)))
-                .collect(),
-        });
+        match layer_spec(b, i, &dir, theme, &mut files) {
+            Ok(l) => out.push(l),
+            Err(e) => warnings.push(e),
+        }
     }
     (out, warnings, files)
+}
+
+/// One `[[background]]` entry (the `index`-th) as a layer. Relative paths
+/// resolve against `dir`; files read go into `files` (for live reload).
+pub fn layer_spec(
+    b: &seraphim_config::Background,
+    index: usize,
+    dir: &Path,
+    theme: &Theme,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<LayerSpec, String> {
+    let id = b.id.clone().unwrap_or_else(|| format!("{}-{}", b.kind, index + 1));
+    let kind = match b.kind.as_str() {
+        "solid" => LayerKind::Solid(
+            b.color.as_deref().and_then(|c| resolve_color(c, theme)).unwrap_or([0.0; 4]),
+        ),
+        "gradient" => LayerKind::Gradient {
+            colors: b.colors.iter().filter_map(|c| resolve_color(c, theme)).collect(),
+            angle: b.angle,
+        },
+        "image" => {
+            let path = b.resolve(b.path.as_deref().unwrap_or_default(), dir);
+            files.push(path.clone());
+            LayerKind::Image { path, fit: Fit::parse(&b.fit).unwrap_or_default(), blur: b.blur }
+        }
+        "blur" => LayerKind::Blur,
+        "video" => {
+            let path = b.resolve(b.path.as_deref().unwrap_or_default(), dir);
+            files.push(path.clone());
+            LayerKind::Video { path, fit: Fit::parse(&b.fit).unwrap_or_default() }
+        }
+        _ => {
+            let name = b.shader.clone().unwrap_or_default();
+            if name.ends_with(".wgsl") {
+                let path = b.resolve(&name, &dir.join("shaders"));
+                let path = if path.exists() { path } else { b.resolve(&name, dir) };
+                files.push(path.clone());
+                match std::fs::read_to_string(&path) {
+                    Ok(src) => LayerKind::Shader { name, source: Some(src) },
+                    Err(e) => return Err(format!("background {id:?}: {}: {e}", path.display())),
+                }
+            } else {
+                LayerKind::Shader { name, source: None }
+            }
+        }
+    };
+    Ok(LayerSpec {
+        id,
+        kind,
+        opacity: b.opacity,
+        blend: Blend::parse(&b.blend).unwrap_or_default(),
+        params: b.params.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+        colors: b
+            .palette
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), resolve_color(v, theme)?)))
+            .collect(),
+    })
 }
 
 /// `visual.transition` as a style: a built-in name, or a WGSL file from

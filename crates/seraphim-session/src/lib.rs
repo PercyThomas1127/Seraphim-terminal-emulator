@@ -18,7 +18,11 @@
 //! | `session.cwd.changed`    | `{cwd}`                                     |
 //! | `terminal.title.changed` | `{title}`                                   |
 //! | `terminal.bell`          | `{}`                                        |
-//! | `terminal.output`        | `{bytes}` — byte count only, rate-limited by queue |
+//! | `terminal.output`        | `{bytes, text}` — printed text (no escape sequences; `\n` for line feeds), only collected while someone listens |
+//! | `terminal.output.raw`    | `{bytes, data}` — the raw bytes (lossy UTF-8), only while someone listens |
+//! | `command.output`         | `{command?, text}` — printed text while a command runs (OSC 133 C..D) |
+//! | `terminal.text.changed`  | `{}` — the screen changed (once per chunk of output) |
+//! | `terminal.cursor.moved`  | `{row, col}` — 0-based, after a chunk of output |
 //! | `terminal.screen.alternate` | `{active}`                               |
 //! | `shell.prompt`           | `{}`                                        |
 //! | `command.started`        | `{command?}`                                |
@@ -33,9 +37,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use seraphim_events::{json, EventBus, Publisher};
-use seraphim_pty::{is_eof_error, ProcessInfo, Pty, PtyCommand, PtySize};
+use seraphim_pty::{is_eof_error, Pty, PtyCommand, PtySize};
 use seraphim_terminal::{Terminal, TerminalEvent};
 
+pub use seraphim_pty::ProcessInfo;
 pub use seraphim_pty::PtyCommand as Command;
 
 pub type SessionId = u64;
@@ -261,6 +266,11 @@ impl Session {
         std::mem::take(&mut *self.shared.clipboard.lock().unwrap())
     }
 
+    /// Info on the shell (the session's first process).
+    pub fn shell_process(&self) -> Option<ProcessInfo> {
+        ProcessInfo::read(self.pty.lock().unwrap().pid())
+    }
+
     /// Info on the process in the terminal's foreground (from `/proc`).
     pub fn foreground_process(&self) -> Option<ProcessInfo> {
         let pgid = self.pty.lock().unwrap().foreground_pgid()?;
@@ -351,16 +361,48 @@ impl IoLoop {
                 Err(e) if is_eof_error(&e) => break,
                 Err(_) => break,
             };
-            let (events, responses) = {
+            // Three levels of output (spec §8.4): raw bytes, parsed text,
+            // and semantic shell events (below). The costly ones are built
+            // only when someone listens.
+            let p = &self.publisher;
+            let want_text = p.wants("terminal.output") || p.wants("command.output");
+            let want_cursor = p.wants("terminal.cursor.moved");
+            let (events, responses, text, cursor) = {
                 let mut term = self.terminal.lock().unwrap();
+                term.set_capture_text(want_text);
+                let before = want_cursor.then(|| term.cursor());
                 term.advance(&buf[..n]);
-                (term.take_events(), term.take_responses())
+                let after = term.cursor();
+                let moved =
+                    before.filter(|b| (b.row, b.col) != (after.row, after.col)).map(|_| after);
+                (term.take_events(), term.take_responses(), term.take_text(), moved)
             };
             self.changed();
             if !responses.is_empty() {
                 let _ = self.writer.lock().unwrap().write_all(&responses);
             }
-            self.publisher.publish("terminal.output", Some(self.id), json!({"bytes": n}));
+            if p.wants("terminal.output.raw") {
+                let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                p.publish("terminal.output.raw", Some(self.id), json!({"bytes": n, "data": raw}));
+            }
+            p.publish("terminal.output", Some(self.id), json!({"bytes": n, "text": text}));
+            if let (Some((command, _)), false) = (&self.command, text.is_empty()) {
+                p.publish(
+                    "command.output",
+                    Some(self.id),
+                    json!({"command": command, "text": text}),
+                );
+            }
+            if p.wants("terminal.text.changed") {
+                p.publish("terminal.text.changed", Some(self.id), json!({}));
+            }
+            if let Some(c) = cursor {
+                p.publish(
+                    "terminal.cursor.moved",
+                    Some(self.id),
+                    json!({"row": c.row, "col": c.col}),
+                );
+            }
             for ev in events {
                 self.handle(ev);
             }

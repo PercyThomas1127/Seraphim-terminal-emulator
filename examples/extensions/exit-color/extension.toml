@@ -1,0 +1,5 @@
+name = "exit-color"
+version = "1.0.0"
+description = "Tint the background by the last command's exit status (spec §11.4)."
+api = 1
+permissions = ["visual"]

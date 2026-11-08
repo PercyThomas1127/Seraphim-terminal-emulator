@@ -237,6 +237,9 @@ struct GpuLayer {
     uniforms: wgpu::Buffer,
     opacity: Animated,
     params: Vec<(String, Animated)>,
+    /// Animatable colors (name, RGBA) in uniform order: `color` for a
+    /// solid, `0`..`7` for gradient stops, palette names for shaders.
+    colors: Vec<(String, [Animated; 4])>,
     /// The shader reads `u.time`, so it changes every frame.
     uses_time: bool,
     /// Parameters that make the layer change over time when non-zero
@@ -522,6 +525,71 @@ impl VisualEngine {
         }
     }
 
+    /// Animate a layer color: `color` of a solid layer, a gradient stop by
+    /// index (`"0"`, `"1"`, …) or a shader palette name. Returns false if
+    /// the layer or color does not exist.
+    pub fn set_color(&mut self, id: &str, name: &str, value: Rgba, transition: Transition) -> bool {
+        let (now, t) = (self.time(), self.effective(transition));
+        let Some(l) = self.layers.iter_mut().find(|l| l.id == id && !l.leaving) else {
+            return false;
+        };
+        match l.colors.iter_mut().find(|(n, _)| n == name) {
+            Some((_, c)) => {
+                for (a, v) in c.iter_mut().zip(value) {
+                    a.set(v as f64, t, now);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Names of a layer's animatable colors.
+    pub fn color_names(&self, id: &str) -> Vec<&str> {
+        self.layers
+            .iter()
+            .find(|l| l.id == id && !l.leaving)
+            .map(|l| l.colors.iter().map(|(n, _)| n.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Add one layer on top of the scene, fading it in, or replace the
+    /// layer with the same id in place (keeping its position).
+    pub fn upsert_layer(&mut self, spec: &LayerSpec, transition: Transition) -> Result<(), String> {
+        let now = self.time();
+        let transition = self.effective(transition);
+        let mut layer = self.build(spec).map_err(|e| format!("layer {:?}: {e}", spec.id))?;
+        if let Some(v) = &mut layer.video {
+            v.2 = now;
+        }
+        layer.opacity = Animated::new(0.0);
+        layer.opacity.set(spec.opacity.clamp(0.0, 1.0) as f64, transition, now);
+        match self.layers.iter().position(|l| l.id == spec.id && !l.leaving) {
+            Some(i) => {
+                // The old one fades out underneath the new one.
+                let mut old = std::mem::replace(&mut self.layers[i], layer);
+                old.leaving = true;
+                old.opacity.set(0.0, transition, now);
+                self.layers.insert(i, old);
+            }
+            None => self.layers.push(layer),
+        }
+        self.drop_finished(now);
+        Ok(())
+    }
+
+    /// Fade a layer out and remove it. Returns false if there is none.
+    pub fn remove_layer(&mut self, id: &str, transition: Transition) -> bool {
+        let (now, t) = (self.time(), self.effective(transition));
+        let Some(l) = self.layers.iter_mut().find(|l| l.id == id && !l.leaving) else {
+            return false;
+        };
+        l.leaving = true;
+        l.opacity.set(0.0, t, now);
+        self.drop_finished(now);
+        true
+    }
+
     /// Whether the scene changes over time right now; the window keeps
     /// drawing frames only while this is true.
     pub fn animating(&self) -> bool {
@@ -548,6 +616,7 @@ impl VisualEngine {
                 || self.progress.active(now)
                 || l.opacity.active(now)
                 || l.params.iter().any(|(_, a)| a.active(now))
+                || l.colors.iter().any(|(_, c)| c.iter().any(|a| a.active(now)))
             {
                 return Some(0.0);
             }
@@ -600,6 +669,14 @@ impl VisualEngine {
             u.opacity = l.opacity.value(now) as f32 * self.global_opacity;
             for (i, (_, a)) in l.params.iter_mut().enumerate().take(MAX_PARAMS) {
                 u.params[i] = a.value(now) as f32;
+            }
+            for (i, (_, c)) in l.colors.iter_mut().enumerate().take(MAX_STOPS) {
+                u.colors[i] = [
+                    c[0].value(now) as f32,
+                    c[1].value(now) as f32,
+                    c[2].value(now) as f32,
+                    c[3].value(now) as f32,
+                ];
             }
             if let Some((stream, tex, start)) = &mut l.video {
                 if let Some(frame) = stream.frame_for(now - *start, self.fixed_time.is_some()) {
@@ -729,9 +806,11 @@ impl VisualEngine {
         let mut video = None;
         let mut params: Vec<(String, f32)> = Vec::new();
         let mut colors: Vec<(String, Rgba)> = Vec::new();
+        let mut color_names: Vec<String> = Vec::new();
         let body: String = match &spec.kind {
             LayerKind::Solid(c) => {
                 data.colors[0] = *c;
+                color_names.push("color".into());
                 include_str!("shaders/solid.wgsl").into()
             }
             LayerKind::Gradient { colors, angle } => {
@@ -744,6 +823,7 @@ impl VisualEngine {
                 }
                 for (i, c) in colors.iter().enumerate() {
                     data.colors[i] = *c;
+                    color_names.push(i.to_string());
                     data.stops[i] =
                         if colors.len() == 1 { 0.0 } else { i as f32 / (colors.len() - 1) as f32 };
                 }
@@ -842,6 +922,7 @@ impl VisualEngine {
             }
             consts.push_str(&format!("const C_{n}: u32 = {i}u;\n"));
             data.colors[i] = *c;
+            color_names.push(n.clone());
         }
         let source = format!("{PRELUDE}\n{consts}\n{body}");
         // Gradients read u.time only through spin/flow (see time_params);
@@ -925,6 +1006,11 @@ impl VisualEngine {
             uniforms,
             opacity: Animated::new(spec.opacity as f64),
             params: params.into_iter().map(|(n, v)| (n, Animated::new(v as f64))).collect(),
+            colors: color_names
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| (n, data.colors[i].map(|v| Animated::new(v as f64))))
+                .collect(),
             uses_time,
             time_params,
             static_data: data,

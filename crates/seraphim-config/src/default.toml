@@ -199,9 +199,12 @@ selection_fade_ms = 90
 # Continuous bindings: a layer parameter follows a live value, eased over
 # smoothing_ms. Sources: system.cpu (percent), system.memory (percent),
 # system.load (load average per core), battery.level (percent),
-# battery.charging (0 or 1), time.hour (0-24, local); or the latest event
-# of a kind with `event` and `field`. `input` (default: the source's range)
-# maps linearly onto `output`; `map` maps exact values instead.
+# battery.charging (0 or 1), time.hour (0-24, local),
+# terminal.last_exit_code, session.root, session.cwd, terminal.alt_screen;
+# or the latest event of a kind with `event` and `field`. `input` (default:
+# the source's range) maps linearly onto `output`; `map` maps exact values
+# instead. With param = "color" (or "color.<name>"), `colors` maps exact
+# values to colors.
 #
 # [[bind]]
 # source = "system.cpu"
@@ -215,3 +218,32 @@ selection_fade_ms = 90
 # layer = "glow"
 # param = "pulse"
 # map = { "0" = 0.0, default = 1.0 }
+#
+# [[bind]]
+# source = "terminal.last_exit_code"
+# layer = "base"
+# param = "color"
+# colors = { "0" = "#f5a6d0", default = "#ff5577" }
+
+# Lua extensions: folders in extensions/ (extension.toml + init.lua) and
+# one-file scripts in scripts/*.lua, next to this file. Each runs in its
+# own sandbox on a script thread; a handler that runs longer than
+# budget_ms is stopped, and an extension that keeps doing it is disabled.
+[scripting]
+enabled = true
+budget_ms = 50
+memory_mb = 64
+
+# What an extension may do. It gets the permissions it asks for in its
+# manifest *and* that are granted here; by default: visual, interface,
+# metrics. The others: terminal.read, terminal.write (never into a root
+# shell), process.read, process.exec (with `commands`), filesystem (with
+# `paths`), network (with `hosts`), system (desktop notifications).
+#
+# [extensions.git-status]
+# grant = ["visual", "interface", "terminal.read", "process.exec"]
+# commands = ["git"]
+# settings = { branch_colors = true }
+#
+# [extensions.noisy]
+# disabled = true

@@ -1,0 +1,5 @@
+name = "cpu-glow"
+version = "1.0.0"
+description = "Background intensity follows CPU load (spec §11.4). Made for the heavens preset."
+api = 1
+permissions = ["visual", "metrics", "interface"]

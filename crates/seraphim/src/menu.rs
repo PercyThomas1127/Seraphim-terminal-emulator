@@ -16,6 +16,11 @@ pub enum Command {
     /// Type this text into the shell.
     Send(String),
     Profile(String),
+    /// A command an extension registered.
+    Script {
+        ext: String,
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

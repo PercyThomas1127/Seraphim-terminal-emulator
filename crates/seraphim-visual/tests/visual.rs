@@ -698,3 +698,58 @@ fn video_layer_plays_and_loops() {
     );
     assert_eq!(e.len(), 1, "{e:?}");
 }
+
+#[test]
+fn colors_animate_and_single_layers_come_and_go() {
+    let Some(mut r) = rig() else { return };
+    let g = LayerSpec::new(
+        "g",
+        LayerKind::Gradient { colors: vec![[0.0, 0.0, 1.0, 1.0]; 2], angle: 0.0 },
+    );
+    assert!(r
+        .v
+        .set_layers(&[solid("bg", [1.0, 0.0, 0.0, 1.0]), g], Transition::Instant)
+        .is_empty());
+    assert_eq!(r.v.color_names("bg"), ["color"]);
+    assert_eq!(r.v.color_names("g"), ["0", "1"]);
+    assert!(!r.v.set_color("bg", "nope", [0.0; 4], Transition::Instant));
+    assert!(r.v.set_color("g", "0", [0.0, 1.0, 0.0, 1.0], Transition::Instant));
+    assert!(r.v.set_color("g", "1", [0.0, 1.0, 0.0, 1.0], Transition::Instant));
+    assert!(near(rgb(r.frame("").pixel(1, 1)), [0, 255, 0], 2), "gradient now green");
+    // A tween is part-way at the half.
+    r.v.set_fixed_time(Some(0.0));
+    assert!(r.v.set_color(
+        "g",
+        "0",
+        [0.0, 0.0, 0.0, 1.0],
+        Transition::Tween { duration: 1.0, easing: Easing::Linear }
+    ));
+    assert!(r.v.set_color(
+        "g",
+        "1",
+        [0.0, 0.0, 0.0, 1.0],
+        Transition::Tween { duration: 1.0, easing: Easing::Linear }
+    ));
+    assert!(r.v.animating());
+    r.v.set_fixed_time(Some(0.5));
+    let mid = rgb(r.frame("").pixel(1, 1));
+    assert!(near(mid, [0, 128, 0], 40), "{mid:?}");
+    r.v.set_fixed_time(Some(2.0));
+    // Add a layer on top, replace it in place, remove it.
+    r.v.upsert_layer(&solid("top", [1.0, 1.0, 1.0, 1.0]), Transition::Instant).unwrap();
+    assert_eq!(r.v.layer_ids(), ["bg", "g", "top"]);
+    assert_eq!(rgb(r.frame("").pixel(1, 1)), [255, 255, 255]);
+    r.v.upsert_layer(&solid("top", [1.0, 1.0, 0.0, 1.0]), Transition::Instant).unwrap();
+    assert_eq!(r.v.layer_ids(), ["bg", "g", "top"]);
+    assert_eq!(rgb(r.frame("").pixel(1, 1)), [255, 255, 0]);
+    assert!(r
+        .v
+        .upsert_layer(
+            &LayerSpec::new("bad", LayerKind::Shader { name: "nope".into(), source: None }),
+            Transition::Instant
+        )
+        .is_err());
+    assert!(r.v.remove_layer("top", Transition::Instant));
+    assert!(!r.v.remove_layer("top", Transition::Instant));
+    assert_eq!(r.v.layer_ids(), ["bg", "g"]);
+}

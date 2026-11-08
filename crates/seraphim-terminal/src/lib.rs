@@ -155,6 +155,22 @@ impl Terminal {
         std::mem::take(&mut self.state.events)
     }
 
+    /// Start or stop collecting printed text for [`Terminal::take_text`].
+    pub fn set_capture_text(&mut self, on: bool) {
+        match (on, self.state.text.is_some()) {
+            (true, false) => self.state.text = Some(String::new()),
+            (false, true) => self.state.text = None,
+            _ => {}
+        }
+    }
+
+    /// Text printed since the last call: the characters applications
+    /// wrote, with `\n` for line feeds and `\t` for tabs; escape sequences
+    /// and cursor movement are not included.
+    pub fn take_text(&mut self) -> String {
+        self.state.text.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
     /// Drain bytes the terminal must send back to the application
     /// (device status reports, DA responses, ...).
     pub fn take_responses(&mut self) -> Vec<u8> {

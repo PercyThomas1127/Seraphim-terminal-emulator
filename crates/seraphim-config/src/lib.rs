@@ -62,6 +62,47 @@ pub struct Config {
     pub bind: Vec<Bind>,
     /// Menu bar additions ([`BUILTIN_MENU`] is the base).
     pub menu: Vec<Menu>,
+    /// The Lua scripting runtime.
+    pub scripting: Scripting,
+    /// Per-extension switches and permissions, by extension name.
+    pub extensions: std::collections::BTreeMap<String, ExtensionConfig>,
+}
+
+/// `[scripting]`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scripting {
+    /// Run extensions at all.
+    pub enabled: bool,
+    /// Longest a single handler may run, in milliseconds.
+    pub budget_ms: u32,
+    /// Memory limit per extension, in MiB.
+    pub memory_mb: u32,
+}
+
+impl Default for Scripting {
+    fn default() -> Self {
+        Scripting { enabled: true, budget_ms: 50, memory_mb: 64 }
+    }
+}
+
+/// `[extensions.<name>]`: what one extension may do (spec §8.5).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtensionConfig {
+    /// `true` keeps the extension from running.
+    pub disabled: bool,
+    /// Permissions granted (default: visual, interface, metrics). The
+    /// extension gets those it also requests in its manifest.
+    pub grant: Option<Vec<String>>,
+    /// `filesystem`: folders it may read and write.
+    pub paths: Vec<String>,
+    /// `network`: hosts it may reach (`*.example.com` for subdomains).
+    pub hosts: Vec<String>,
+    /// `process.exec`: programs it may run (`"*"` for any).
+    pub commands: Vec<String>,
+    /// Settings for the extension (`seraphim.settings` in Lua).
+    pub settings: toml::Table,
 }
 
 /// The built-in menu bar, as TOML (`[[menu]]` entries).
@@ -178,6 +219,8 @@ impl Default for Config {
             background: Vec::new(),
             on: Vec::new(),
             bind: Vec::new(),
+            scripting: Scripting::default(),
+            extensions: Default::default(),
             menu: Vec::new(),
         }
     }
@@ -251,6 +294,9 @@ pub struct Bind {
     pub output: [f32; 2],
     /// Exact values instead of a range: `{ "0" = 0.85, default = 0.0 }`.
     pub map: std::collections::BTreeMap<String, f32>,
+    /// For `param = "color"` (or `"color.<name>"`): exact values to
+    /// colors, `{ "0" = "#f5a6d0", default = "#ff5577" }`.
+    pub colors: std::collections::BTreeMap<String, String>,
     /// Ease to each new value over this many milliseconds.
     pub smoothing_ms: u32,
     /// How often metrics are sampled.
@@ -268,18 +314,39 @@ impl Default for Bind {
             input: None,
             output: [0.0, 1.0],
             map: Default::default(),
+            colors: Default::default(),
             smoothing_ms: 600,
             interval_ms: 1000,
         }
     }
 }
 
+/// Sources that are really the latest value of an event field:
+/// (source, event, field).
+pub const BIND_EVENT_SOURCES: &[(&str, &str, &str)] = &[
+    ("terminal.last_exit_code", "command.completed", "exit_code"),
+    ("session.root", "session.privileged", "root"),
+    ("session.cwd", "session.cwd.changed", "cwd"),
+    ("terminal.alt_screen", "terminal.screen.alternate", "active"),
+];
+
 impl Bind {
-    fn validate(&self) -> Result<(), String> {
+    /// Whether this binding drives a color.
+    pub fn is_color(&self) -> bool {
+        self.param == "color" || self.param.starts_with("color.")
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
         match (&self.source, &self.event) {
             (Some(s), None) => {
-                if !BIND_SOURCES.iter().any(|(n, _)| n == s) {
-                    let names: Vec<&str> = BIND_SOURCES.iter().map(|b| b.0).collect();
+                if !BIND_SOURCES.iter().any(|(n, _)| n == s)
+                    && !BIND_EVENT_SOURCES.iter().any(|(n, _, _)| n == s)
+                {
+                    let names: Vec<&str> = BIND_SOURCES
+                        .iter()
+                        .map(|b| b.0)
+                        .chain(BIND_EVENT_SOURCES.iter().map(|b| b.0))
+                        .collect();
                     return Err(format!("unknown source {s:?} ({})", names.join(", ")));
                 }
             }
@@ -296,6 +363,18 @@ impl Bind {
         }
         if self.input.is_some_and(|[a, b]| a == b) {
             return Err("`input` must be two different values".into());
+        }
+        if self.is_color() {
+            if self.colors.is_empty() || !self.map.is_empty() {
+                return Err("a color binding maps values to colors with `colors`".into());
+            }
+            for c in self.colors.values() {
+                if parse_rgba(c).is_none() && !is_color_ref(c) {
+                    return Err(format!("invalid color {c:?}"));
+                }
+            }
+        } else if !self.colors.is_empty() {
+            return Err("`colors` needs param = \"color\" or \"color.<name>\"".into());
         }
         if !(200..=3_600_000).contains(&self.interval_ms) {
             return Err("interval_ms must be 200-3600000".into());
@@ -882,6 +961,33 @@ mod tests {
     }
 
     #[test]
+    fn scripting_and_extension_grants() {
+        let c = parse("[scripting]\nbudget_ms = 20\n\n[extensions.glow]\ngrant = [\"visual\", \"network\"]\nhosts = [\"api.example.com\"]\nsettings = { pattern = \"FAIL\" }\n\n[extensions.noisy]\ndisabled = true\n").unwrap();
+        assert_eq!(c.scripting.budget_ms, 20);
+        assert!(c.scripting.enabled);
+        let g = &c.extensions["glow"];
+        assert_eq!(g.grant.as_deref(), Some(&["visual".to_owned(), "network".to_owned()][..]));
+        assert_eq!(g.settings["pattern"].as_str(), Some("FAIL"));
+        assert!(c.extensions["noisy"].disabled);
+        assert!(parse("[extensions.x]\nallow = [\"all\"]\n").is_err(), "unknown keys rejected");
+    }
+
+    #[test]
+    fn color_bindings_and_event_sources() {
+        let c = parse("[[bind]]\nsource = \"terminal.last_exit_code\"\nlayer = \"base\"\nparam = \"color\"\ncolors = { \"0\" = \"#f5a6d0\", default = \"theme.bright.1\" }\n").unwrap();
+        assert!(c.bind[0].is_color());
+        for bad in [
+            "param = \"color\"\n",
+            "param = \"color\"\ncolors = { \"0\" = \"pink\" }\n",
+            "param = \"glow\"\ncolors = { \"0\" = \"#ffffff\" }\n",
+        ] {
+            let e = parse(&format!("[[bind]]\nsource = \"session.root\"\nlayer = \"a\"\n{bad}"))
+                .unwrap_err();
+            assert!(e.to_string().contains("bind 1"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
     fn documented_default_file_matches_built_in_defaults() {
         assert_eq!(parse(DEFAULT_TOML).unwrap(), Config::default());
     }
@@ -1287,7 +1393,7 @@ pub fn parse_rgba(s: &str) -> Option<[f32; 4]> {
 }
 
 impl Background {
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         let color = |c: &str| {
             parse_rgba(c).ok_or_else(|| {
                 format!("invalid color {c:?}, expected \"#rrggbb\" or \"#rrggbbaa\"")

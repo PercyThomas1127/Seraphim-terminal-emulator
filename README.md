@@ -4,20 +4,18 @@ The programmable terminal environment of Divinity OS.
 
 > *A terminal that doesn't just let you customize its appearance. It lets you program its personality.*
 
-This repository is at the end of **Phase I (Functional Foundation)**: the
-Terminal Core, PTY layer, Session Manager, Event Bus, GPU renderer, window,
-configuration and conformance suite are implemented and tested. The one
-remaining Phase I item is measuring latency, startup and Wayland scaling on
-real hardware. See [`docs/phase-1-plan.md`](docs/phase-1-plan.md) for
-what's done and what's left, and [`docs/adr/`](docs/adr/) for the
-architecture decisions that settle spec §18.
+Seraphim is a GPU-rendered terminal (Rust, wgpu) with layered, animated
+backgrounds, inline images, and Lua extensions that react to what happens
+in the terminal. See [`docs/adr/`](docs/adr/) for the architecture
+decisions that settle spec §18.
 
 ![Seraphim renderer output](docs/images/renderer.png)
 
 ## Status
 
-Phases I (functional terminal) and II (visual identity) of the
-specification are complete; Phase III (Lua scripting) is next. See
+Phases I (functional terminal), II (visual identity) and III
+(programmability) of the specification are complete; Phase IV (tabs,
+splits, panels, settings UI) is next. See
 [docs/progress.md](docs/progress.md) for where every part of the spec
 stands.
 
@@ -31,9 +29,12 @@ crates/
   seraphim-session/    Sessions: PTY <-> Terminal I/O thread, event publishing, root detection
   seraphim-render/     GPU text renderer (wgpu): fonts + fallback, glyph atlas, one instanced draw
   seraphim-config/     TOML configuration loading and validation
+  seraphim-visual/     Visual engine: layered backgrounds, shaders, animation, transitions
+  seraphim-script/     Lua 5.4 extensions: sandbox, script thread, API, permissions
   seraphim-conformance/ Differential testing against xterm (golden screens, vttest, triage)
   seraphim/            Application: window (winit + wgpu), plus headless `run` / `replay` tools
 shell-integration/     Bash/Zsh/Fish scripts emitting OSC 133 + OSC 7
+examples/              Example extensions
 docs/                  ADRs and phase plans
 ```
 
@@ -223,6 +224,36 @@ items = [
 
 A `[[menu]]` titled like a built-in one appends to it (`replace = true`
 replaces it).
+
+### Extensions (Lua)
+
+![An extension flashing the window on ERROR, another one's notice](docs/images/scripting.png)
+
+Extensions are Lua 5.4 programs that react to events (output, commands,
+prompts, focus, metrics, Gabriel installs…) and change layers, colors and
+animations, bind properties to live values, add menu commands and
+shortcuts, and more, within the permissions you grant them. Put a folder
+with an `extension.toml` and `init.lua` in `~/.config/seraphim/extensions/`,
+or a single file in `~/.config/seraphim/scripts/`:
+
+```lua
+-- scripts/fail.lua: tint the window red after a failed command.
+visual.add_layer({ id = "fail", kind = "solid", color = "#ff2255", opacity = 0 })
+seraphim.on("command.completed", function(event)
+  local failed = (event.exit_code or 0) ~= 0
+  visual.set_opacity("fail", failed and 0.25 or 0, { duration = 400 })
+end)
+```
+
+Each extension runs in its own sandbox on a script thread. A handler that
+runs too long is stopped, and one that keeps doing it is disabled; the
+terminal never waits for a script. Extensions get only the permissions they
+ask for *and* you grant (`[extensions.NAME]` in the config). The defaults
+only change what Seraphim shows. A root shell never gives an extension more
+rights, and nothing can type into a root session. See
+**[docs/scripting.md](docs/scripting.md)** for the guide and API reference,
+and [`examples/`](examples/) for complete extensions: an error flash,
+Gabriel install effects, exit-code colors, CPU-driven intensity, a clock.
 
 ### Images
 

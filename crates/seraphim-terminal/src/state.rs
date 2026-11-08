@@ -189,6 +189,9 @@ pub(crate) struct State {
     pub hyperlinks: Vec<Hyperlink>,
     pub events: Vec<TerminalEvent>,
     pub responses: Vec<u8>,
+    /// Printed text (with line feeds and tabs) since the last take, when
+    /// someone wants it (`terminal.output` / `command.output` events).
+    pub text: Option<String>,
     damage: Vec<bool>,
     last_printed: Option<char>,
     /// Start column of the immediately preceding printed character, if it
@@ -245,6 +248,7 @@ impl State {
             cwd: None,
             hyperlinks: Vec::new(),
             events: Vec::new(),
+            text: None,
             responses: Vec::new(),
             damage: vec![true; rows],
             last_printed: None,
@@ -1377,6 +1381,9 @@ fn arg(params: &[u16], i: usize, default: u16) -> u16 {
 impl Perform for State {
     #[inline(always)]
     fn print(&mut self, c: char) {
+        if let Some(t) = &mut self.text {
+            t.push(c);
+        }
         // Fast path: printable ASCII in the ASCII charset, no insert mode,
         // no pending wrap, onto a narrow cell. This is nearly all output.
         if self.fast_print && matches!(c, ' '..='~') && !self.cursor.pending_wrap {
@@ -1522,8 +1529,16 @@ impl State {
                 self.cursor.col = self.cursor.col.saturating_sub(1);
                 self.cursor.pending_wrap = false;
             }
-            0x09 => self.tab_forward(1),
+            0x09 => {
+                if let Some(t) = &mut self.text {
+                    t.push('\t');
+                }
+                self.tab_forward(1)
+            }
             0x0A..=0x0C => {
+                if let Some(t) = &mut self.text {
+                    t.push('\n');
+                }
                 self.linefeed();
                 if self.modes.linefeed_newline {
                     self.carriage_return();

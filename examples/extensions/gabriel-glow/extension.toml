@@ -1,0 +1,5 @@
+name = "gabriel-glow"
+version = "1.0.0"
+description = "React to Gabriel package installs (spec §8.3). Made for the heavens preset."
+api = 1
+permissions = ["visual", "interface"]

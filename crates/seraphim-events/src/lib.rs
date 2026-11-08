@@ -46,6 +46,9 @@ pub enum Pattern {
     /// `prefix.*` — any event whose name starts with `prefix.`.
     Prefix(String),
     Exact(String),
+    /// Any of these (one subscription for a set of patterns, so an event
+    /// matching several of them arrives once).
+    Any(Vec<Pattern>),
 }
 
 impl Pattern {
@@ -64,6 +67,7 @@ impl Pattern {
             Pattern::All => true,
             Pattern::Prefix(p) => name.starts_with(p.as_str()),
             Pattern::Exact(e) => e == name,
+            Pattern::Any(ps) => ps.iter().any(|p| p.matches(name)),
         }
     }
 }
@@ -144,6 +148,12 @@ impl EventBus {
         delivered
     }
 
+    /// Whether anyone listens for `name`: lets publishers skip building
+    /// costly payloads (output text) nobody asked for.
+    pub fn wants(&self, name: &str) -> bool {
+        self.inner.subs.read().unwrap().iter().any(|s| s.pattern.matches(name))
+    }
+
     pub fn subscriber_count(&self) -> usize {
         self.inner.subs.read().unwrap().len()
     }
@@ -174,6 +184,11 @@ impl Publisher {
     pub fn source(&self) -> &str {
         &self.source
     }
+
+    /// See [`EventBus::wants`].
+    pub fn wants(&self, name: &str) -> bool {
+        self.bus.wants(name)
+    }
 }
 
 /// Receiving end of a subscription. Unsubscribes on drop.
@@ -202,9 +217,31 @@ impl Subscription {
         self.rx.try_iter().collect()
     }
 
+    /// A handle that changes this subscription's pattern from any thread.
+    pub fn pattern_handle(&self) -> PatternHandle {
+        PatternHandle { id: self.id, bus: self.bus.clone() }
+    }
+
     /// Events discarded because this subscriber's queue was full.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Changes a subscription's pattern (see [`Subscription::pattern_handle`]).
+#[derive(Clone)]
+pub struct PatternHandle {
+    id: u64,
+    bus: Weak<Inner>,
+}
+
+impl PatternHandle {
+    pub fn set(&self, pattern: Pattern) {
+        if let Some(inner) = self.bus.upgrade() {
+            if let Some(s) = inner.subs.write().unwrap().iter_mut().find(|s| s.id == self.id) {
+                s.pattern = pattern;
+            }
+        }
     }
 }
 
@@ -273,6 +310,21 @@ mod tests {
         drop(s);
         assert_eq!(bus.subscriber_count(), 0);
         assert_eq!(bus.publisher("x").publish("e", None, Value::Null), 0);
+    }
+
+    #[test]
+    fn any_patterns_and_retargeting() {
+        let bus = EventBus::new();
+        let s = bus.subscribe(Pattern::Any(vec!["a.*".into(), "a.b".into()]), 8);
+        let p = bus.publisher("t");
+        p.publish("a.b", None, Value::Null);
+        assert_eq!(s.drain().len(), 1, "matches two patterns, delivered once");
+        assert!(bus.wants("a.c") && !bus.wants("b"));
+        s.pattern_handle().set(Pattern::parse("b"));
+        p.publish("a.b", None, Value::Null);
+        p.publish("b", None, Value::Null);
+        assert_eq!(s.drain().len(), 1);
+        assert!(!bus.wants("a.c"));
     }
 
     #[test]

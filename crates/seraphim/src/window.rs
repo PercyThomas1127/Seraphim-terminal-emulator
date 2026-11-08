@@ -77,6 +77,28 @@ pub struct WindowOptions {
     pub cursor: seraphim_config::CursorFx,
     /// How scenes change (or why the configured transition failed).
     pub transition: Result<seraphim_visual::TransitionStyle, String>,
+    /// `[scripting]` and `[extensions.*]`.
+    pub scripting: seraphim_config::Scripting,
+    pub extensions: std::collections::BTreeMap<String, seraphim_config::ExtensionConfig>,
+    /// `--extension` paths.
+    pub cli_extensions: Vec<std::path::PathBuf>,
+}
+
+impl WindowOptions {
+    /// What the scripting runtime is started from.
+    fn script_sources(&self) -> crate::scripting::Sources {
+        crate::scripting::Sources {
+            scripting: self.scripting.clone(),
+            extensions: self.extensions.clone(),
+            config_dir: self
+                .config_path
+                .as_deref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf()),
+            cli: self.cli_extensions.clone(),
+            live_reload: self.live_reload,
+        }
+    }
 }
 
 impl WindowOptions {
@@ -128,6 +150,9 @@ impl Default for WindowOptions {
             notice: None,
             cursor: Default::default(),
             transition: Ok(Default::default()),
+            scripting: Default::default(),
+            extensions: Default::default(),
+            cli_extensions: Vec::new(),
         }
     }
 }
@@ -145,6 +170,8 @@ enum UserEvent {
     Wake,
     /// A watched configuration file changed on disk.
     ConfigChanged(Vec<std::path::PathBuf>),
+    /// Scripts queued commands.
+    Script,
 }
 
 /// How long a notice stays in the corner of the window.
@@ -302,6 +329,10 @@ struct Active {
     /// When the background next changes (animated images); cleared by
     /// each redraw.
     visual_due: Option<Instant>,
+    /// Lua extensions and what they registered.
+    scripts: crate::scripting::ScriptHost,
+    /// `[[bind]]` from the configuration (script bindings are added).
+    config_binds: Vec<crate::bindings::Bind>,
 }
 
 impl Active {
@@ -483,7 +514,21 @@ impl App {
             bindings,
             occluded: false,
             visual_due: None,
+            scripts: crate::scripting::ScriptHost::default(),
+            config_binds: o.binds.clone(),
         };
+        let proxy = self.proxy.clone();
+        let wake: seraphim_script::Waker = Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::Script);
+        });
+        let (warnings, _) =
+            active.scripts.configure(o.script_sources(), &active.bus, wake, &mut active.visual);
+        for w in &warnings {
+            eprintln!("seraphim: {w}");
+        }
+        if let Some(w) = warnings.into_iter().next() {
+            active.notify(w);
+        }
         active.rebuild_menu();
         Ok(active)
     }
@@ -630,6 +675,7 @@ impl App {
         o.cli_font_family = self.options.cli_font_family.clone();
         o.cli_font_size = self.options.cli_font_size;
         o.cli_preset = self.options.cli_preset.clone();
+        o.cli_extensions = self.options.cli_extensions.clone();
         if o.cli_font_family.is_some() {
             o.font_family = o.cli_font_family.clone();
         }
@@ -686,11 +732,29 @@ impl App {
         }
         a.visual_cfg = o.visual.clone();
         a.update_pause();
+        if rebuilt {
+            a.scripts.reapply_layers(&mut a.visual);
+        }
+        let proxy = self.proxy.clone();
+        let wake: seraphim_script::Waker = Arc::new(move || {
+            let _ = proxy.send_event(UserEvent::Script);
+        });
+        if request_kind == Request::Reload {
+            a.scripts.invalidate();
+        }
+        let (script_warnings, fx) =
+            a.scripts.configure(o.script_sources(), &a.bus, wake, &mut a.visual);
+        for w in &script_warnings {
+            eprintln!("seraphim: {w}");
+        }
         a.interactions.replace(o.rules.clone(), &a.bus, &mut a.visual);
-        a.bindings.replace(o.binds.clone(), &a.bus);
+        a.config_binds = o.binds.clone();
+        let all: Vec<_> = a.config_binds.iter().chain(a.scripts.binds()).cloned().collect();
+        a.bindings.replace(all, &a.bus);
         if rebuilt {
             a.bindings.reapply(&mut a.visual);
         }
+        a.script_effects(fx);
         let scale = a.scale;
         self.options = o;
         let _ = scale;
@@ -705,7 +769,13 @@ impl App {
             Some(a.session.id()),
             seraphim_events::json!({ "profile": self.options.profile }),
         );
-        let msg = match (&request_kind, layer_error.or(transition_error).or(first_warning)) {
+        let msg = match (
+            &request_kind,
+            layer_error
+                .or(transition_error)
+                .or(first_warning)
+                .or(script_warnings.into_iter().next()),
+        ) {
             (_, Some(problem)) => problem,
             (Request::Files(_), None) => "Configuration reloaded".to_owned(),
             (Request::Reload, None) => "Configuration reloaded".to_owned(),
@@ -954,6 +1024,61 @@ impl Active {
             fullscreen: self.window.fullscreen().is_some(),
         };
         self.menu.menus = menu::build(menus, &ctx);
+        // Commands extensions registered, in their own menu before Help.
+        if !self.scripts.commands.is_empty() {
+            let items = self
+                .scripts
+                .commands
+                .iter()
+                .map(|(ext, id, title)| menu::Item::Entry {
+                    label: title.clone(),
+                    key: None,
+                    shortcut: self.scripts.shortcut_for(ext, id),
+                    command: MenuCommand::Script { ext: ext.clone(), id: id.clone() },
+                    checked: false,
+                })
+                .collect();
+            let m = menu::Menu { title: "Extensions".into(), key: Some(1), items };
+            let at = self
+                .menu
+                .menus
+                .iter()
+                .position(|m| m.title == "Help")
+                .unwrap_or(self.menu.menus.len());
+            self.menu.menus.insert(at, m);
+        }
+    }
+
+    /// Carry out what scripts asked for.
+    fn script_effects(&mut self, fx: Vec<crate::scripting::Effect>) {
+        use crate::scripting::Effect;
+        let mut binds = false;
+        let mut menu = false;
+        for e in fx {
+            match e {
+                Effect::Notify(m) => self.notify(m),
+                Effect::Send(text) => self.write(text.as_bytes()),
+                Effect::Action(name) => match Action::from_name(&name) {
+                    Some(a) => self.run_action(a),
+                    None => self.notify(format!("Unknown action {name:?}")),
+                },
+                Effect::Profile(name) => self.pending = Some(Request::Profile(name)),
+                Effect::MenuChanged => menu = true,
+                Effect::BindsChanged => binds = true,
+                Effect::Redraw => self.window.request_redraw(),
+            }
+        }
+        if binds {
+            let all: Vec<_> =
+                self.config_binds.iter().chain(self.scripts.binds()).cloned().collect();
+            self.bindings.replace(all, &self.bus);
+            self.bindings.reapply(&mut self.visual);
+            self.window.request_redraw();
+        }
+        if menu {
+            self.rebuild_menu();
+            self.window.request_redraw();
+        }
     }
 
     /// Tap Alt: open the first menu, or close an open one.
@@ -964,6 +1089,11 @@ impl Active {
             self.rebuild_menu();
             self.menu.open_menu(0);
         }
+        self.bus.publisher("interface").publish(
+            "interface.menu.toggled",
+            Some(self.session.id()),
+            seraphim_events::json!({ "open": self.menu.engaged() }),
+        );
         self.window.request_redraw();
     }
 
@@ -974,6 +1104,7 @@ impl Active {
             MenuCommand::Action(a) => self.run_action(a),
             MenuCommand::Send(text) => self.write(text.as_bytes()),
             MenuCommand::Profile(name) => self.pending = Some(Request::Profile(name)),
+            MenuCommand::Script { ext, id } => self.scripts.invoke(&ext, &id),
         }
     }
 
@@ -1305,6 +1436,13 @@ impl Active {
             WKey::Named(NamedKey::F11) => Some(ShortcutKey::F(11)),
             _ => None,
         };
+        // Extension shortcuts come first: the user installed them.
+        if let Some(chord) = chord_of(event, m) {
+            if let Some((ext, id)) = self.scripts.key(&chord) {
+                self.scripts.invoke(&ext, &id);
+                return;
+            }
+        }
         let alt_screen = self.session.terminal().is_alternate_screen();
         if let Some(action) = sk.and_then(|k| actions::shortcut(k, m, alt_screen)) {
             self.run_action(action);
@@ -1426,6 +1564,17 @@ impl ApplicationHandler<UserEvent> for App {
             self.handle(Request::Files(files), event_loop);
             return;
         }
+        if let UserEvent::Script = event {
+            if let Some(a) = &mut self.active {
+                let theme = a.renderer.theme().clone();
+                let fx = a.scripts.apply(&mut a.visual, &theme);
+                a.script_effects(fx);
+                if let Some(r) = a.pending.take() {
+                    self.handle(r, event_loop);
+                }
+            }
+            return;
+        }
         let allow_read = self.options.allow_clipboard_read;
         let Some(a) = &mut self.active else { return };
         if let Some(exit) = a.session.exit_info() {
@@ -1466,6 +1615,13 @@ impl ApplicationHandler<UserEvent> for App {
                 let h = size.height.saturating_sub(a.top_inset()).max(1);
                 let (cols, rows) = a.renderer.grid_size(size.width, h, pad);
                 let _ = a.session.resize(cols, rows);
+                a.bus.publisher("interface").publish(
+                    "interface.resized",
+                    Some(a.session.id()),
+                    seraphim_events::json!({
+                        "cols": cols, "rows": rows, "width": size.width, "height": size.height,
+                    }),
+                );
                 a.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -1491,6 +1647,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 a.focused = focused;
+                a.bus.publisher("interface").publish(
+                    "interface.focus.changed",
+                    Some(a.session.id()),
+                    seraphim_events::json!({ "focused": focused }),
+                );
                 // Alt+Tab: the release happens in another window.
                 a.alt_tap = false;
                 if !focused && a.menu.engaged() {
@@ -1594,6 +1755,11 @@ impl ApplicationHandler<UserEvent> for App {
             } else {
                 wake = Some(wake.map_or(until, |w| w.min(until)));
             }
+        }
+
+        // Extensions that read the terminal see it at most 50 ms late.
+        if let Some(t) = a.scripts.refresh_snapshot(&a.session, now) {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
         }
 
         // Bindings: metrics on their intervals, latest event values.
@@ -1723,6 +1889,37 @@ fn draw(a: &mut Active) {
 }
 
 /// Translate a winit key event into a protocol-neutral [`KeyInput`].
+/// The shortcut a key press makes, for extension shortcuts.
+fn chord_of(event: &KeyEvent, m: actions::Modifiers) -> Option<crate::scripting::Chord> {
+    let key = match &event.logical_key {
+        WKey::Character(s) => s.to_lowercase(),
+        WKey::Named(n) => match n {
+            NamedKey::Enter => "enter".into(),
+            NamedKey::Space => "space".into(),
+            NamedKey::Tab => "tab".into(),
+            NamedKey::Escape => "escape".into(),
+            NamedKey::Backspace => "backspace".into(),
+            NamedKey::ArrowUp => "up".into(),
+            NamedKey::ArrowDown => "down".into(),
+            NamedKey::ArrowLeft => "left".into(),
+            NamedKey::ArrowRight => "right".into(),
+            NamedKey::Home => "home".into(),
+            NamedKey::End => "end".into(),
+            NamedKey::PageUp => "pageup".into(),
+            NamedKey::PageDown => "pagedown".into(),
+            NamedKey::Insert => "insert".into(),
+            NamedKey::Delete => "delete".into(),
+            other => {
+                let name = format!("{other:?}");
+                let n = name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok())?;
+                format!("f{n}")
+            }
+        },
+        _ => return None,
+    };
+    Some(crate::scripting::Chord { ctrl: m.ctrl, shift: m.shift, alt: m.alt, key })
+}
+
 fn key_input(event: &KeyEvent, mods: Mods) -> Option<KeyInput<'_>> {
     use winit::keyboard::{KeyCode, PhysicalKey};
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;

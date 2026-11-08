@@ -1,6 +1,6 @@
 # ADR 0005 — Scripting architecture
 
-**Status:** Proposed  **Spec:** §8, §18.1
+**Status:** Accepted for Lua, as built in [ADR 0009](0009-scripting-runtime.md); WebAssembly still proposed  **Spec:** §8, §18.1
 
 ## Recommendation
 
