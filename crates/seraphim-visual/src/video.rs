@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 /// Videos wider or taller than this are scaled down while decoding.
@@ -126,10 +126,7 @@ impl Stream {
         let mut latest = None;
         while self.shown < due {
             let next = if wait {
-                match self.frames.recv_timeout(Duration::from_secs(5)) {
-                    Ok(f) => Some(f),
-                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
-                }
+                self.frames.recv_timeout(Duration::from_secs(5)).ok()
             } else {
                 self.frames.try_recv().ok()
             };

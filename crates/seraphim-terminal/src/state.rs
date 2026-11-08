@@ -374,11 +374,14 @@ impl State {
         let history = self.scrollback.len();
         let mut all: Vec<Row> = self.scrollback.drain(..).collect();
         all.extend(self.primary.take_lines());
-        let anchors = [
+        let mut anchors = vec![
             // A pending wrap means the cursor is logically past the last cell.
             reflow::Anchor { row: history + pcur_row, col: pcur_col + pending as usize },
             reflow::Anchor { row: history, col: 0 },
         ];
+        // Primary-screen images follow their text through the re-wrap.
+        let images = self.graphics.primary_anchors(history, all.len());
+        anchors.extend(images.iter().map(|&(_, row, col)| reflow::Anchor { row, col }));
         let (mut lines, mapped) = reflow::reflow(all, cols, &anchors);
         let (crow, ccol) = mapped[0];
         let old_top = mapped[1].0;
@@ -406,9 +409,16 @@ impl State {
         while screen.len() < rows {
             screen.push(Row::new(cols, &Attrs::default()));
         }
+        // New absolute lines: screen row (index - top) on the same base.
+        for (k, &(i, _, _)) in images.iter().enumerate() {
+            let (row, col) = mapped[2 + k];
+            self.graphics.move_primary(i, row as i64 - top as i64, col.min(cols - 1));
+        }
         let keep = lines.len().saturating_sub(self.scrollback_limit);
         self.scrollback.extend(lines.drain(keep..));
         self.primary.set_lines(cols, screen);
+        // Images whose lines fell out of the (shorter) history go too.
+        self.graphics.scroll(false, 0, self.scrollback.len());
         let (new_row, new_col) = (crow - top, ccol.min(cols - 1));
         // The alternate screen is not reflowed: full-screen programs redraw.
         self.alternate.resize(cols, rows, (self.cursor.row + 1).saturating_sub(rows));

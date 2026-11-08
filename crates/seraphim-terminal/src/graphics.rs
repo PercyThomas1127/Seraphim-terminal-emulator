@@ -11,9 +11,9 @@
 //! RGB, RGBA and PNG; zlib compression (`o=z`); chunked transfers (`m=1`);
 //! direct data and files (`t=d`, `t=f`, `t=t`); source rectangles,
 //! cell offsets, sizes in cells, z-index and `C=1`. Not supported yet:
-//! composing frames (`a=c`), answered with an error. Animation frames and
-//! playback (`a=f`, `a=a`), shared memory (`t=s`) and Unicode placeholders
-//! (`U=1`, see [`PLACEHOLDER`]) are supported.
+//! nothing of the current spec. Animation (`a=f`, `a=a`, `a=c`), shared
+//! memory (`t=s`) and Unicode placeholders (`U=1`, see [`PLACEHOLDER`])
+//! are included.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -438,6 +438,35 @@ impl Graphics {
         self.changed();
     }
 
+    /// Primary-screen placements as (index, row, col) in the reflow input
+    /// (history first, then the screen), for those still in it.
+    pub(crate) fn primary_anchors(
+        &self,
+        history: usize,
+        total: usize,
+    ) -> Vec<(usize, usize, usize)> {
+        let base = self.scrolled[0] - history as i64;
+        self.placements
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.alt && !p.virtual_)
+            .filter_map(|(i, p)| {
+                let row = p.line - base;
+                (row >= 0 && (row as usize) < total).then_some((i, row as usize, p.col))
+            })
+            .collect()
+    }
+
+    /// After a reflow: placement `i` now starts on screen row `row`
+    /// (negative: in history) at column `col`.
+    pub(crate) fn move_primary(&mut self, i: usize, row: i64, col: usize) {
+        if let Some(p) = self.placements.get_mut(i) {
+            p.line = self.scrolled[0] + row;
+            p.col = col;
+            self.generation += 1;
+        }
+    }
+
     /// Rows `top..=bottom` of a screen scrolled by `delta` lines (negative:
     /// up). Images entirely inside the region move with it; one pushed out
     /// of the region is removed. Images not inside it stay put.
@@ -735,7 +764,7 @@ impl Graphics {
                 self.finish(l.cmd, l.data, l.failed, ctx)
             }
             b'a' => self.control(&cmd),
-            b'c' => respond(&cmd, "EINVAL:composing frames (a=c) is not supported"),
+            b'c' => self.compose(&cmd),
             _ => respond(&cmd, "EINVAL:unknown action"),
         }
     }
@@ -818,18 +847,7 @@ impl Graphics {
                 }
                 let s = &data[(y * w as usize + x) * 4..][..4];
                 let d = &mut canvas[(ty * iw + tx) * 4..][..4];
-                if replace || s[3] == 255 {
-                    d.copy_from_slice(s);
-                } else if s[3] > 0 {
-                    // Straight-alpha "over".
-                    let (sa, da) = (s[3] as f32 / 255.0, d[3] as f32 / 255.0);
-                    let oa = sa + da * (1.0 - sa);
-                    for c in 0..3 {
-                        let v = (s[c] as f32 * sa + d[c] as f32 * da * (1.0 - sa)) / oa.max(1e-6);
-                        d[c] = v.round() as u8;
-                    }
-                    d[3] = (oa * 255.0).round() as u8;
-                }
+                blend(d, s, replace);
             }
         }
         let gap = if cmd.z > 0 {
@@ -855,6 +873,49 @@ impl Graphics {
             img.anim.gaps[index] = gap;
         }
         self.enforce_quota(id);
+        self.changed();
+        respond(cmd, "OK")
+    }
+
+    /// `a=c`: copy a `w x h` rectangle at `x, y` of frame `r` onto frame
+    /// `c` at `X, Y`, alpha-blended (or replacing with `C=1`).
+    fn compose(&mut self, cmd: &Cmd) -> Effect {
+        let Some(id) = self.resolve(cmd) else { return respond(cmd, "ENOENT:no such image") };
+        let key = self.next_key;
+        self.next_key += 1;
+        let img = self.images.get_mut(&id).expect("resolved");
+        let n = img.frame_count();
+        let (Some(src), Some(dst)) = (
+            (cmd.rows as usize).checked_sub(1).filter(|&r| r < n),
+            (cmd.cols as usize).checked_sub(1).filter(|&c| c < n),
+        ) else {
+            return respond(cmd, "ENOENT:no such frame");
+        };
+        let (iw, ih) = (img.width, img.height);
+        let (x, y) = (cmd.x.min(iw), cmd.y.min(ih));
+        let w = if cmd.w == 0 { iw - x } else { cmd.w.min(iw - x) };
+        let h = if cmd.h == 0 { ih - y } else { cmd.h.min(ih - y) };
+        let (dx, dy) = (cmd.off_x, cmd.off_y);
+        if dx + w > iw || dy + h > ih {
+            return respond(cmd, "EINVAL:rectangle out of bounds");
+        }
+        let from = img.frame(src).0.clone();
+        let mut canvas = img.frame(dst).0.as_ref().clone();
+        let iw = iw as usize;
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let s = &from[((y as usize + row) * iw + x as usize + col) * 4..][..4];
+                let d = &mut canvas[((dy as usize + row) * iw + dx as usize + col) * 4..][..4];
+                blend(d, s, cmd.no_move);
+            }
+        }
+        match dst {
+            0 => {
+                img.rgba = Arc::new(canvas);
+                img.key = key;
+            }
+            k => img.anim.frames[k - 1] = Frame { rgba: Arc::new(canvas), key },
+        }
         self.changed();
         respond(cmd, "OK")
     }
@@ -1046,6 +1107,21 @@ impl Loading {
             Some(bytes) => self.data.extend(bytes),
             None => self.failed = Some("EINVAL:bad base64".into()),
         }
+    }
+}
+
+/// Straight-alpha "over" of pixel `s` onto `d` (or a plain copy).
+fn blend(d: &mut [u8], s: &[u8], replace: bool) {
+    if replace || s[3] == 255 {
+        d.copy_from_slice(s);
+    } else if s[3] > 0 {
+        let (sa, da) = (s[3] as f32 / 255.0, d[3] as f32 / 255.0);
+        let oa = sa + da * (1.0 - sa);
+        for c in 0..3 {
+            let v = (s[c] as f32 * sa + d[c] as f32 * da * (1.0 - sa)) / oa.max(1e-6);
+            d[c] = v.round() as u8;
+        }
+        d[3] = (oa * 255.0).round() as u8;
     }
 }
 

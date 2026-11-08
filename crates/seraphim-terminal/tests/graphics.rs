@@ -366,5 +366,29 @@ fn animation_frames_and_playback() {
     t.advance(&apc("a=f,i=404,f=32,s=1,v=1", &[0; 4]));
     assert!(reply(&mut t).contains("ENOENT"));
     t.advance(b"\x1b_Ga=c,i=9\x1b\\");
-    assert!(reply(&mut t).contains("EINVAL"));
+    assert!(reply(&mut t).contains("ENOENT"), "frames r and c are required");
+    // Copy frame 2's (blue) top-left pixel onto frame 1 at (1, 1).
+    t.advance(b"\x1b_Ga=c,i=9,r=2,c=1,w=1,h=1,X=1,Y=1,C=1\x1b\\");
+    assert_eq!(reply(&mut t), "\x1b_Gi=9;OK\x1b\\");
+    let f1 = t.graphics().image(9).unwrap().frame(0).0.clone();
+    assert_eq!(&f1[12..16], &[0, 0, 255, 255], "pixel (1,1) is blue now");
+    assert_eq!(&f1[..4], &[255, 0, 0, 255], "the rest untouched");
+    t.advance(b"\x1b_Ga=c,i=9,r=2,c=1,w=2,h=2,X=1\x1b\\");
+    assert!(reply(&mut t).contains("out of bounds"));
+}
+
+#[test]
+fn images_follow_their_text_through_reflow() {
+    let mut t = Terminal::with_scrollback(20, 6, 100);
+    t.set_cell_pixel_size(10.0, 20.0);
+    // A 20-column line that wraps when the window narrows, then an image.
+    t.advance(b"aaaaaaaaaaaaaaaaaaaa\r\n");
+    t.advance(b"bbbb");
+    t.advance(&apc("a=T,f=32,s=10,v=20,i=1,C=1,q=2", &rgba(10, 20, [1, 1, 1, 255])));
+    assert_eq!(t.visible_images()[0].row, 1);
+    t.resize(10, 6);
+    let v = t.visible_images();
+    assert_eq!((v[0].row, v[0].placement.col), (2, 4), "pushed down by the re-wrapped line above");
+    t.resize(20, 6);
+    assert_eq!(t.visible_images()[0].row, 1, "and back");
 }

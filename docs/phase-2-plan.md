@@ -26,14 +26,13 @@
 | Offscreen compositing (only when needed): backdrop blur layers (`kind = "blur"`, separable Gaussian, downsampled for large radii) and styled scene transitions (spec §6.3): fade, slide, wipe, dissolve, zoom, blur, fade-through, user WGSL `fn transition(uv, p)` | `seraphim-visual/src/compose.rs` |
 | Animated gradients (`spin`, `flow`); frame pacing (animated images wake the loop at their frame boundaries, not at the fps cap) | `seraphim-visual` |
 | Video backgrounds (`kind = "video"`): decoded by an ffmpeg subprocess into a bounded frame queue, paced by the engine clock, looped, graded like images; ffmpeg stops with Seraphim (PDEATHSIG on Linux) | `seraphim-visual/src/video.rs` |
+| Kitty `a=c` (compose frames); images follow their text through resize reflow | `graphics.rs`, `state.rs` |
 | Named shader colors (`palette`, `color(C_name)`), theme-relative | `seraphim-visual` |
 
 See ADR 0007 for the design and measurements, and ADR 0008 for presets and rules.
 
 ## Next
 
-1. **Graphics leftovers:** composing frames (`a=c`); keeping images
-   attached to their text when a resize reflows lines.
 2. **More background features:** video; blur of non-image layers (a
    GPU post-process); animated gradients; frame pacing for animated
    images (wake at the next frame instead of drawing at max_fps).
