@@ -25,6 +25,7 @@ pub struct Config {
     pub shell: Shell,
     pub clipboard: Clipboard,
     pub colors: Colors,
+    pub background: Background,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -84,6 +85,53 @@ pub struct Colors {
     pub normal: [Rgb; 8],
     #[serde(deserialize_with = "colors8")]
     pub bright: [Rgb; 8],
+}
+
+/// The animated background layer drawn behind the text.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Background {
+    pub style: BackgroundStyle,
+    /// Strength of the effects over `colors.background`, 0..1.
+    pub intensity: f32,
+    /// Animation speed; 0 draws a still image and stops redrawing.
+    pub speed: f32,
+    /// Frame rate cap while animating.
+    pub fps: u32,
+    /// Three scene colors; when unset, taken from the palette.
+    #[serde(deserialize_with = "opt_colors3")]
+    pub colors: Option<[Rgb; 3]>,
+    /// The two colors the scene turns to in a root session.
+    #[serde(deserialize_with = "colors2")]
+    pub privileged_colors: [Rgb; 2],
+    /// Color of the wave shown when a package is installed.
+    #[serde(deserialize_with = "color")]
+    pub install_color: Rgb,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundStyle {
+    #[default]
+    None,
+    Aurora,
+    Nebula,
+    Starfield,
+}
+
+impl Default for Background {
+    fn default() -> Self {
+        let h = |s: &str| parse_hex(s).expect("valid built-in color");
+        Background {
+            style: BackgroundStyle::None,
+            intensity: 0.6,
+            speed: 1.0,
+            fps: 30,
+            colors: None,
+            privileged_colors: [h("#ff3b4e"), h("#ff9a3c")],
+            install_color: h("#ffd98a"),
+        }
+    }
 }
 
 impl Default for Font {
@@ -195,6 +243,19 @@ impl Config {
         if self.terminal.scrollback > 1_000_000 {
             return Err("terminal.scrollback must be at most 1000000 lines".into());
         }
+        let b = &self.background;
+        if !(0.0..=1.0).contains(&b.intensity) {
+            return Err(format!(
+                "background.intensity must be between 0 and 1 (got {})",
+                b.intensity
+            ));
+        }
+        if !(0.0..=10.0).contains(&b.speed) {
+            return Err(format!("background.speed must be between 0 and 10 (got {})", b.speed));
+        }
+        if !(1..=240).contains(&b.fps) {
+            return Err(format!("background.fps must be between 1 and 240 (got {})", b.fps));
+        }
         if self.shell.program.as_deref().is_some_and(|s| s.trim().is_empty()) {
             return Err("shell.program must not be empty (remove it to use $SHELL)".into());
         }
@@ -219,6 +280,28 @@ fn color<'de, D: Deserializer<'de>>(d: D) -> Result<Rgb, D::Error> {
 
 fn opt_color<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Rgb>, D::Error> {
     color(d).map(Some)
+}
+
+fn opt_colors3<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[Rgb; 3]>, D::Error> {
+    colors_n::<D, 3>(d).map(Some)
+}
+
+fn colors2<'de, D: Deserializer<'de>>(d: D) -> Result<[Rgb; 2], D::Error> {
+    colors_n::<D, 2>(d)
+}
+
+fn colors_n<'de, D: Deserializer<'de>, const N: usize>(d: D) -> Result<[Rgb; N], D::Error> {
+    let v = Vec::<String>::deserialize(d)?;
+    if v.len() != N {
+        return Err(de::Error::custom(format!("expected {N} colors, got {}", v.len())));
+    }
+    let mut out = [[0; 3]; N];
+    for (i, s) in v.iter().enumerate() {
+        out[i] = parse_hex(s).ok_or_else(|| {
+            de::Error::custom(format!("invalid color {s:?}, expected \"#rrggbb\""))
+        })?;
+    }
+    Ok(out)
 }
 
 fn colors8<'de, D: Deserializer<'de>>(d: D) -> Result<[Rgb; 8], D::Error> {
@@ -283,6 +366,24 @@ mod tests {
         assert!(e.contains("window.columns"), "{e}");
         let e = parse("[font]\nsize = \"big\"\n").unwrap_err();
         assert!(e.contains("line 2"), "{e}");
+    }
+
+    #[test]
+    fn background_section() {
+        let c = parse(
+            "[background]\nstyle = \"aurora\"\nintensity = 0.4\ncolors = [\"#ff0000\", \"#00ff00\", \"#0000ff\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.background.style, BackgroundStyle::Aurora);
+        assert_eq!(c.background.intensity, 0.4);
+        assert_eq!(c.background.colors, Some([[255, 0, 0], [0, 255, 0], [0, 0, 255]]));
+        assert_eq!(c.background.fps, 30, "unset keys keep defaults");
+        let e = parse("[background]\nstyle = \"lava\"\n").unwrap_err();
+        assert!(e.contains("lava") && e.contains("aurora"), "{e}");
+        let e = parse("[background]\nintensity = 2.0\n").unwrap_err();
+        assert!(e.contains("background.intensity"), "{e}");
+        let e = parse("[background]\nprivileged_colors = [\"#ff0000\"]\n").unwrap_err();
+        assert!(e.contains("expected 2 colors"), "{e}");
     }
 
     #[test]

@@ -9,10 +9,11 @@
 //! a `wgpu::Device`, a target format and a render pass. [`headless`]
 //! renders to an image for tests and screenshots.
 //!
-//! The Visual Engine (Phase II) will draw its layers *before* this pass;
-//! text is always composited on top so it stays crisp (spec §4.4).
+//! The [`background`] layer draws first, inside the same pass; text is
+//! always composited on top so it stays crisp (spec §4.4).
 
 mod atlas;
+pub mod background;
 pub mod font;
 pub mod headless;
 mod theme;
@@ -22,6 +23,8 @@ use std::collections::HashMap;
 use seraphim_terminal::{Attrs, CursorShape, Flags, Point, SelectionRange, Terminal};
 
 use atlas::{Atlas, AtlasRect, ATLAS_SIZE};
+use background::Background;
+pub use background::{BackgroundConfig, BackgroundStyle};
 use font::{is_emoji_cluster, is_ignorable, is_private_use, GlyphKey, ShapedGlyph};
 pub use font::{CellMetrics, FontConfig, FontError, FontStyle, Fonts};
 use theme::to_f32;
@@ -105,6 +108,9 @@ pub struct Renderer {
     applied_overrides: seraphim_terminal::palette::ColorOverrides,
     instances: Vec<Instance>,
     stats: FrameStats,
+    background: Background,
+    /// Seconds on the animation clock, set by [`Renderer::set_time`].
+    time: f32,
 }
 
 impl Renderer {
@@ -267,6 +273,8 @@ impl Renderer {
             applied_overrides: Default::default(),
             instances: Vec::new(),
             stats: FrameStats::default(),
+            background: Background::new(device, format),
+            time: 0.0,
         }
     }
 
@@ -301,6 +309,24 @@ impl Renderer {
         self.glyphs.clear();
         self.shaped.clear();
         self.atlas.clear();
+    }
+
+    /// The animated background layer.
+    pub fn background(&self) -> &Background {
+        &self.background
+    }
+
+    pub fn background_mut(&mut self) -> &mut Background {
+        &mut self.background
+    }
+
+    pub fn set_background(&mut self, config: BackgroundConfig) {
+        self.background.set_config(config);
+    }
+
+    /// Set the animation clock (seconds) used by the next `prepare`.
+    pub fn set_time(&mut self, seconds: f32) {
+        self.time = seconds;
     }
 
     pub fn fonts(&self) -> &Fonts {
@@ -345,12 +371,26 @@ impl Renderer {
             atlas: [ATLAS_SIZE as f32, ATLAS_SIZE as f32],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+        if self.background.is_enabled() {
+            let a = &self.theme.ansi;
+            self.background.prepare(
+                queue,
+                (view.width, view.height),
+                self.theme.background,
+                [a[13], a[4], a[6]],
+                self.time,
+            );
+        }
         self.instance_count = self.instances.len() as u32;
         self.stats.instances = self.instances.len();
     }
 
     /// Record the draw into an existing render pass.
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
+        // Background layers first: text always composites on top.
+        if self.background.is_enabled() {
+            self.background.render(pass);
+        }
         if self.instance_count == 0 {
             return;
         }

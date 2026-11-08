@@ -1,9 +1,12 @@
 //! Seraphim terminal.
 //!
 //! ```text
-//! seraphim [--config PATH] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [-e PROGRAM [ARGS...]]
+//! seraphim [--config PATH] [--font FAMILY] [--font-size PT] [--cols N] [--rows N]
+//!          [--background STYLE] [--background-preview MOOD] [-e PROGRAM [ARGS...]]
 //!     Open a window running PROGRAM (default: your shell). Settings come from
-//!     ~/.config/seraphim/config.toml, then these options.
+//!     ~/.config/seraphim/config.toml, then these options. STYLE is none,
+//!     aurora, nebula or starfield. --background-preview replays a background
+//!     mood (privileged, install or all) on a timer.
 //!
 //! seraphim --print-default-config
 //!     Print the documented default configuration file.
@@ -172,6 +175,29 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
             "--cols" => o.cols = value("--cols")?.parse().map_err(|_| "--cols needs a number")?,
             "--rows" => o.rows = value("--rows")?.parse().map_err(|_| "--rows needs a number")?,
             "--allow-clipboard-read" => o.allow_clipboard_read = true,
+            "--background" => {
+                use seraphim_render::BackgroundStyle as S;
+                o.background.style = match value("--background")?.as_str() {
+                    "none" => S::None,
+                    "aurora" => S::Aurora,
+                    "nebula" => S::Nebula,
+                    "starfield" => S::Starfield,
+                    s => {
+                        return Err(format!(
+                            "unknown background {s:?} (none, aurora, nebula, starfield)"
+                        ))
+                    }
+                }
+            }
+            "--background-preview" => {
+                use window::BackgroundPreview as P;
+                o.background_preview = Some(match value("--background-preview")?.as_str() {
+                    "privileged" => P::Privileged,
+                    "install" => P::Install,
+                    "all" => P::All,
+                    s => return Err(format!("unknown preview {s:?} (privileged, install, all)")),
+                });
+            }
             "-e" | "--" => {
                 let rest: Vec<&String> = it.by_ref().collect();
                 let (prog, args) = rest.split_first().ok_or("-e needs a PROGRAM")?;
@@ -212,12 +238,33 @@ fn options_from_config(c: &seraphim_config::Config) -> window::WindowOptions {
         theme,
         scrollback: c.terminal.scrollback,
         grapheme_clustering: c.terminal.grapheme_clustering,
+        background: background_from_config(&c.background),
+        background_preview: None,
+    }
+}
+
+fn background_from_config(b: &seraphim_config::Background) -> seraphim_render::BackgroundConfig {
+    use seraphim_config::BackgroundStyle as C;
+    use seraphim_render::BackgroundStyle as R;
+    seraphim_render::BackgroundConfig {
+        style: match b.style {
+            C::None => R::None,
+            C::Aurora => R::Aurora,
+            C::Nebula => R::Nebula,
+            C::Starfield => R::Starfield,
+        },
+        intensity: b.intensity,
+        speed: b.speed,
+        fps: b.fps,
+        colors: b.colors,
+        privileged_colors: b.privileged_colors,
+        install_color: b.install_color,
     }
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--background STYLE] [--background-preview MOOD] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),

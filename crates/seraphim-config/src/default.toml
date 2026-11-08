@@ -52,3 +52,21 @@ bold_is_bright = false
 # ANSI colors 0-7 and 8-15.
 normal = ["#2a273a", "#ff5577", "#8be9a8", "#f9d98b", "#89a8ff", "#c89bff", "#7fe0e8", "#d8d3e6"]
 bright = ["#5c5775", "#ff7a96", "#a9f5bf", "#fce6a9", "#a8bfff", "#f5a6d0", "#a3eef2", "#ffffff"]
+
+[background]
+# Animated layer behind the text: "none", "aurora", "nebula" or "starfield".
+# Text cells with an explicit background color still draw solid on top.
+style = "none"
+# Strength of the effects over colors.background, 0 to 1.
+intensity = 0.6
+# Animation speed; 0 draws a still image and stops redrawing.
+speed = 1.0
+# Frame rate cap while animating (halved when the window is unfocused).
+fps = 30
+# Three scene colors; when unset, bright magenta, blue and cyan from the
+# palette above.
+# colors = ["#f5a6d0", "#89a8ff", "#7fe0e8"]
+# The scene shifts to these in a root session.
+privileged_colors = ["#ff3b4e", "#ff9a3c"]
+# Color of the wave shown when a package is installed.
+install_color = "#ffd98a"

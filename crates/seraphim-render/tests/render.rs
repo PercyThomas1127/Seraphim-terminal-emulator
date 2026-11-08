@@ -379,3 +379,97 @@ fn overline_dotted_and_dashed_are_drawn() {
     let t2 = row.windows(2).filter(|p| p[0] != p[1]).count();
     assert!(t2 >= 3 && t2 < transitions, "dashed: {t2} transitions");
 }
+
+mod background {
+    use super::*;
+    use seraphim_render::{BackgroundConfig, BackgroundStyle};
+
+    fn frame(h: &mut Headless, term: &Terminal, t: f32) -> Image {
+        let (width, height) = (480, 320);
+        h.renderer.set_time(t);
+        h.render(term, View { width, height, padding: PAD, focused: true, cursor_on: true })
+    }
+
+    fn mean(img: &Image) -> [f32; 3] {
+        let mut sum = [0.0f32; 3];
+        for p in img.rgba.chunks(4) {
+            for i in 0..3 {
+                sum[i] += p[i] as f32;
+            }
+        }
+        let n = (img.rgba.len() / 4) as f32;
+        sum.map(|s| s / n)
+    }
+
+    #[test]
+    fn styles_draw_behind_text_and_animate() {
+        let Some(mut h) = headless() else { return };
+        let mut term = Terminal::new(20, 4);
+        term.advance(b"seraphim");
+        let bg = Theme::default().background;
+        for style in [BackgroundStyle::Aurora, BackgroundStyle::Nebula, BackgroundStyle::Starfield]
+        {
+            h.renderer.set_background(BackgroundConfig { style, ..Default::default() });
+            let a = frame(&mut h, &term, 10.0);
+            let b = frame(&mut h, &term, 14.0);
+            let changed = a.rgba.iter().zip(&b.rgba).filter(|(x, y)| x != y).count();
+            assert!(changed > a.rgba.len() / 50, "{style:?} should animate ({changed} bytes)");
+            let off_theme =
+                a.rgba.chunks(4).filter(|p| rgb([p[0], p[1], p[2], p[3]]) != bg).count();
+            assert!(off_theme > a.rgba.len() / 8, "{style:?} should paint the background");
+            // Text still composites on top: the glyph cell holds bright ink.
+            let (x, y, w, hh) = cell(&h, 0, 0);
+            let bright = (y..y + hh)
+                .flat_map(|yy| (x..x + w).map(move |xx| (xx, yy)))
+                .filter(|&(xx, yy)| a.pixel(xx, yy)[0] > 200)
+                .count();
+            assert!(bright > 5, "{style:?}: text should stay visible over the background");
+        }
+    }
+
+    #[test]
+    fn none_is_the_plain_theme() {
+        let Some(mut h) = headless() else { return };
+        let term = Terminal::new(20, 4);
+        h.renderer.set_background(BackgroundConfig::default());
+        let img = frame(&mut h, &term, 3.0);
+        assert_eq!(rgb(img.pixel(200, 200)), Theme::default().background);
+    }
+
+    #[test]
+    fn privileged_mood_warms_the_scene() {
+        let Some(mut h) = headless() else { return };
+        let term = Terminal::new(20, 4);
+        h.renderer.set_background(BackgroundConfig {
+            style: BackgroundStyle::Aurora,
+            ..Default::default()
+        });
+        let calm = mean(&frame(&mut h, &term, 20.0));
+        h.renderer.background_mut().set_privileged(true);
+        assert!(h.renderer.background().needs_frames());
+        let _ = frame(&mut h, &term, 20.5); // mid-fade
+        let root = mean(&frame(&mut h, &term, 22.0));
+        assert!(root[0] > calm[0] + 3.0, "red should rise: {calm:?} -> {root:?}");
+        assert!(root[0] - root[2] > calm[0] - calm[2], "scene should shift warm");
+    }
+
+    #[test]
+    fn install_wave_runs_once() {
+        let Some(mut h) = headless() else { return };
+        let term = Terminal::new(20, 4);
+        h.renderer.set_background(BackgroundConfig {
+            style: BackgroundStyle::Aurora,
+            speed: 0.0,
+            ..Default::default()
+        });
+        let _ = frame(&mut h, &term, 5.0);
+        assert!(!h.renderer.background().needs_frames(), "speed 0 is a still image");
+        h.renderer.background_mut().pulse_install();
+        let _ = frame(&mut h, &term, 6.0);
+        assert!(h.renderer.background().install_phase().is_some());
+        assert!(h.renderer.background().needs_frames(), "the wave animates even when still");
+        let _ = frame(&mut h, &term, 9.0);
+        assert!(h.renderer.background().install_phase().is_none());
+        assert!(!h.renderer.background().needs_frames());
+    }
+}

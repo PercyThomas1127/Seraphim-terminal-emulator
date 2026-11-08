@@ -4,14 +4,15 @@
 //! The session's I/O thread never touches them; it only pokes the loop via
 //! an `EventLoopProxy`, and the loop redraws (coalesced, vsync-paced) when
 //! it gets around to it. No frames are rendered while nothing changes; the
-//! only timer is cursor blinking, and only when the application asked for a
-//! blinking cursor.
+//! timers are cursor blinking (only when the application asked for a
+//! blinking cursor) and the animated background (only when one is
+//! configured, paced to its fps and paused while the window is hidden).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use seraphim_events::EventBus;
-use seraphim_render::{FontConfig, Fonts, Renderer, Theme, View};
+use seraphim_render::{BackgroundConfig, FontConfig, Fonts, Renderer, Theme, View};
 use seraphim_session::{ClipboardRequest, Command, Notifier, Session, SessionConfig};
 use seraphim_terminal::input::{
     encode_focus, encode_key, encode_key_input, encode_mouse, encode_paste, mouse_reporting, Key,
@@ -46,7 +47,34 @@ pub struct WindowOptions {
     pub theme: Theme,
     pub scrollback: usize,
     pub grapheme_clustering: bool,
+    pub background: BackgroundConfig,
+    /// Replay background moods on a timer, to preview them before event
+    /// bindings drive them.
+    pub background_preview: Option<BackgroundPreview>,
 }
+
+/// What `--background-preview` replays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundPreview {
+    /// Ease into and out of the root palette every few seconds.
+    Privileged,
+    /// An install wave every few seconds.
+    Install,
+    /// Both, on independent timers.
+    All,
+}
+
+impl BackgroundPreview {
+    fn privileged(self) -> bool {
+        matches!(self, BackgroundPreview::Privileged | BackgroundPreview::All)
+    }
+    fn install(self) -> bool {
+        matches!(self, BackgroundPreview::Install | BackgroundPreview::All)
+    }
+}
+
+const PREVIEW_PRIVILEGED_EVERY: Duration = Duration::from_secs(6);
+const PREVIEW_INSTALL_EVERY: Duration = Duration::from_secs(4);
 
 impl Default for WindowOptions {
     fn default() -> Self {
@@ -61,6 +89,8 @@ impl Default for WindowOptions {
             theme: Theme::default(),
             scrollback: seraphim_terminal::DEFAULT_SCROLLBACK,
             grapheme_clustering: true,
+            background: BackgroundConfig::default(),
+            background_preview: None,
         }
     }
 }
@@ -199,6 +229,14 @@ struct Active {
     warned_clipboard_read: bool,
     /// When the app turned on synchronized output with a frame pending.
     sync_since: Option<Instant>,
+    /// Zero point of the animation clock.
+    clock: Instant,
+    /// When the background wants its next frame.
+    next_frame: Instant,
+    /// The compositor says no part of the window is visible.
+    occluded: bool,
+    next_preview_privileged: Instant,
+    next_preview_install: Instant,
 }
 
 struct App {
@@ -256,6 +294,7 @@ impl App {
 
         let gpu = init_gpu(event_loop, window.clone())?;
         let mut renderer = Renderer::new(&gpu.device, gpu.config.format, fonts, o.theme.clone());
+        renderer.set_background(o.background.clone());
         if (font_px(o.font_size, scale) - renderer.fonts().size_px()).abs() > 0.1 {
             renderer.set_fonts(self.fonts_for(scale)?);
         }
@@ -302,6 +341,11 @@ impl App {
             blink_deadline: Instant::now() + BLINK_INTERVAL,
             warned_clipboard_read: false,
             sync_since: None,
+            clock: Instant::now(),
+            next_frame: Instant::now(),
+            occluded: false,
+            next_preview_privileged: Instant::now() + Duration::from_secs(1),
+            next_preview_install: Instant::now() + Duration::from_secs(1),
         })
     }
 
@@ -742,6 +786,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 a.window.request_redraw();
             }
+            WindowEvent::Occluded(occluded) => {
+                a.occluded = occluded;
+                if !occluded {
+                    a.window.request_redraw();
+                }
+            }
             WindowEvent::Focused(focused) => {
                 a.focused = focused;
                 a.reset_blink();
@@ -789,6 +839,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if a.title.is_empty() { "Seraphim".into() } else { a.title.clone() };
                         a.window.set_title(&t);
                     }
+                    a.renderer.set_time(a.clock.elapsed().as_secs_f32());
                     a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
                 }
                 draw(a);
@@ -825,6 +876,37 @@ impl ApplicationHandler<UserEvent> for App {
         } else {
             a.blink_on = true;
         }
+        if let Some(preview) = self.options.background_preview {
+            let bg = a.renderer.background_mut();
+            if preview.privileged() && now >= a.next_preview_privileged {
+                let on = !bg.privileged();
+                bg.set_privileged(on);
+                a.next_preview_privileged = now + PREVIEW_PRIVILEGED_EVERY;
+            }
+            if preview.install() && now >= a.next_preview_install {
+                bg.pulse_install();
+                a.next_preview_install = now + PREVIEW_INSTALL_EVERY;
+            }
+            let next = [
+                preview.privileged().then_some(a.next_preview_privileged),
+                preview.install().then_some(a.next_preview_install),
+            ];
+            for t in next.into_iter().flatten() {
+                wake = Some(wake.map_or(t, |w| w.min(t)));
+            }
+        }
+
+        // Animated background: one frame per interval while visible.
+        let bg = a.renderer.background();
+        if bg.needs_frames() && !a.occluded {
+            if now >= a.next_frame {
+                // Skip missed frames rather than bursting to catch up.
+                a.next_frame = now.max(a.next_frame) + bg.frame_interval(a.focused);
+                a.window.request_redraw();
+            }
+            wake = Some(wake.map_or(a.next_frame, |w| w.min(a.next_frame)));
+        }
+
         event_loop.set_control_flow(match wake {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
