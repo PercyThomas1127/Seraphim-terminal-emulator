@@ -83,8 +83,8 @@ syntax, not engines.
 * Parameters are animated with `Animated`, so mood changes retarget
   smoothly. A root shell that exits mid-fade turns back without a jump.
 * Not yet:
-  * continuous bindings (`[[bind]]`, mapping metrics such as CPU to a
-    parameter);
+  * (done since: continuous bindings, `[[bind]]`, in
+    `seraphim/src/bindings.rs`);
   * rules that switch profiles;
   * stopping redraws for a shader that is still (the branch did this
     when `speed = 0`).

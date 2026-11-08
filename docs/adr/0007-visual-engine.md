@@ -55,8 +55,7 @@
 * (Done since: Kitty graphics protocol and Sixel inline images; see the
   Phase II plan.)
 * Image formats beyond PNG, image blur, video and animated images.
-* Continuous bindings (`[[bind]]`, ADR 0006). Event-triggered animations
-  are done: see ADR 0008.
+* (Done since: event rules and continuous bindings, ADR 0008.)
 * (Done since: live reload, `seraphim/src/watch.rs`. Scene changes made
   while the window is unfocused apply instantly instead of freezing
   half-way.)

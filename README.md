@@ -136,6 +136,25 @@ duration_ms = 600
 easing = "ease-out"
 ```
 
+Bindings (`[[bind]]`) keep a parameter following a live value: CPU,
+memory, load, battery, the time of day, or a field of the latest event.
+Each new value is eased in:
+
+```toml
+[[bind]]
+source = "system.cpu"               # percent
+layer = "sky"
+param = "speed"
+output = [0.6, 2.5]                 # idle .. busy
+
+[[bind]]
+event = "command.completed"
+field = "exit_code"
+layer = "glow"
+param = "pulse"
+map = { "0" = 0.0, default = 1.0 }  # red after a failed command
+```
+
 To tweak a preset's layer, give a `[[background]]` the same `id` in your
 config, e.g. `params = { style = 2 }` for the nebula. See ADR 0008 for the
 design and the Lua/CSS authoring plan.

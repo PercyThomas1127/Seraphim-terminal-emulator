@@ -1826,6 +1826,7 @@ name = "seraphim"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "libc",
  "pollster",
  "seraphim-config",
  "seraphim-events",
@@ -1833,6 +1834,7 @@ dependencies = [
  "seraphim-session",
  "seraphim-terminal",
  "seraphim-visual",
+ "serde_json",
  "toml",
  "wgpu",
  "winit",

@@ -55,6 +55,8 @@ pub struct WindowOptions {
     pub layers: Vec<seraphim_visual::LayerSpec>,
     /// `[[on]]` interaction rules driving the layers from bus events.
     pub rules: Vec<crate::interaction::Rule>,
+    /// `[[bind]]` continuous bindings.
+    pub binds: Vec<crate::bindings::Bind>,
     /// Active profile name ("default" for none).
     pub profile: String,
     pub config_path: Option<std::path::PathBuf>,
@@ -111,6 +113,7 @@ impl Default for WindowOptions {
             visual: Default::default(),
             layers: Vec::new(),
             rules: Vec::new(),
+            binds: Vec::new(),
             profile: "default".into(),
             config_path: None,
             cli_font_family: None,
@@ -290,6 +293,7 @@ struct Active {
     menu_src: (Vec<seraphim_config::Menu>, Option<std::path::PathBuf>, String),
     /// `[[on]]` rules, fed from the bus.
     interactions: Interactions,
+    bindings: crate::bindings::Bindings,
     /// The compositor says no part of the window is visible.
     occluded: bool,
 }
@@ -405,6 +409,7 @@ impl App {
         // Subscribe before the session starts: it reports privilege at once.
         const SESSION_ID: u64 = 1;
         let interactions = Interactions::new(o.rules.clone(), &bus, SESSION_ID);
+        let bindings = crate::bindings::Bindings::new(o.binds.clone(), &bus, SESSION_ID);
         let session = Session::spawn(
             SESSION_ID,
             SessionConfig {
@@ -466,6 +471,7 @@ impl App {
                 })
             }),
             interactions,
+            bindings,
             occluded: false,
         };
         active.rebuild_menu();
@@ -649,7 +655,8 @@ impl App {
         let files_changed = matches!(&request_kind, Request::Files(f)
             if f.iter().any(|p| p.extension().is_none_or(|e| e != "toml")));
         let mut layer_error = None;
-        if o.layers != self.options.layers || files_changed || !live {
+        let rebuilt = o.layers != self.options.layers || files_changed || !live;
+        if rebuilt {
             for e in a.visual.set_layers(&o.layers, fade) {
                 eprintln!("seraphim: {e}");
                 layer_error.get_or_insert(e);
@@ -664,6 +671,10 @@ impl App {
         a.visual_cfg = o.visual.clone();
         a.update_pause();
         a.interactions.replace(o.rules.clone(), &a.bus, &mut a.visual);
+        a.bindings.replace(o.binds.clone(), &a.bus);
+        if rebuilt {
+            a.bindings.reapply(&mut a.visual);
+        }
         let scale = a.scale;
         self.options = o;
         let _ = scale;
@@ -1561,6 +1572,15 @@ impl ApplicationHandler<UserEvent> for App {
             } else {
                 wake = Some(wake.map_or(until, |w| w.min(until)));
             }
+        }
+
+        // Bindings: metrics on their intervals, latest event values.
+        let (next, changed) = a.bindings.tick(now, &mut a.visual);
+        if let Some(t) = next {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
+        if changed {
+            a.window.request_redraw();
         }
 
         // Interaction rules react to bus events (published by the session

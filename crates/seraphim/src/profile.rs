@@ -75,6 +75,7 @@ pub fn options_from_config(
         visual: c.visual.clone(),
         layers,
         rules: c.on.iter().map(crate::interaction::Rule::from_config).collect(),
+        binds: c.bind.iter().filter_map(crate::bindings::Bind::from_config).collect(),
         watch: files,
         live_reload: c.live_reload,
         notice: None,

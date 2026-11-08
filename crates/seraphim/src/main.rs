@@ -24,6 +24,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod actions;
+mod bindings;
 mod interaction;
 mod menu;
 mod profile;

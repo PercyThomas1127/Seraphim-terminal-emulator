@@ -58,6 +58,8 @@ pub struct Config {
     pub background: Vec<Background>,
     /// Interaction rules: animate layers when events happen.
     pub on: Vec<Rule>,
+    /// Continuous bindings: a layer parameter follows a live value.
+    pub bind: Vec<Bind>,
     /// Menu bar additions ([`BUILTIN_MENU`] is the base).
     pub menu: Vec<Menu>,
 }
@@ -175,6 +177,7 @@ impl Default for Config {
             preset: None,
             background: Vec::new(),
             on: Vec::new(),
+            bind: Vec::new(),
             menu: Vec::new(),
         }
     }
@@ -216,6 +219,91 @@ impl Default for Rule {
             duration_ms: 300,
             easing: "ease-in-out".into(),
         }
+    }
+}
+
+/// Metric sources a `[[bind]]` can follow, with their natural input range.
+pub const BIND_SOURCES: &[(&str, [f32; 2])] = &[
+    ("system.cpu", [0.0, 100.0]),
+    ("system.memory", [0.0, 100.0]),
+    ("system.load", [0.0, 1.0]),
+    ("battery.level", [0.0, 100.0]),
+    ("battery.charging", [0.0, 1.0]),
+    ("time.hour", [0.0, 24.0]),
+];
+
+/// "This layer property follows that value" (spec 5.3, 11.4).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Bind {
+    /// A metric ([`BIND_SOURCES`]).
+    pub source: Option<String>,
+    /// Or the latest event with this name ...
+    pub event: Option<String>,
+    /// ... and this field of its data (dotted path).
+    pub field: Option<String>,
+    pub layer: String,
+    /// A shader parameter, or `opacity`.
+    pub param: String,
+    /// Source values mapped to `output` (default: the source's range;
+    /// 0-1 for events).
+    pub input: Option<[f32; 2]>,
+    pub output: [f32; 2],
+    /// Exact values instead of a range: `{ "0" = 0.85, default = 0.0 }`.
+    pub map: std::collections::BTreeMap<String, f32>,
+    /// Ease to each new value over this many milliseconds.
+    pub smoothing_ms: u32,
+    /// How often metrics are sampled.
+    pub interval_ms: u32,
+}
+
+impl Default for Bind {
+    fn default() -> Self {
+        Bind {
+            source: None,
+            event: None,
+            field: None,
+            layer: String::new(),
+            param: String::new(),
+            input: None,
+            output: [0.0, 1.0],
+            map: Default::default(),
+            smoothing_ms: 600,
+            interval_ms: 1000,
+        }
+    }
+}
+
+impl Bind {
+    fn validate(&self) -> Result<(), String> {
+        match (&self.source, &self.event) {
+            (Some(s), None) => {
+                if !BIND_SOURCES.iter().any(|(n, _)| n == s) {
+                    let names: Vec<&str> = BIND_SOURCES.iter().map(|b| b.0).collect();
+                    return Err(format!("unknown source {s:?} ({})", names.join(", ")));
+                }
+            }
+            (None, Some(e)) => {
+                if e.trim().is_empty() || self.field.as_deref().is_none_or(|f| f.trim().is_empty())
+                {
+                    return Err("an event binding needs `event` and `field`".into());
+                }
+            }
+            _ => return Err("needs exactly one of `source` or `event`".into()),
+        }
+        if self.layer.trim().is_empty() || self.param.trim().is_empty() {
+            return Err("needs `layer` and `param`".into());
+        }
+        if self.input.is_some_and(|[a, b]| a == b) {
+            return Err("`input` must be two different values".into());
+        }
+        if !(200..=3_600_000).contains(&self.interval_ms) {
+            return Err("interval_ms must be 200-3600000".into());
+        }
+        if self.smoothing_ms > 60_000 {
+            return Err("smoothing_ms must be at most 60000".into());
+        }
+        Ok(())
     }
 }
 
@@ -721,6 +809,10 @@ impl Config {
         for m in &self.menu {
             m.validate().map_err(|e| format!("menu {:?}: {e}", m.title))?;
         }
+        for (i, b) in self.bind.iter().enumerate() {
+            let what = b.source.clone().or_else(|| b.event.clone()).unwrap_or_default();
+            b.validate().map_err(|e| format!("bind {} ({what}): {e}", i + 1))?;
+        }
         for (i, r) in self.on.iter().enumerate() {
             r.validate().map_err(|e| format!("on {} ({}): {e}", i + 1, r.event))?;
         }
@@ -953,6 +1045,22 @@ mod tests {
     }
 
     #[test]
+    fn bindings_are_validated() {
+        let c = parse("[[bind]]\nsource = \"system.cpu\"\nlayer = \"sky\"\nparam = \"speed\"\noutput = [0.5, 2]\n\n[[bind]]\nevent = \"command.completed\"\nfield = \"exit_code\"\nlayer = \"sky\"\nparam = \"alert\"\nmap = { \"0\" = 0.0, default = 1.0 }\n").unwrap();
+        assert_eq!(c.bind.len(), 2);
+        assert_eq!(c.bind[0].smoothing_ms, 600);
+        for (bad, want) in [
+            ("source = \"system.gpu\"", "unknown source"),
+            ("source = \"system.cpu\"\nevent = \"x\"", "exactly one"),
+            ("event = \"x\"", "needs `event` and `field`"),
+            ("source = \"system.cpu\"\ninput = [1, 1]", "two different"),
+        ] {
+            let e = parse(&format!("[[bind]]\nlayer = \"a\"\nparam = \"b\"\n{bad}\n")).unwrap_err();
+            assert!(e.contains(want), "{bad}: {e}");
+        }
+    }
+
+    #[test]
     fn rules_and_palettes_are_validated() {
         let e = parse("[[on]]\nevent = \"x\"\nlayer = \"a\"\nparam = \"p\"\neasing = \"bouncy\"\n")
             .unwrap_err();
@@ -1076,7 +1184,7 @@ fn check_name(what: &str, name: &str) -> Result<(), ConfigError> {
 }
 
 /// Keys a preset file may set.
-const PRESET_KEYS: &[&str] = &["background", "on", "visual"];
+const PRESET_KEYS: &[&str] = &["background", "on", "bind", "visual"];
 
 /// Validate a preset file and return its table.
 pub fn parse_preset(text: &str, origin: &Path) -> Result<toml::Table, ConfigError> {
@@ -1113,10 +1221,12 @@ fn merge_over_preset(base: &mut toml::Table, mut over: toml::Table) {
             }
         }
     }
-    if let Some(toml::Value::Array(rules)) = over.remove("on") {
-        match base.entry("on").or_insert_with(|| toml::Value::Array(Vec::new())) {
-            toml::Value::Array(list) => list.extend(rules),
-            _ => unreachable!("validated preset"),
+    for key in ["on", "bind"] {
+        if let Some(toml::Value::Array(rules)) = over.remove(key) {
+            match base.entry(key).or_insert_with(|| toml::Value::Array(Vec::new())) {
+                toml::Value::Array(list) => list.extend(rules),
+                _ => unreachable!("validated preset"),
+            }
         }
     }
     merge(base, over);

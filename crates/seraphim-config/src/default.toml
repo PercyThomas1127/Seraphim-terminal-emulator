@@ -178,3 +178,23 @@ selection_fade_ms = 90
 # fullscreen, zoom-in, zoom-out, zoom-reset, scroll-top, scroll-bottom,
 # profiles (the profile list), next-profile, reload-config,
 # open-config-folder, shortcuts, about.
+
+# Continuous bindings: a layer parameter follows a live value, eased over
+# smoothing_ms. Sources: system.cpu (percent), system.memory (percent),
+# system.load (load average per core), battery.level (percent),
+# battery.charging (0 or 1), time.hour (0-24, local); or the latest event
+# of a kind with `event` and `field`. `input` (default: the source's range)
+# maps linearly onto `output`; `map` maps exact values instead.
+#
+# [[bind]]
+# source = "system.cpu"
+# layer = "sky"
+# param = "speed"
+# output = [0.6, 2.5]
+#
+# [[bind]]
+# event = "command.completed"
+# field = "exit_code"
+# layer = "glow"
+# param = "pulse"
+# map = { "0" = 0.0, default = 1.0 }
