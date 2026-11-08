@@ -393,8 +393,11 @@ impl VisualEngine {
         errors
     }
 
+    /// Reduced motion makes transitions instant; so does a paused clock
+    /// (unfocused or hidden window), or a change made while nobody is
+    /// looking would sit frozen half-way until the window is focused.
     fn effective(&self, t: Transition) -> Transition {
-        if self.reduced_motion {
+        if self.reduced_motion || (self.paused && self.fixed_time.is_none()) {
             Transition::Instant
         } else {
             t

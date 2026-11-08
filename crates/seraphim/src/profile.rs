@@ -28,7 +28,15 @@ pub fn load(
         return Ok(options_from_config(&loaded.config, None, &loaded.profile));
     };
     let loaded = Config::load_layered_with(path, profile, preset).map_err(|e| e.to_string())?;
-    Ok(options_from_config(&loaded.config, path.parent(), &loaded.profile))
+    let (mut o, warnings) = options_from_config(&loaded.config, path.parent(), &loaded.profile);
+    // Live reload watches every file that went in, and the config file
+    // even before it exists.
+    let mut watch = vec![path.to_path_buf()];
+    watch.extend(loaded.sources);
+    watch.append(&mut o.watch);
+    watch.dedup();
+    o.watch = watch;
+    Ok((o, warnings))
 }
 
 /// Window settings from a (layered) configuration. Returns warnings for
@@ -50,7 +58,7 @@ pub fn options_from_config(
     theme.bold_is_bright = k.bold_is_bright;
     theme.ansi[..8].copy_from_slice(&k.normal);
     theme.ansi[8..].copy_from_slice(&k.bright);
-    let (layers, warnings) = layers(c, config_dir, &theme);
+    let (layers, warnings, files) = layers(c, config_dir, &theme);
     let o = WindowOptions {
         font_family: c.font.family.clone(),
         font_size: c.font.size,
@@ -67,6 +75,9 @@ pub fn options_from_config(
         visual: c.visual.clone(),
         layers,
         rules: c.on.iter().map(crate::interaction::Rule::from_config).collect(),
+        watch: files,
+        live_reload: c.live_reload,
+        notice: None,
         menu_bar: c.window.menu_bar,
         menus: crate::menu::merge(&seraphim_config::builtin_menu(), &c.menu),
         profile: profile.to_owned(),
@@ -79,10 +90,15 @@ pub fn options_from_config(
 }
 
 /// `[[background]]` entries as visual-engine layers.
-fn layers(c: &Config, config_dir: Option<&Path>, theme: &Theme) -> (Vec<LayerSpec>, Vec<String>) {
+fn layers(
+    c: &Config,
+    config_dir: Option<&Path>,
+    theme: &Theme,
+) -> (Vec<LayerSpec>, Vec<String>, Vec<std::path::PathBuf>) {
     let dir = config_dir.map(Path::to_path_buf).unwrap_or_default();
     let mut out = Vec::new();
     let mut warnings = Vec::new();
+    let mut files = Vec::new();
     for (i, b) in c.background.iter().enumerate() {
         let id = b.id.clone().unwrap_or_else(|| format!("{}-{}", b.kind, i + 1));
         let kind = match b.kind.as_str() {
@@ -93,15 +109,17 @@ fn layers(c: &Config, config_dir: Option<&Path>, theme: &Theme) -> (Vec<LayerSpe
                 colors: b.colors.iter().filter_map(|c| parse_rgba(c)).collect(),
                 angle: b.angle,
             },
-            "image" => LayerKind::Image {
-                path: b.resolve(b.path.as_deref().unwrap_or_default(), &dir),
-                fit: Fit::parse(&b.fit).unwrap_or_default(),
-            },
+            "image" => {
+                let path = b.resolve(b.path.as_deref().unwrap_or_default(), &dir);
+                files.push(path.clone());
+                LayerKind::Image { path, fit: Fit::parse(&b.fit).unwrap_or_default() }
+            }
             _ => {
                 let name = b.shader.clone().unwrap_or_default();
                 if name.ends_with(".wgsl") {
                     let path = b.resolve(&name, &dir.join("shaders"));
                     let path = if path.exists() { path } else { b.resolve(&name, &dir) };
+                    files.push(path.clone());
                     match std::fs::read_to_string(&path) {
                         Ok(src) => LayerKind::Shader { name, source: Some(src) },
                         Err(e) => {
@@ -127,7 +145,7 @@ fn layers(c: &Config, config_dir: Option<&Path>, theme: &Theme) -> (Vec<LayerSpe
                 .collect(),
         });
     }
-    (out, warnings)
+    (out, warnings, files)
 }
 
 /// A palette color: `#rrggbb[aa]` or a theme color such as

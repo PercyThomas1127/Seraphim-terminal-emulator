@@ -195,6 +195,12 @@ with:
 cargo run -p seraphim -- --print-default-config
 ```
 
+Changes apply as soon as you save: Seraphim watches the config, the active
+profile, theme and preset files, and any shaders and images they use
+(`live_reload = false` turns this off; Ctrl+Shift+R reloads by hand). A
+notice in the corner says when it reloaded, or what is wrong; a broken
+file leaves the current look in place until it is fixed.
+
 Unknown keys and invalid values are reported with their line and column;
 a broken config never stops the terminal from opening (it falls back to the
 defaults and says why). Command-line options override the file;

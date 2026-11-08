@@ -17,6 +17,10 @@
 # profile = "work"
 # preset = "heavens"
 
+# Apply changes to these files (and shaders, images, profiles, themes) as
+# soon as they are saved. Ctrl+Shift+R reloads by hand.
+live_reload = true
+
 [font]
 # Family name; when unset, the first installed of JetBrains Mono, Fira Code,
 # DejaVu Sans Mono, Liberation Mono, Noto Sans Mono is used.

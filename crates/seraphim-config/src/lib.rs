@@ -32,7 +32,7 @@ pub const DEFAULT_TOML: &str = include_str!("default.toml");
 
 pub type Rgb = [u8; 3];
 
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Color theme: a built-in name ([`BUILTIN_THEMES`]) or a file in
@@ -40,6 +40,9 @@ pub struct Config {
     pub theme: Option<String>,
     /// Profile applied on top of this file at startup.
     pub profile: Option<String>,
+    /// Apply changes to the configuration files (and shaders, images)
+    /// as soon as they are saved.
+    pub live_reload: bool,
     pub font: Font,
     pub window: Window,
     pub terminal: TerminalConfig,
@@ -152,6 +155,27 @@ pub fn builtin_menu() -> Vec<Menu> {
         menu: Vec<Menu>,
     }
     toml::from_str::<File>(BUILTIN_MENU).expect("valid built-in menu").menu
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            theme: None,
+            profile: None,
+            live_reload: true,
+            font: Default::default(),
+            window: Default::default(),
+            terminal: Default::default(),
+            shell: Default::default(),
+            clipboard: Default::default(),
+            colors: Default::default(),
+            visual: Default::default(),
+            preset: None,
+            background: Vec::new(),
+            on: Vec::new(),
+            menu: Vec::new(),
+        }
+    }
 }
 
 /// Built-in presets: (name, TOML).

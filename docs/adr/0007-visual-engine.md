@@ -57,4 +57,6 @@
 * Image formats beyond PNG, image blur, video and animated images.
 * Continuous bindings (`[[bind]]`, ADR 0006). Event-triggered animations
   are done: see ADR 0008.
-* Live file watching (reload is manual, Ctrl+Shift+R).
+* (Done since: live reload, `seraphim/src/watch.rs`. Scene changes made
+  while the window is unfocused apply instantly instead of freezing
+  half-way.)

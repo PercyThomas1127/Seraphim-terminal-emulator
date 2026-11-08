@@ -226,6 +226,8 @@ pub struct MenuBar {
     /// The highlighted item of the open dropdown.
     pub hover: Option<usize>,
     pub panel: Option<Panel>,
+    /// A one-line notice drawn in the bottom-right corner.
+    pub toast: Option<String>,
 }
 
 const GAP: usize = 4; // between label and shortcut
@@ -452,8 +454,61 @@ impl MenuBar {
                 c.fill(row, r.col + 1, r.cols.saturating_sub(2), p.menu_bg);
             }
         }
+        if let Some(msg) = &self.toast {
+            // Bottom-right, wrapped to at most three lines.
+            let max = cols.saturating_sub(6).clamp(1, 72);
+            let lines = wrap(msg, max, 3);
+            let inner = lines.iter().map(|l| width(l)).max().unwrap_or(0);
+            let (w, h) = (inner + 4, lines.len() + 2);
+            if rows > h && cols > w {
+                let r = Rect { row: rows - h, col: cols - w - 1, rows: h, cols: w };
+                let border = Style { fg: p.border, bg: p.menu_bg, underline: false };
+                c.frame(r, border);
+                let st = Style { fg: p.menu_fg, bg: p.menu_bg, underline: false };
+                for (i, l) in lines.iter().enumerate() {
+                    c.text(r.row + 1 + i, r.col + 2, l, st);
+                }
+            }
+        }
         c.to_ansi()
     }
+}
+
+/// Word-wrap `text` to `width` columns, at most `max_lines` (the last one
+/// ends in "…" if text remains).
+fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        let mut word = word.to_owned();
+        while word.chars().count() > width {
+            // A word longer than a line is broken.
+            let head: String = word.chars().take(width).collect();
+            word = word.chars().skip(width).collect();
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            lines.push(head);
+        }
+        let need = cur.chars().count() + usize::from(!cur.is_empty()) + word.chars().count();
+        if need > width && !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(&word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        let last = lines.last_mut().unwrap();
+        let keep: String = last.chars().take(width.saturating_sub(1)).collect();
+        *last = format!("{keep}…");
+    }
+    lines
 }
 
 /// Colors for the overlay (RGB).
@@ -610,6 +665,13 @@ mod tests {
     }
 
     #[test]
+    fn wrapping() {
+        assert_eq!(wrap("a bb ccc dddd", 6, 3), ["a bb", "ccc", "dddd"]);
+        assert_eq!(wrap("aaaaaaaaaa", 4, 5), ["aaaa", "aaaa", "aa"]);
+        assert_eq!(wrap("one two three four five", 9, 2), ["one two", "three…"]);
+    }
+
+    #[test]
     fn labels() {
         assert_eq!(parse_label("&File"), ("File".into(), Some(0)));
         assert_eq!(parse_label("Select &All"), ("Select All".into(), Some(7)));
@@ -724,5 +786,14 @@ mod tests {
         t.advance(&b.paint(80, 20, false, &p));
         assert!(t.screen_text().contains("Seraphim") && t.screen_text().contains(" About "));
         assert_eq!(b.key(MenuKey::Char('x')), Outcome::Close, "any key closes a panel");
+        // Notice in the corner.
+        b.close();
+        b.toast = Some("Configuration reloaded".into());
+        let mut t = seraphim_terminal::Terminal::new(80, 20);
+        t.advance(&b.paint(80, 20, false, &p));
+        let text = t.screen_text();
+        let line = text.lines().nth(18).unwrap();
+        // (one line: three rows from the bottom is the frame's top)
+        assert!(line.ends_with("│ Configuration reloaded │"), "{line:?}");
     }
 }

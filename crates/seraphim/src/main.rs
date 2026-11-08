@@ -27,6 +27,7 @@ mod actions;
 mod interaction;
 mod menu;
 mod profile;
+mod watch;
 mod window;
 
 use seraphim_events::EventBus;
@@ -150,17 +151,24 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
         }
     }
     let mut o = match profile::load(config_path.as_deref(), profile.as_deref(), preset.as_deref()) {
-        Ok((o, warnings)) => {
-            for w in warnings {
+        Ok((mut o, warnings)) => {
+            for w in &warnings {
                 eprintln!("seraphim: {w}");
             }
+            o.notice = warnings.into_iter().next();
             o
         }
         // A broken config must not leave you without a terminal: report
         // it and carry on with the defaults.
         Err(e) => {
             eprintln!("seraphim: ignoring config: {e}");
-            profile::options_from_config(&seraphim_config::Config::default(), None, "default").0
+            let mut o =
+                profile::options_from_config(&seraphim_config::Config::default(), None, "default")
+                    .0;
+            o.notice = Some(format!("Configuration ignored: {e}"));
+            // Keep watching the broken file: fixing it applies the fix.
+            o.watch = config_path.iter().cloned().collect();
+            o
         }
     };
     o.config_path = config_path;

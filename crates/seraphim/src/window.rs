@@ -67,6 +67,11 @@ pub struct WindowOptions {
     pub menu_bar: bool,
     /// Menu bar contents (built-in merged with `[[menu]]`).
     pub menus: Vec<seraphim_config::Menu>,
+    /// Files the configuration came from (watched for live reload).
+    pub watch: Vec<std::path::PathBuf>,
+    pub live_reload: bool,
+    /// Shown in the window at startup (e.g. a config error).
+    pub notice: Option<String>,
 }
 
 impl Default for WindowOptions {
@@ -92,6 +97,9 @@ impl Default for WindowOptions {
             cli_preset: None,
             menu_bar: false,
             menus: seraphim_config::builtin_menu(),
+            watch: Vec::new(),
+            live_reload: true,
+            notice: None,
         }
     }
 }
@@ -107,7 +115,12 @@ const WHEEL_LINES: i64 = 3;
 enum UserEvent {
     /// Terminal state changed (output, exit, clipboard request).
     Wake,
+    /// A watched configuration file changed on disk.
+    ConfigChanged(Vec<std::path::PathBuf>),
 }
+
+/// How long a notice stays in the corner of the window.
+const TOAST_TIME: Duration = Duration::from_secs(4);
 
 struct Gpu {
     surface: wgpu::Surface<'static>,
@@ -245,6 +258,11 @@ struct Active {
     /// Alt went down with nothing else pressed since: a release opens the
     /// menu.
     alt_tap: bool,
+    /// A short notice in the corner (reloads, config errors), until the
+    /// deadline.
+    toast: Option<(String, Instant)>,
+    /// Live reload; `None` when disabled.
+    watcher: Option<crate::watch::Watcher>,
     /// What the menus are built from: configuration, config path (for
     /// the profile list) and the active profile.
     menu_src: (Vec<seraphim_config::Menu>, Option<std::path::PathBuf>, String),
@@ -267,6 +285,8 @@ impl Active {
 enum Request {
     NextProfile,
     Reload,
+    /// Live reload: these watched files changed.
+    Files(Vec<std::path::PathBuf>),
     Profile(String),
     /// Font size steps: +1, -1, or 0 to reset.
     Zoom(i8),
@@ -415,6 +435,13 @@ impl App {
             menu_pinned: o.menu_bar,
             alt_tap: false,
             menu_src: (o.menus.clone(), o.config_path.clone(), o.profile.clone()),
+            toast: o.notice.clone().map(|m| (m, Instant::now() + TOAST_TIME * 2)),
+            watcher: o.live_reload.then(|| {
+                let proxy = self.proxy.clone();
+                crate::watch::Watcher::spawn(o.watch.clone(), move |changed| {
+                    proxy.send_event(UserEvent::ConfigChanged(changed)).is_ok()
+                })
+            }),
             interactions,
             occluded: false,
         };
@@ -429,7 +456,7 @@ impl App {
     fn handle(&mut self, request: Request, event_loop: &ActiveEventLoop) {
         match request {
             Request::Quit => event_loop.exit(),
-            Request::NextProfile | Request::Reload | Request::Profile(_) => {
+            Request::NextProfile | Request::Reload | Request::Profile(_) | Request::Files(_) => {
                 self.apply_profile(request)
             }
             Request::Zoom(step) => {
@@ -522,6 +549,7 @@ impl App {
         if self.active.is_none() {
             return;
         }
+        let request_kind = request.clone();
         let path = self.options.config_path.clone();
         let current = self.options.profile.clone();
         let name = match request {
@@ -544,10 +572,14 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 // Keep the current look; say why.
-                eprintln!("seraphim: profile {name:?} not applied: {e}");
+                if let Some(a) = &mut self.active {
+                    a.notify(format!("Configuration not applied: {e}"));
+                }
                 return;
             }
         };
+        let live = matches!(request_kind, Request::Files(_));
+        let first_warning = warnings.first().cloned();
         for w in warnings {
             eprintln!("seraphim: {w}");
         }
@@ -589,8 +621,18 @@ impl App {
         }
         a.visual.set_reduced_motion(o.visual.reduced_motion);
         a.visual.set_global_opacity(o.visual.window_opacity);
-        for e in a.visual.set_layers(&o.layers, fade) {
-            eprintln!("seraphim: {e}");
+        // Rebuild the scene only if it changed (or a shader/image file did).
+        let files_changed = matches!(&request_kind, Request::Files(f)
+            if f.iter().any(|p| p.extension().is_none_or(|e| e != "toml")));
+        let mut layer_error = None;
+        if o.layers != self.options.layers || files_changed || !live {
+            for e in a.visual.set_layers(&o.layers, fade) {
+                eprintln!("seraphim: {e}");
+                layer_error.get_or_insert(e);
+            }
+        }
+        if let Some(w) = &a.watcher {
+            w.set(o.watch.clone());
         }
         if o.visual.window_opacity < 1.0 && self.options.visual.window_opacity >= 1.0 {
             eprintln!("seraphim: window_opacity takes effect after a restart (transparency is set when the window opens)");
@@ -612,7 +654,13 @@ impl App {
             Some(a.session.id()),
             seraphim_events::json!({ "profile": self.options.profile }),
         );
-        eprintln!("seraphim: profile {:?}", self.options.profile);
+        let msg = match (&request_kind, layer_error.or(first_warning)) {
+            (_, Some(problem)) => problem,
+            (Request::Files(_), None) => "Configuration reloaded".to_owned(),
+            (Request::Reload, None) => "Configuration reloaded".to_owned(),
+            _ => format!("Profile: {}", self.options.profile),
+        };
+        a.notify(msg);
         a.window.request_redraw();
     }
 
@@ -820,6 +868,20 @@ impl Active {
 
     fn bar_visible(&self) -> bool {
         self.menu_pinned || self.menu.engaged()
+    }
+
+    /// The overlay (menu bar, panels, notices) has something to draw.
+    fn overlay_visible(&self) -> bool {
+        self.bar_visible() || self.toast.is_some()
+    }
+
+    /// Show a notice for a few seconds (and log it).
+    fn notify(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        eprintln!("seraphim: {msg}");
+        // One line in the window; the log has the full text.
+        self.toast = Some((short_notice(&msg), Instant::now() + TOAST_TIME));
+        self.window.request_redraw();
     }
 
     /// Fresh menus for the current state (profile list, check marks).
@@ -1230,6 +1292,32 @@ impl Active {
 }
 
 /// `SERAPHIM_DEBUG_INPUT=1` logs raw window input events to stderr.
+/// One line for the window: file names instead of full paths, and for
+/// multi-line errors (TOML snippets) the last line, which says what's wrong.
+fn short_notice(msg: &str) -> String {
+    let lines: Vec<&str> = msg.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let first = lines.first().copied().unwrap_or_default();
+    let shorten = |w: &str| -> String {
+        match w.strip_suffix(':') {
+            Some(p) if p.starts_with('/') => {
+                let name =
+                    std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned());
+                format!("{}:", name.unwrap_or_else(|| p.to_owned()))
+            }
+            _ => w.to_owned(),
+        }
+    };
+    let mut out: Vec<String> = first.split(' ').map(shorten).collect();
+    if lines.len() > 1 {
+        let last = lines[lines.len() - 1];
+        if !last.starts_with('|') && !last.starts_with('^') {
+            out.push("—".into());
+            out.push(last.to_owned());
+        }
+    }
+    out.join(" ")
+}
+
 /// Open a folder in the desktop's file manager.
 fn open_path(path: &std::path::Path) {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
@@ -1274,7 +1362,11 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        if let UserEvent::ConfigChanged(files) = event {
+            self.handle(Request::Files(files), event_loop);
+            return;
+        }
         let allow_read = self.options.allow_clipboard_read;
         let Some(a) = &mut self.active else { return };
         if let Some(exit) = a.session.exit_info() {
@@ -1393,10 +1485,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
                 }
-                if a.bar_visible() {
+                if a.overlay_visible() {
                     let (cols, rows, _, _) = a.overlay_grid();
                     let palette = menu::Palette::from_theme(a.renderer.theme());
                     let mut t = seraphim_terminal::Terminal::with_scrollback(cols, rows, 0);
+                    a.menu.toast = a.toast.as_ref().map(|t| t.0.clone());
                     t.advance(&a.menu.paint(cols, rows, a.menu_pinned, &palette));
                     let view = View {
                         width: size.width,
@@ -1428,6 +1521,15 @@ impl ApplicationHandler<UserEvent> for App {
                 a.window.request_redraw();
             } else {
                 wake = Some(since + SYNC_TIMEOUT);
+            }
+        }
+
+        if let Some((_, until)) = a.toast {
+            if now >= until {
+                a.toast = None;
+                a.window.request_redraw();
+            } else {
+                wake = Some(wake.map_or(until, |w| w.min(until)));
             }
         }
 
@@ -1522,7 +1624,7 @@ fn draw(a: &mut Active) {
             pass.set_viewport(0.0, top as f32, w as f32, (h - top) as f32, 0.0, 1.0);
         }
         a.renderer.render(&mut pass);
-        if a.bar_visible() {
+        if a.overlay_visible() {
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             a.overlay.render(&mut pass);
         }
@@ -1628,6 +1730,16 @@ fn key_input(event: &KeyEvent, mods: Mods) -> Option<KeyInput<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notices_are_short() {
+        let e = "Configuration not applied: /home/u/.config/seraphim/config.toml: TOML parse error at line 3, column 8\n  |\n3 | size = \"huge\"\n  |        ^^^^^^\ninvalid type: string \"huge\", expected f32\n";
+        assert_eq!(
+            short_notice(e),
+            "Configuration not applied: config.toml: TOML parse error at line 3, column 8 — invalid type: string \"huge\", expected f32"
+        );
+        assert_eq!(short_notice("Configuration reloaded"), "Configuration reloaded");
+    }
 
     #[test]
     fn base64_round_trip() {
