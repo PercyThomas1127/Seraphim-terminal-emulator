@@ -17,6 +17,10 @@ pub enum Action {
     ScrollLineDown,
     ScrollTop,
     ScrollBottom,
+    /// Switch to the next profile (Ctrl+Shift+P).
+    NextProfile,
+    /// Re-read the configuration files (Ctrl+Shift+R).
+    ReloadConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +51,8 @@ pub fn shortcut(key: ShortcutKey, m: Modifiers, alt_screen: bool) -> Option<Acti
     match key {
         K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'c') => Some(Action::Copy),
         K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'v') => Some(Action::Paste),
+        K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'p') => Some(Action::NextProfile),
+        K::Char(c) if ctrl_shift && c.eq_ignore_ascii_case(&'r') => Some(Action::ReloadConfig),
         K::Insert if shift_only => Some(Action::Paste),
         _ if alt_screen => None,
         K::PageUp if shift_only => Some(Action::ScrollPageUp),
@@ -144,6 +150,8 @@ mod tests {
         assert_eq!(shortcut(ShortcutKey::Char('C'), CTRL_SHIFT, false), Some(Action::Copy));
         assert_eq!(shortcut(ShortcutKey::Char('v'), CTRL_SHIFT, true), Some(Action::Paste));
         assert_eq!(shortcut(ShortcutKey::Insert, SHIFT, false), Some(Action::Paste));
+        assert_eq!(shortcut(ShortcutKey::Char('P'), CTRL_SHIFT, true), Some(Action::NextProfile));
+        assert_eq!(shortcut(ShortcutKey::Char('r'), CTRL_SHIFT, false), Some(Action::ReloadConfig));
         assert_eq!(shortcut(ShortcutKey::PageUp, SHIFT, false), Some(Action::ScrollPageUp));
         assert_eq!(shortcut(ShortcutKey::PageUp, SHIFT, true), None, "alt screen gets the key");
         assert_eq!(shortcut(ShortcutKey::PageUp, Modifiers::default(), false), None);

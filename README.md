@@ -79,6 +79,35 @@ unambiguous keys (Ctrl+I vs Tab, Esc vs Alt) and key release events.
 Applications may set the clipboard with OSC 52; reading it requires
 `--allow-clipboard-read` (or `clipboard.allow_read` in the config).
 
+### Backgrounds, themes and profiles
+
+![Seraphim visual engine](docs/images/visual.png)
+
+Layers behind the text — solid colors, gradients, PNG images and WGSL
+shaders (built-in `aurora` and `starfield`, or your own) — are declared in
+the config:
+
+```toml
+theme = "celestial"          # or "monochrome", "daylight", themes/<name>.toml
+
+[[background]]
+kind = "gradient"
+colors = ["#100c22", "#2a1844", "#0d0f1f"]
+
+[[background]]
+kind = "shader"
+shader = "aurora"
+blend = "screen"
+opacity = 0.75
+params = { speed = 0.3, hue = 0.78 }
+```
+
+Profiles in `~/.config/seraphim/profiles/<name>.toml` override any part of
+the config; switch with `--profile NAME` or **Ctrl+Shift+P** at runtime
+(the background crossfades), reload with **Ctrl+Shift+R**. Animation only
+draws frames while something moves, pauses when the window is unfocused, and
+stops entirely with `visual.reduced_motion = true`.
+
 ### Configuration
 
 Settings live in `~/.config/seraphim/config.toml` (font, window size,

@@ -1832,6 +1832,7 @@ dependencies = [
  "seraphim-render",
  "seraphim-session",
  "seraphim-terminal",
+ "seraphim-visual",
  "wgpu",
  "winit",
 ]
@@ -1901,6 +1902,18 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "vte",
+]
+
+[[package]]
+name = "seraphim-visual"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "png",
+ "pollster",
+ "seraphim-render",
+ "seraphim-terminal",
+ "wgpu",
 ]
 
 [[package]]

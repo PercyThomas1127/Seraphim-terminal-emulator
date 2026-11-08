@@ -1,0 +1,8 @@
+# Celestial: dark violet with rose accents (the default).
+foreground = "#e6e1f0"
+background = "#14121f"
+cursor = "#f5a6d0"
+cursor_text = "#14121f"
+selection_background = "#4a3b6b"
+normal = ["#2a273a", "#ff5577", "#8be9a8", "#f9d98b", "#89a8ff", "#c89bff", "#7fe0e8", "#d8d3e6"]
+bright = ["#5c5775", "#ff7a96", "#a9f5bf", "#fce6a9", "#a8bfff", "#f5a6d0", "#a3eef2", "#ffffff"]

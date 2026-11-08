@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod actions;
+mod profile;
 mod window;
 
 use seraphim_events::EventBus;
@@ -130,29 +131,33 @@ fn replay(o: Opts) -> Result<ExitCode, String> {
 
 /// Window options from the config file, then command-line overrides.
 fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
-    // --config must be known before anything else is applied.
+    // --config and --profile must be known before anything else applies.
     let mut config_path = seraphim_config::Config::default_path();
+    let mut profile: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--config" {
-            config_path = Some(it.next().ok_or("--config needs a PATH")?.into());
-        } else if a == "-e" || a == "--" {
-            break;
+        match a.as_str() {
+            "--config" => config_path = Some(it.next().ok_or("--config needs a PATH")?.into()),
+            "--profile" => profile = Some(it.next().ok_or("--profile needs a NAME")?.clone()),
+            "-e" | "--" => break,
+            _ => {}
         }
     }
-    let config = match &config_path {
-        Some(p) => match seraphim_config::Config::load(p) {
-            Ok(c) => c.unwrap_or_default(),
-            // A broken config must not leave you without a terminal: report
-            // it and carry on with the defaults.
-            Err(e) => {
-                eprintln!("seraphim: ignoring config: {e}");
-                seraphim_config::Config::default()
+    let mut o = match profile::load(config_path.as_deref(), profile.as_deref()) {
+        Ok((o, warnings)) => {
+            for w in warnings {
+                eprintln!("seraphim: {w}");
             }
-        },
-        None => seraphim_config::Config::default(),
+            o
+        }
+        // A broken config must not leave you without a terminal: report
+        // it and carry on with the defaults.
+        Err(e) => {
+            eprintln!("seraphim: ignoring config: {e}");
+            profile::options_from_config(&seraphim_config::Config::default(), None, "default").0
+        }
     };
-    let mut o = options_from_config(&config);
+    o.config_path = config_path;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -162,12 +167,19 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
             "--config" => {
                 value("--config")?;
             }
-            "--font" => o.font_family = Some(value("--font")?),
+            "--profile" => {
+                value("--profile")?;
+            }
+            "--font" => {
+                o.font_family = Some(value("--font")?);
+                o.cli_font_family = o.font_family.clone();
+            }
             "--font-size" => {
                 o.font_size = value("--font-size")?
                     .parse::<f32>()
                     .map_err(|_| "--font-size needs a number")?
-                    .clamp(4.0, 200.0)
+                    .clamp(4.0, 200.0);
+                o.cli_font_size = Some(o.font_size);
             }
             "--cols" => o.cols = value("--cols")?.parse().map_err(|_| "--cols needs a number")?,
             "--rows" => o.rows = value("--rows")?.parse().map_err(|_| "--rows needs a number")?,
@@ -185,39 +197,9 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
     Ok(o)
 }
 
-fn options_from_config(c: &seraphim_config::Config) -> window::WindowOptions {
-    let mut theme = seraphim_render::Theme::default();
-    let k = &c.colors;
-    theme.foreground = k.foreground;
-    theme.background = k.background;
-    theme.cursor = k.cursor;
-    theme.cursor_text = k.cursor_text;
-    theme.selection_bg = k.selection_background;
-    theme.selection_fg = k.selection_foreground;
-    theme.bold_is_bright = k.bold_is_bright;
-    theme.ansi[..8].copy_from_slice(&k.normal);
-    theme.ansi[8..].copy_from_slice(&k.bright);
-    window::WindowOptions {
-        font_family: c.font.family.clone(),
-        font_size: c.font.size,
-        cols: c.window.columns,
-        rows: c.window.rows,
-        padding: c.window.padding,
-        command: c
-            .shell
-            .program
-            .as_ref()
-            .map(|p| Command::new(p.as_str()).args(c.shell.args.iter().map(|s| s.as_str()))),
-        allow_clipboard_read: c.clipboard.allow_read,
-        theme,
-        scrollback: c.terminal.scrollback,
-        grapheme_clustering: c.terminal.grapheme_clustering,
-    }
-}
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),
@@ -254,7 +236,7 @@ mod tests {
             std::path::Path::new("t.toml"),
         )
         .unwrap();
-        let o = options_from_config(&c);
+        let o = profile::options_from_config(&c, None, "default").0;
         assert_eq!(o.font_size, 13.5);
         assert_eq!(o.padding, 0.0);
         assert_eq!(o.theme.ansi[0], [0, 0, 1]);
@@ -267,7 +249,8 @@ mod tests {
 
     #[test]
     fn default_config_equals_default_theme() {
-        let o = options_from_config(&seraphim_config::Config::default());
+        let o =
+            profile::options_from_config(&seraphim_config::Config::default(), None, "default").0;
         assert_eq!(
             o.theme,
             seraphim_render::Theme::default(),

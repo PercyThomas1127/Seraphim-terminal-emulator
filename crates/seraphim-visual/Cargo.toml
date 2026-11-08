@@ -1,0 +1,16 @@
+[package]
+name = "seraphim-visual"
+description = "Seraphim Visual and Animation Engines: background layers, WGSL shaders, tweens and springs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+png.workspace = true
+
+[dev-dependencies]
+seraphim-render.workspace = true
+seraphim-terminal.workspace = true

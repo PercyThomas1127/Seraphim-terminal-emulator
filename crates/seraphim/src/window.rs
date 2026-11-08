@@ -18,6 +18,7 @@ use seraphim_terminal::input::{
     KeyInput, KeyKind, ModifierKey, Mods, MouseAction, MouseButton,
 };
 use seraphim_terminal::{MouseMode, Point};
+use seraphim_visual::{Transition, VisualEngine};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
@@ -46,6 +47,15 @@ pub struct WindowOptions {
     pub theme: Theme,
     pub scrollback: usize,
     pub grapheme_clustering: bool,
+    pub visual: seraphim_config::Visual,
+    /// Background layers, bottom first.
+    pub layers: Vec<seraphim_visual::LayerSpec>,
+    /// Active profile name ("default" for none).
+    pub profile: String,
+    pub config_path: Option<std::path::PathBuf>,
+    /// Command-line overrides, re-applied on reload and profile switches.
+    pub cli_font_family: Option<String>,
+    pub cli_font_size: Option<f32>,
 }
 
 impl Default for WindowOptions {
@@ -61,6 +71,12 @@ impl Default for WindowOptions {
             theme: Theme::default(),
             scrollback: seraphim_terminal::DEFAULT_SCROLLBACK,
             grapheme_clustering: true,
+            visual: Default::default(),
+            layers: Vec::new(),
+            profile: "default".into(),
+            config_path: None,
+            cli_font_family: None,
+            cli_font_size: None,
         }
     }
 }
@@ -199,6 +215,18 @@ struct Active {
     warned_clipboard_read: bool,
     /// When the app turned on synchronized output with a frame pending.
     sync_since: Option<Instant>,
+    visual: VisualEngine,
+    visual_cfg: seraphim_config::Visual,
+    last_frame: Instant,
+    /// A profile switch or reload requested by a shortcut; applied by `App`,
+    /// which owns the configuration.
+    pending: Option<ProfileRequest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileRequest {
+    Next,
+    Reload,
 }
 
 struct App {
@@ -244,6 +272,8 @@ impl App {
         );
         let attrs = Window::default_attributes()
             .with_title("Seraphim")
+            // Transparency must be requested when the window is created.
+            .with_transparent(o.visual.window_opacity < 1.0)
             .with_inner_size(size)
             .with_min_inner_size(PhysicalSize::new(
                 (m.width * 10.0) as u32,
@@ -254,7 +284,7 @@ impl App {
         window.set_cursor(CursorIcon::Text);
         let scale = window.scale_factor();
 
-        let gpu = init_gpu(event_loop, window.clone())?;
+        let gpu = init_gpu(event_loop, window.clone(), o.visual.window_opacity < 1.0)?;
         let mut renderer = Renderer::new(&gpu.device, gpu.config.format, fonts, o.theme.clone());
         if (font_px(o.font_size, scale) - renderer.fonts().size_px()).abs() > 0.1 {
             renderer.set_fonts(self.fonts_for(scale)?);
@@ -284,6 +314,13 @@ impl App {
         )
         .map_err(|e| format!("cannot start shell: {e}"))?;
 
+        let mut visual = VisualEngine::new(&gpu.device, &gpu.queue, gpu.config.format);
+        visual.set_reduced_motion(o.visual.reduced_motion);
+        visual.set_global_opacity(o.visual.window_opacity);
+        for e in visual.set_layers(&o.layers, Transition::Instant) {
+            eprintln!("seraphim: {e}");
+        }
+
         window.request_redraw();
         Ok(Active {
             window,
@@ -302,7 +339,101 @@ impl App {
             blink_deadline: Instant::now() + BLINK_INTERVAL,
             warned_clipboard_read: false,
             sync_since: None,
+            visual,
+            visual_cfg: o.visual.clone(),
+            last_frame: Instant::now(),
+            pending: None,
         })
+    }
+
+    /// Switch profile (or reload the current one) without restarting the
+    /// shell: theme, fonts, background layers and visual settings change;
+    /// the background crossfades.
+    fn apply_profile(&mut self, request: ProfileRequest) {
+        if self.active.is_none() {
+            return;
+        }
+        let path = self.options.config_path.clone();
+        let current = self.options.profile.clone();
+        let name = match request {
+            ProfileRequest::Reload => current.clone(),
+            ProfileRequest::Next => {
+                let all = path
+                    .as_deref()
+                    .map(seraphim_config::Config::profiles)
+                    .unwrap_or_else(|| vec!["default".into()]);
+                let i = all.iter().position(|p| *p == current).map_or(0, |i| (i + 1) % all.len());
+                all[i].clone()
+            }
+        };
+        let (mut o, warnings) = match crate::profile::load(path.as_deref(), Some(&name)) {
+            Ok(r) => r,
+            Err(e) => {
+                // Keep the current look; say why.
+                eprintln!("seraphim: profile {name:?} not applied: {e}");
+                return;
+            }
+        };
+        for w in warnings {
+            eprintln!("seraphim: {w}");
+        }
+        // Keep what isn't part of a profile, and command-line overrides.
+        o.cols = self.options.cols;
+        o.rows = self.options.rows;
+        o.command = self.options.command.clone();
+        o.config_path = path;
+        o.cli_font_family = self.options.cli_font_family.clone();
+        o.cli_font_size = self.options.cli_font_size;
+        if o.cli_font_family.is_some() {
+            o.font_family = o.cli_font_family.clone();
+        }
+        if let Some(size) = o.cli_font_size {
+            o.font_size = size;
+        }
+        let font_changed = o.font_family != self.options.font_family
+            || o.font_size != self.options.font_size
+            || o.padding != self.options.padding;
+        let fade = Transition::Tween {
+            duration: o.visual.transition_ms as f64 / 1000.0,
+            easing: seraphim_visual::Easing::EaseInOut,
+        };
+        let a = self.active.as_mut().unwrap();
+        a.renderer.set_theme(o.theme.clone());
+        {
+            let mut t = a.session.terminal();
+            t.set_color_scheme(o.theme.scheme());
+            t.set_grapheme_clustering(o.grapheme_clustering);
+        }
+        a.visual.set_reduced_motion(o.visual.reduced_motion);
+        a.visual.set_global_opacity(o.visual.window_opacity);
+        for e in a.visual.set_layers(&o.layers, fade) {
+            eprintln!("seraphim: {e}");
+        }
+        if o.visual.window_opacity < 1.0 && self.options.visual.window_opacity >= 1.0 {
+            eprintln!("seraphim: window_opacity takes effect after a restart (transparency is set when the window opens)");
+        }
+        a.visual_cfg = o.visual.clone();
+        a.visual.set_paused(!a.focused && !a.visual_cfg.animate_unfocused);
+        let scale = a.scale;
+        self.options = o;
+        if font_changed {
+            if let Ok(fonts) = self.fonts_for(scale) {
+                let pad = self.padding(scale);
+                let a = self.active.as_mut().unwrap();
+                a.renderer.set_fonts(fonts);
+                let size = a.window.inner_size();
+                let (cols, rows) = a.renderer.grid_size(size.width, size.height, pad);
+                let _ = a.session.resize(cols, rows);
+            }
+        }
+        let a = self.active.as_mut().unwrap();
+        a._bus.publisher("visual").publish(
+            "visual.profile.changed",
+            Some(a.session.id()),
+            seraphim_events::json!({ "profile": self.options.profile }),
+        );
+        eprintln!("seraphim: profile {:?}", self.options.profile);
+        a.window.request_redraw();
     }
 
     fn fonts_for(&self, scale: f64) -> Result<Fonts, String> {
@@ -318,7 +449,11 @@ impl App {
     }
 }
 
-fn init_gpu(event_loop: &ActiveEventLoop, window: Arc<Window>) -> Result<Gpu, String> {
+fn init_gpu(
+    event_loop: &ActiveEventLoop,
+    window: Arc<Window>,
+    transparent: bool,
+) -> Result<Gpu, String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
         Box::new(event_loop.owned_display_handle()),
     ));
@@ -346,6 +481,13 @@ fn init_gpu(event_loop: &ActiveEventLoop, window: Arc<Window>) -> Result<Gpu, St
         config.format = *f;
     }
     config.present_mode = wgpu::PresentMode::AutoVsync;
+    if transparent {
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+        } else {
+            eprintln!("seraphim: this display does not support transparent windows; window_opacity ignored");
+        }
+    }
     surface.configure(&device, &config);
     eprintln!(
         "seraphim: {} ({:?}), surface {:?}",
@@ -411,6 +553,8 @@ impl Active {
             a.window.request_redraw();
         };
         match action {
+            Action::NextProfile => self.pending = Some(ProfileRequest::Next),
+            Action::ReloadConfig => self.pending = Some(ProfileRequest::Reload),
             Action::Copy => self.copy_selection(Board::Clipboard),
             Action::Paste => self.paste(Board::Clipboard),
             Action::ScrollPageUp => scroll(self, rows - 1),
@@ -744,6 +888,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 a.focused = focused;
+                a.visual.set_paused(!focused && !a.visual_cfg.animate_unfocused);
                 a.reset_blink();
                 let bytes = encode_focus(focused, a.session.terminal().modes());
                 if !bytes.is_empty() {
@@ -791,9 +936,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
                 }
+                a.last_frame = Instant::now();
                 draw(a);
             }
             _ => {}
+        }
+        if let Some(req) = self.active.as_mut().and_then(|a| a.pending.take()) {
+            self.apply_profile(req);
         }
     }
 
@@ -809,6 +958,16 @@ impl ApplicationHandler<UserEvent> for App {
             } else {
                 wake = Some(since + SYNC_TIMEOUT);
             }
+        }
+
+        // Animated background: draw frames at up to max_fps while it moves.
+        if a.visual.animating() {
+            let next =
+                a.last_frame + Duration::from_secs_f64(1.0 / a.visual_cfg.max_fps.max(1) as f64);
+            if now >= next {
+                a.window.request_redraw();
+            }
+            wake = Some(wake.map_or(next, |w| w.min(next)));
         }
 
         let blinking = {
@@ -838,6 +997,12 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn draw(a: &mut Active) {
+    let (w, h) = (a.gpu.config.width, a.gpu.config.height);
+    a.visual.prepare(w, h);
+    // Premultiplied background at the window opacity (1 = opaque).
+    let mut clear = a.renderer.clear_color();
+    let alpha = a.visual_cfg.window_opacity.clamp(0.0, 1.0) as f64;
+    clear = wgpu::Color { r: clear.r * alpha, g: clear.g * alpha, b: clear.b * alpha, a: alpha };
     let frame = match a.gpu.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(f) => f,
         wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
@@ -862,12 +1027,13 @@ fn draw(a: &mut Active) {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(a.renderer.clear_color()),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
             })],
             ..Default::default()
         });
+        a.visual.render(&mut pass);
         a.renderer.render(&mut pass);
     }
     a.gpu.queue.submit([encoder.finish()]);

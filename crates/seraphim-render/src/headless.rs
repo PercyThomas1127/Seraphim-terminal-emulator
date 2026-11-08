@@ -87,6 +87,17 @@ impl Headless {
 
     /// Render `term` and read the pixels back.
     pub fn render(&mut self, term: &Terminal, view: View) -> Image {
+        self.render_with(term, view, &mut |_| {})
+    }
+
+    /// Like [`Headless::render`], with `background` drawing into the pass
+    /// before the text (e.g. visual layers).
+    pub fn render_with(
+        &mut self,
+        term: &Terminal,
+        view: View,
+        background: &mut dyn FnMut(&mut wgpu::RenderPass<'_>),
+    ) -> Image {
         let (width, height) = (view.width.max(1), view.height.max(1));
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
@@ -116,6 +127,7 @@ impl Headless {
                 })],
                 ..Default::default()
             });
+            background(&mut pass);
             self.renderer.render(&mut pass);
         }
 

@@ -3,6 +3,14 @@
 # Location: $XDG_CONFIG_HOME/seraphim/config.toml (usually
 # ~/.config/seraphim/config.toml). Every setting is optional; this file
 # lists the defaults. Command-line options override it.
+#
+# Layering: theme colors < this file < the active profile.
+#   theme    = built-in "celestial", "monochrome", "daylight", or
+#              themes/<name>.toml (a file of [colors] keys)
+#   profile  = profiles/<name>.toml, any subset of these settings; switch at
+#              runtime with Ctrl+Shift+P, reload files with Ctrl+Shift+R.
+# theme = "celestial"
+# profile = "work"
 
 [font]
 # Family name; when unset, the first installed of JetBrains Mono, Fira Code,
@@ -52,3 +60,46 @@ bold_is_bright = false
 # ANSI colors 0-7 and 8-15.
 normal = ["#2a273a", "#ff5577", "#8be9a8", "#f9d98b", "#89a8ff", "#c89bff", "#7fe0e8", "#d8d3e6"]
 bright = ["#5c5775", "#ff7a96", "#a9f5bf", "#fce6a9", "#a8bfff", "#f5a6d0", "#a3eef2", "#ffffff"]
+
+[visual]
+# Freeze all animation and make transitions instant.
+reduced_motion = false
+# Frame-rate cap while something animates (nothing animates: no frames).
+max_fps = 60
+# Keep animating while the window is unfocused.
+animate_unfocused = false
+# Background opacity of the window (needs a compositor; text stays opaque).
+window_opacity = 1.0
+# Crossfade duration when switching profiles, in milliseconds.
+transition_ms = 400
+
+# Background layers, bottom first. Kinds: solid, gradient, image (PNG),
+# shader (built-in "aurora", "starfield", or a .wgsl file implementing
+#   fn shade(uv: vec2<f32>, px: vec2<f32>) -> vec4<f32>
+# with u.time, u.resolution and p(P_<name>) for the params below).
+# Every layer takes opacity (0-1) and blend ("normal", "add", "multiply",
+# "screen").
+#
+# [[background]]
+# kind = "gradient"
+# colors = ["#100c22", "#2a1844", "#0d0f1f"]
+# angle = 90
+#
+# [[background]]
+# kind = "shader"
+# shader = "starfield"
+# opacity = 0.8
+# params = { density = 0.5, speed = 1.0 }
+#
+# [[background]]
+# kind = "shader"
+# shader = "aurora"
+# blend = "screen"
+# opacity = 0.7
+# params = { speed = 0.3, intensity = 0.8, hue = 0.78 }
+#
+# [[background]]
+# kind = "image"
+# path = "~/Pictures/wallpaper.png"
+# fit = "cover"
+# opacity = 0.3

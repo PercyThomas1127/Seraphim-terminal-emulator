@@ -1,0 +1,8 @@
+# Monochrome: greys only; color is expressed as brightness.
+foreground = "#d4d4d4"
+background = "#111111"
+cursor = "#f0f0f0"
+cursor_text = "#111111"
+selection_background = "#3a3a3a"
+normal = ["#2b2b2b", "#9a9a9a", "#b4b4b4", "#c4c4c4", "#8a8a8a", "#a6a6a6", "#bcbcbc", "#d4d4d4"]
+bright = ["#555555", "#b0b0b0", "#cacaca", "#dadada", "#a0a0a0", "#bebebe", "#d2d2d2", "#ffffff"]

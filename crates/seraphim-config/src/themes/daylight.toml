@@ -1,0 +1,8 @@
+# Daylight: a light theme with warm paper tones.
+foreground = "#3b3550"
+background = "#f7f3ec"
+cursor = "#c2477a"
+cursor_text = "#f7f3ec"
+selection_background = "#e3d7f0"
+normal = ["#3b3550", "#c23b5a", "#2f8a55", "#a8740f", "#3a62c4", "#8a4cc2", "#1f8a92", "#c9c2d6"]
+bright = ["#6c6680", "#d9536f", "#3fa067", "#c28a1d", "#5079d6", "#a064d6", "#2fa1a9", "#ffffff"]

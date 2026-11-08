@@ -15,6 +15,7 @@ seraphim-events = { path = "crates/seraphim-events" }
 seraphim-session = { path = "crates/seraphim-session" }
 seraphim-render = { path = "crates/seraphim-render" }
 seraphim-config = { path = "crates/seraphim-config" }
+seraphim-visual = { path = "crates/seraphim-visual" }
 vte = "0.15"
 unicode-width = "0.2"
 unicode-segmentation = "1"
