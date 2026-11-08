@@ -372,3 +372,97 @@ fn combining_marks_follow_their_cell() {
     assert_eq!(t.scrollback()[0].text(), "a\u{301}");
     assert_eq!(t.screen_text(), "b\nc");
 }
+
+// Found by xterm-refereed differential testing (crates/seraphim-conformance).
+
+#[test]
+fn deleting_a_wide_char_keeps_the_next_one() {
+    let t = term(8, 1, "日本\x1b[1;1H\x1b[2P");
+    assert_eq!(t.screen_text(), "本");
+    // Inserting before a wide char moves it intact.
+    let t = term(8, 1, "日本\x1b[1;1H\x1b[2@");
+    assert_eq!(t.screen_text(), "  日本");
+    // A deletion boundary through the middle of a wide char breaks it.
+    let t = term(8, 1, "日本\x1b[1;1H\x1b[3P");
+    assert_eq!(t.screen_text(), "");
+}
+
+#[test]
+fn rep_only_repeats_an_immediately_preceding_graphic_char() {
+    let t = term(14, 1, "本\t\x1b[3b");
+    assert_eq!(t.screen_text(), "本");
+    // Verified against xterm: a second REP repeats nothing, and SGR or CR
+    // in between also end the repeatable character.
+    let t = term(14, 1, "ab\x1b[2b\x1b[2b");
+    assert_eq!(t.screen_text(), "abbb");
+    let t = term(14, 1, "a\x1b[31m\x1b[2b");
+    assert_eq!(t.screen_text(), "a");
+}
+
+#[test]
+fn wide_char_wrapping_at_last_column_keeps_that_cell() {
+    let t = term(14, 2, "\t\tx\t本");
+    assert_eq!(t.screen_text(), "             x\n本");
+}
+
+#[test]
+fn scroll_down_default_count() {
+    let t = term(6, 3, "a\r\nb\r\nc\x1b[2;1H\x1b[T");
+    assert_eq!(t.screen_text(), "\na\nb");
+    let t = term(6, 3, "a\r\nb\r\nc\x1b[2;1H\x1b[0S");
+    assert_eq!(t.screen_text(), "b\nc", "SU 0 still means 1");
+}
+
+// Each expectation below was verified against xterm (see
+// crates/seraphim-conformance).
+
+#[test]
+fn wide_char_without_autowrap_follows_xterm() {
+    let t = |s: &str| term(6, 1, s).screen_text();
+    assert_eq!(t("\x1b[?7lab日本"), "ab日本", "fits exactly");
+    assert_eq!(t("\x1b[?7labc日本"), "abc本", "replaces the wide char just printed");
+    assert_eq!(t("\x1b[?7labcd日本"), "abcd本");
+    assert_eq!(t("\x1b[?7labcde日"), "abcde", "no room: dropped");
+    assert_eq!(t("\x1b[?7labcdef日"), "abcdef");
+    assert_eq!(t("\x1b[?7labcd日\x1b[1;6H本"), "abcd日", "cursor moved in between: dropped");
+    assert_eq!(t("\x1b[?7labcd日x"), "abcd x", "narrow char splits the wide one");
+}
+
+#[test]
+fn alternate_screen_clearing_follows_xterm() {
+    let t = |s: &str| term(6, 1, s).screen_text();
+    assert_eq!(t("main\x1b[?1049hq\x1b[?1049h"), "", "1049h always clears");
+    assert_eq!(t("main\x1b[?1047hq\x1b[?1047h"), "    q", "1047h does not clear");
+    assert_eq!(t("main\x1b[?47hq\x1b[?47h"), "    q");
+    assert_eq!(t("main\x1b[?1047hq\x1b[?1047l\x1b[?47h"), "", "1047l clears on the way out");
+    assert_eq!(t("main\x1b[?47hq\x1b[?47l\x1b[?47h"), "    q", "47 never clears");
+}
+
+#[test]
+fn tab_at_margin_keeps_pending_wrap() {
+    assert_eq!(term(6, 2, "abcdef\tg").screen_text(), "abcdef\ng");
+    assert_eq!(term(6, 2, "abcde\tg").screen_text(), "abcdeg");
+}
+
+#[test]
+fn resize_forgets_the_last_wide_char_position() {
+    // Found by the fuzzer: a remembered wide-char column survived a shrink.
+    let mut t = term(10, 2, "\x1b[?7labcdefgh日");
+    t.resize(3, 2);
+    t.advance("\x1b[?7l本".as_bytes());
+    t.check_invariants().unwrap();
+}
+
+#[test]
+fn vertical_movement_and_margins_follow_xterm() {
+    // Region rows 3..=5 (1-based) in an 8-row screen.
+    let at = |seq: &str| {
+        let t = term(8, 8, &format!("\x1b[3;5r{seq}"));
+        (t.cursor().row + 1, t.cursor().col + 1)
+    };
+    assert_eq!(at("\x1b[2;1H\x1b[9B"), (5, 1), "CUD from above stops at the bottom margin");
+    assert_eq!(at("\x1b[2;1H\x1b[9e"), (8, 1), "VPR ignores margins");
+    assert_eq!(at("\x1b[8;1H\x1b[9A"), (3, 1), "CUU from below stops at the top margin");
+    assert_eq!(at("\x1b[8;1H\x1b[9F"), (3, 1));
+    assert_eq!(at("\x1b[1;1H\x1b[9E"), (5, 1));
+}

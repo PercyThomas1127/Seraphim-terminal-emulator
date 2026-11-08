@@ -30,6 +30,12 @@ applications.
 | Mouse reporting: X10/1000/1002/1003 with default/UTF-8/SGR encodings, modifiers, wheel; Shift bypasses to selection; alternate-scroll (1007) for less/man | `seraphim-terminal/src/input.rs`, window | unit tests; exact bytes via Xvfb |
 | OSC 52 policy: store allowed (decoded, 1 MiB cap, never broadcast on the bus), read denied unless `--allow-clipboard-read` | session queue + window | session test; Xvfb |
 | Cursor blink only when the app requests it (DECSCUSR / `?12`); 0 idle CPU otherwise | window | Xvfb pixel sampling + `/proc` CPU ticks |
+| Queries: OSC 4/10/11/12 (query/set/reset, reply terminator matches request), DECRQM, XTVERSION, DECRQSS (`m`, ` q`, `r`), `CSI 18 t`; app color changes rendered | core `palette.rs`, renderer | `tests/queries.rs`, renderer pixel test |
+| Synchronized output (2026) honoured in the window, 150 ms safety timeout | window | — |
+| OSC payload cap (2 MiB) via a pre-filter in front of vte | core `prefilter.rs` | unit tests |
+| Conformance vs xterm: 427/427 golden screens, vttest 34/35 (132-col by design), 300/300 triage streams | `seraphim-conformance` | see `docs/conformance.md` |
+| Fuzzing with invariant checks (stable Rust) | `examples/fuzz.rs`, `tests/fuzz.rs` | 250k+ runs clean |
+| Config file `~/.config/seraphim/config.toml`: font, window, colors, scrollback, shell, clipboard; typos are errors with line/column; broken config falls back to defaults with a message | `seraphim-config` | unit tests; Xvfb |
 
 ## Remaining for the Phase I milestone
 
@@ -47,17 +53,22 @@ Ordered by dependency. Each needs its acceptance check before it's done.
 4. **Kitty keyboard protocol** (`CSI > u` push/pop, `CSI ? u` query):
    separate encoder; do *not* answer the `CSI ? u` query until
    implemented, so apps don't detect support we don't have.
-5. **Conformance:** run `vttest` (menus 1–3, 8, 11) and `esctest`; add
-   colour queries OSC 4/10/11/12, DECRQM, XTVERSION, DECSCUSR already done.
-6. **Robustness:** `cargo-fuzz` target on `Terminal::advance` +
-   `resize`; OSC length cap (ADR 0002 gap 3).
+5. ~~Conformance~~ — done (see `docs/conformance.md`). Follow-ups:
+   vttest menus 3 (character sets), 6 (reports) and 11 (xterm extensions)
+   need menu-aware driving; esctest needs DECRQCRA.
+6. ~~Robustness~~ — done: OSC cap and an invariant-checking fuzzer.
+   (`cargo-fuzz` coverage-guided fuzzing still needs a nightly toolchain.)
 7. **Performance tracking:** keep `examples/throughput.rs` within 10% of
    `alacritty_terminal` on the same machine (absolute MB/s depends on the
    host; the old "500 MB/s" target was uncalibrated). Add partial
    redraws via `take_damage()` if frame-build time becomes significant.
 8. **Reflow on resize** using `Row::wrapped` (currently truncates).
-9. **Minimal config:** `~/.config/seraphim/config.toml` with font, size,
-   palette, shell, scrollback — just enough for Phase II profiles to build on.
+9. ~~Minimal config~~ — done. Live reload and profiles come with Phase II.
+10. **Throughput regression:** after this stage the parser is ~3–8% slower
+    than the previous commit and ~10–15% behind `alacritty_terminal` on this
+    VM (noise ±8%). Instruction counts per byte went *down*, so look at code
+    layout/inlining of `Perform::print` first (`valgrind --tool=callgrind`,
+    `PROFILE_NO_NEWLINE=1 ... --example throughput -- --profile`).
 
 ## Known limitations (today)
 

@@ -58,6 +58,9 @@ pub struct SessionConfig {
     pub rows: u16,
     pub scrollback: usize,
     pub notify: Option<Notifier>,
+    /// Base colors used to answer OSC 10/11/4 color queries. Set before the
+    /// program starts, so even its very first query sees the real theme.
+    pub color_scheme: Option<seraphim_terminal::palette::ColorScheme>,
 }
 
 impl Default for SessionConfig {
@@ -68,6 +71,7 @@ impl Default for SessionConfig {
             rows: 24,
             scrollback: seraphim_terminal::DEFAULT_SCROLLBACK,
             notify: None,
+            color_scheme: None,
         }
     }
 }
@@ -118,11 +122,15 @@ impl Session {
     pub fn spawn(id: SessionId, config: SessionConfig, bus: &EventBus) -> io::Result<Session> {
         let size = PtySize::new(config.cols, config.rows);
         let pty = Pty::spawn(&config.command, size)?;
-        let terminal = Arc::new(Mutex::new(Terminal::with_scrollback(
+        let mut term = Terminal::with_scrollback(
             config.cols as usize,
             config.rows as usize,
             config.scrollback,
-        )));
+        );
+        if let Some(scheme) = config.color_scheme.clone() {
+            term.set_color_scheme(scheme);
+        }
+        let terminal = Arc::new(Mutex::new(term));
         let reader = pty.reader()?;
         let writer = Arc::new(Mutex::new(pty.writer()?));
         let pid = pty.pid();

@@ -35,6 +35,26 @@ impl Row {
         Row { cells: Vec::with_capacity(capacity), wrapped: false, combining: Vec::new(), occ: 0 }
     }
 
+    /// Wide-character pairing and the `occ` invariant.
+    pub(crate) fn check_invariants(&self) -> Result<(), String> {
+        let n = self.cells.len();
+        for (i, c) in self.cells.iter().enumerate() {
+            if c.is_wide() && !(i + 1 < n && self.cells[i + 1].is_wide_spacer()) {
+                return Err(format!("wide char at {i} without spacer"));
+            }
+            if c.is_wide_spacer() && !(i > 0 && self.cells[i - 1].is_wide()) {
+                return Err(format!("orphan spacer at {i}"));
+            }
+            if i >= self.occ && *c != Cell::default() {
+                return Err(format!("cell {i} written beyond occ {}", self.occ));
+            }
+        }
+        if self.combining.iter().any(|(c, _)| *c as usize >= n) {
+            return Err("combining mark beyond row end".into());
+        }
+        Ok(())
+    }
+
     /// Record a write to `cells[..to]` (keeps the `occ` invariant).
     #[inline]
     pub(crate) fn touch(&mut self, to: usize) {
@@ -269,6 +289,17 @@ impl Grid {
 
     /// Erase a wide character pair if `col` is either half of one, so a
     /// partial overwrite never leaves an orphaned half on screen.
+    /// Like [`Grid::split_wide`], but for an edit *boundary* between
+    /// `col - 1` and `col` (insert/delete characters): only a wide
+    /// character that straddles the boundary is broken. One that starts at
+    /// `col` stays intact and simply moves.
+    #[inline]
+    pub(crate) fn split_wide_boundary(&mut self, row: usize, col: usize) {
+        if self.lines[row].cells[col].attrs.flags.contains(Flags::WIDE_SPACER) {
+            self.split_wide_slow(row, col);
+        }
+    }
+
     #[inline]
     pub(crate) fn split_wide(&mut self, row: usize, col: usize) {
         let flags = self.lines[row].cells[col].attrs.flags;

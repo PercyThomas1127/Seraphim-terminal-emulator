@@ -7,6 +7,7 @@ use vte::{Params, Perform};
 
 use crate::cell::{Attrs, Cell, Color, Flags};
 use crate::grid::{Grid, Row};
+use crate::palette::{format_color, parse_color, xterm_256, ColorOverrides, ColorScheme, Rgb};
 use crate::selection::{Lines, Selection, SelectionRange};
 
 /// Semantic events surfaced to higher layers. The Terminal Core only
@@ -181,9 +182,21 @@ pub(crate) struct State {
     pub responses: Vec<u8>,
     damage: Vec<bool>,
     last_printed: Option<char>,
+    /// Start column of the immediately preceding printed character, if it
+    /// was wide (xterm replaces it with a wide char that doesn't fit when
+    /// autowrap is off).
+    last_wide_at: Option<usize>,
+    /// Insert mode off and the active charset is ASCII: printable ASCII can
+    /// take the fast path. Recomputed after every control/CSI/ESC dispatch,
+    /// the only places those settings change.
+    fast_print: bool,
     /// Lines scrolled back into history in the viewport (0 = bottom).
     pub display_offset: usize,
     pub selection: Option<Selection>,
+    pub scheme: ColorScheme,
+    pub overrides: ColorOverrides,
+    /// DECRQSS request being collected (`DCS $ q ... ST`), capped length.
+    dcs: Option<Vec<u8>>,
 }
 
 fn default_tabs(cols: usize) -> Vec<bool> {
@@ -216,8 +229,13 @@ impl State {
             responses: Vec::new(),
             damage: vec![true; rows],
             last_printed: None,
+            last_wide_at: None,
+            fast_print: true,
             display_offset: 0,
             selection: None,
+            scheme: ColorScheme::default(),
+            overrides: ColorOverrides::default(),
+            dcs: None,
         }
     }
 
@@ -317,6 +335,8 @@ impl State {
         }
         self.selection = None;
         self.display_offset = 0;
+        self.last_printed = None;
+        self.last_wide_at = None;
         // Keep the cursor on screen when shrinking: drop lines from the top
         // of the primary screen into scrollback.
         // (Only the active grid is shifted; drop_top <= cursor.row always.)
@@ -499,7 +519,7 @@ impl State {
         let n = n.min(cols - col);
         let attrs = self.cursor.attrs;
         let grid = self.grid();
-        grid.split_wide(row, col);
+        grid.split_wide_boundary(row, col);
         let r = grid.row_mut(row);
         r.shift_combining(col, n as isize, cols);
         let line = &mut r.cells;
@@ -518,9 +538,9 @@ impl State {
         let n = n.min(cols - col);
         let attrs = self.cursor.attrs;
         let grid = self.grid();
-        grid.split_wide(row, col);
+        grid.split_wide_boundary(row, col);
         if col + n < cols {
-            grid.split_wide(row, col + n);
+            grid.split_wide_boundary(row, col + n);
         }
         let r = grid.row_mut(row);
         r.clear_combining(col, col + n);
@@ -561,6 +581,11 @@ impl State {
     }
 
     fn tab_forward(&mut self, n: usize) {
+        if self.cursor.col + 1 >= self.cols {
+            // Already at the right margin: nothing moves, and (as in xterm)
+            // a pending wrap stays pending.
+            return;
+        }
         for _ in 0..n {
             let mut col = self.cursor.col + 1;
             while col < self.cols - 1 && !self.tabs[col] {
@@ -609,6 +634,13 @@ impl State {
         self.active_charset = saved.active_charset;
     }
 
+    fn clear_alternate(&mut self) {
+        let attrs = self.cursor.attrs;
+        self.alternate.clear(&attrs);
+        self.selection = None;
+        self.damage_all();
+    }
+
     fn set_alternate(&mut self, enable: bool, clear: bool) {
         if enable == self.alt_active {
             return;
@@ -627,9 +659,11 @@ impl State {
     fn reset(&mut self) {
         let (cols, rows, limit) = (self.cols, self.rows, self.scrollback_limit);
         let scrollback = std::mem::take(&mut self.scrollback);
+        let scheme = std::mem::take(&mut self.scheme);
         let was_alt = self.alt_active;
         *self = State::new(cols, rows, limit);
         self.scrollback = scrollback;
+        self.scheme = scheme;
         if was_alt {
             self.events.push(TerminalEvent::AlternateScreen(false));
         }
@@ -637,6 +671,8 @@ impl State {
 
     // ---- printing ------------------------------------------------------
 
+    // Kept out of line so the ASCII fast path in `print` stays small.
+    #[inline(never)]
     fn print_char(&mut self, c: char) {
         let c = match self.charsets[self.active_charset] {
             Charset::DecSpecial => dec_special(c),
@@ -659,12 +695,15 @@ impl State {
         }
         if width == 2 && self.cursor.col + 1 >= self.cols {
             if self.modes.autowrap {
-                // Wide char does not fit: pad the last column and wrap.
-                let (row, col) = (self.cursor.row, self.cursor.col);
-                self.erase_cells(row, col, col + 1);
+                // Wide char does not fit: wrap, leaving the last column as
+                // it is (xterm keeps whatever was there).
                 self.wrap_line();
+            } else if let Some(start) = self.last_wide_at.filter(|&s| s + 2 <= self.cols) {
+                // xterm: replace the wide character printed just before.
+                self.cursor.col = start;
             } else {
-                self.cursor.col = self.cols - 2;
+                // xterm: no room and no autowrap, so the character is dropped.
+                return;
             }
         }
         if self.modes.insert {
@@ -694,6 +733,7 @@ impl State {
         }
         self.content_changed(row);
         self.last_printed = Some(c);
+        self.last_wide_at = (width == 2).then_some(col);
 
         let next = col + width;
         if next >= self.cols {
@@ -820,10 +860,15 @@ impl State {
             }
             47 => self.set_alternate(on, false),
             66 => self.modes.app_keypad = on,
+            // xterm: 1047h switches without clearing; 1047l clears the
+            // alternate screen on the way out.
             1047 => {
                 if on {
-                    self.set_alternate(true, true);
+                    self.set_alternate(true, false);
                 } else {
+                    if self.alt_active {
+                        self.clear_alternate();
+                    }
                     self.set_alternate(false, false);
                 }
             }
@@ -834,10 +879,16 @@ impl State {
                     self.restore_cursor()
                 }
             }
+            // xterm: 1049h always clears, even when already on the
+            // alternate screen.
             1049 => {
                 if on {
                     self.save_cursor();
-                    self.set_alternate(true, true);
+                    if self.alt_active {
+                        self.clear_alternate();
+                    } else {
+                        self.set_alternate(true, true);
+                    }
                 } else {
                     self.set_alternate(false, false);
                     self.restore_cursor();
@@ -873,8 +924,10 @@ impl State {
 
     // ---- OSC -----------------------------------------------------------
 
-    fn osc(&mut self, params: &[&[u8]]) {
+    fn osc(&mut self, params: &[&[u8]], bell: bool) {
         let Some(cmd) = params.first() else { return };
+        // Replies use the same terminator as the request (xterm behaviour).
+        let st: &str = if bell { "\x07" } else { "\x1b\\" };
         let text = |i: usize| -> String {
             params.get(i).map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default()
         };
@@ -891,6 +944,72 @@ impl State {
                     self.title = title.clone();
                     self.events.push(TerminalEvent::TitleChanged(title));
                 }
+            }
+            b"4" => {
+                // OSC 4 ; index ; spec|? [; index ; spec|? ...]
+                for pair in params[1..].chunks(2) {
+                    let (Some(idx), Some(spec)) = (pair.first(), pair.get(1)) else { break };
+                    let Some(i) = std::str::from_utf8(idx).ok().and_then(|s| s.parse::<u8>().ok())
+                    else {
+                        continue;
+                    };
+                    if *spec == b"?" {
+                        let c = self.indexed_color(i);
+                        let reply = format!("\x1b]4;{i};{}{st}", format_color(c));
+                        self.responses.extend_from_slice(reply.as_bytes());
+                    } else if let Some(c) = std::str::from_utf8(spec).ok().and_then(parse_color) {
+                        self.overrides.indexed[i as usize] = Some(c);
+                        self.damage_all();
+                    }
+                }
+            }
+            b"10" | b"11" | b"12" => {
+                // Each parameter addresses the next dynamic color in turn
+                // (OSC 10;?;? queries foreground then background).
+                let first: u8 = if *cmd == b"10" {
+                    10
+                } else if *cmd == b"11" {
+                    11
+                } else {
+                    12
+                };
+                for (k, spec) in params[1..].iter().enumerate() {
+                    let which = first + k as u8;
+                    if which > 12 {
+                        break;
+                    }
+                    if *spec == b"?" {
+                        let c = self.dynamic_color(which);
+                        let reply = format!("\x1b]{which};{}{st}", format_color(c));
+                        self.responses.extend_from_slice(reply.as_bytes());
+                    } else if let Some(c) = std::str::from_utf8(spec).ok().and_then(parse_color) {
+                        *self.dynamic_override(which) = Some(c);
+                        self.damage_all();
+                    }
+                }
+            }
+            b"104" => {
+                if params.len() <= 1 || params[1].is_empty() {
+                    *self.overrides.indexed = [None; 256];
+                } else {
+                    for p in &params[1..] {
+                        if let Some(i) =
+                            std::str::from_utf8(p).ok().and_then(|s| s.parse::<u8>().ok())
+                        {
+                            self.overrides.indexed[i as usize] = None;
+                        }
+                    }
+                }
+                self.damage_all();
+            }
+            b"110" | b"111" | b"112" => {
+                let which = match *cmd {
+                    b"110" => 10,
+                    b"111" => 11,
+                    _ => 12,
+                };
+                *self.dynamic_override(which) = None;
+                self.damage_all();
             }
             b"7" => {
                 if let Some(path) = parse_osc7(&text(1)) {
@@ -1067,11 +1186,7 @@ impl Perform for State {
     fn print(&mut self, c: char) {
         // Fast path: printable ASCII in the ASCII charset, no insert mode,
         // no pending wrap, onto a narrow cell. This is nearly all output.
-        if matches!(c, ' '..='~')
-            && !self.cursor.pending_wrap
-            && !self.modes.insert
-            && self.charsets[self.active_charset] == Charset::Ascii
-        {
+        if self.fast_print && matches!(c, ' '..='~') && !self.cursor.pending_wrap {
             let (row, col) = (self.cursor.row, self.cursor.col);
             let cell = Cell { ch: c, attrs: self.cursor.attrs };
             let grid = if self.alt_active { &mut self.alternate } else { &mut self.primary };
@@ -1081,6 +1196,7 @@ impl Perform for State {
                     self.invalidate_selection(row as i64, row as i64);
                 }
                 self.last_printed = Some(c);
+                self.last_wide_at = None;
                 if col + 1 >= self.cols {
                     self.cursor.pending_wrap = self.modes.autowrap;
                 } else {
@@ -1093,6 +1209,54 @@ impl Perform for State {
     }
 
     fn execute(&mut self, byte: u8) {
+        self.execute_inner(byte);
+        self.update_fast_print();
+    }
+
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.csi_dispatch_inner(params, intermediates, ignore, action);
+        self.update_fast_print();
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.esc_dispatch_inner(intermediates, ignore, byte);
+        self.update_fast_print();
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.osc(params, bell_terminated);
+    }
+
+    fn hook(&mut self, _params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        // DECRQSS: DCS $ q <setting> ST
+        self.dcs = (!ignore && intermediates == b"$" && action == 'q').then(Vec::new);
+    }
+
+    fn put(&mut self, byte: u8) {
+        if let Some(buf) = &mut self.dcs {
+            if buf.len() < 64 {
+                buf.push(byte);
+            }
+        }
+    }
+
+    fn unhook(&mut self) {
+        if let Some(buf) = self.dcs.take() {
+            self.decrqss(&buf);
+        }
+    }
+}
+
+impl State {
+    fn update_fast_print(&mut self) {
+        self.fast_print =
+            !self.modes.insert && self.charsets[self.active_charset] == Charset::Ascii;
+    }
+
+    fn execute_inner(&mut self, byte: u8) {
+        // REP only repeats a graphic character output immediately before it.
+        self.last_printed = None;
+        self.last_wide_at = None;
         match byte {
             0x07 => self.events.push(TerminalEvent::Bell),
             0x08 => {
@@ -1113,7 +1277,17 @@ impl Perform for State {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+    fn csi_dispatch_inner(
+        &mut self,
+        params: &Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        // REP repeats a graphic character output *immediately* before it;
+        // any CSI (including REP itself, per xterm) ends that.
+        let last_printed = self.last_printed.take();
+        self.last_wide_at = None;
         if ignore {
             return;
         }
@@ -1132,7 +1306,14 @@ impl Perform for State {
         match (intermediates, action) {
             ([], '@') => self.insert_blank(n(0)),
             ([], 'A') => self.move_up(n(0)),
-            ([], 'B') | ([], 'e') => self.move_down(n(0)),
+            ([], 'B') => self.move_down(n(0)),
+            ([], 'e') => {
+                // VPR ignores the scroll margins (unlike CUD), as in xterm;
+                // origin mode still confines it to the region.
+                let limit = if self.modes.origin { self.scroll_bottom } else { self.rows - 1 };
+                self.cursor.row = (self.cursor.row + n(0)).min(limit);
+                self.cursor.pending_wrap = false;
+            }
             ([], 'C') | ([], 'a') => {
                 self.cursor.col = (self.cursor.col + n(0)).min(self.cols - 1);
                 self.cursor.pending_wrap = false;
@@ -1193,6 +1374,9 @@ impl Perform for State {
             ([], 'M') => self.delete_lines(n(0)),
             ([], 'P') => self.delete_chars(n(0)),
             ([], 'S') => self.scroll_up(n(0)),
+            // SD. Note: xterm treats an *explicit* `CSI 0 T` as a no-op, but
+            // vte reports `CSI T` and `CSI 0 T` identically, so both scroll one
+            // line here (see seraphim-conformance KNOWN_DIFFERENCES).
             ([], 'T') if p.len() <= 1 => self.scroll_down(n(0)),
             ([], 'X') => {
                 let (row, col) = (self.cursor.row, self.cursor.col);
@@ -1200,10 +1384,11 @@ impl Perform for State {
                 self.cursor.pending_wrap = false;
             }
             ([], 'b') => {
-                if let Some(c) = self.last_printed {
+                if let Some(c) = last_printed {
                     for _ in 0..n(0).min(self.cols * self.rows) {
                         self.print_char(c);
                     }
+                    self.last_printed = None;
                 }
             }
             ([], 'c') if arg(p, 0, 0) == 0 => {
@@ -1226,11 +1411,37 @@ impl Perform for State {
             ([], 'l') => p.iter().for_each(|&m| self.set_ansi_mode(m, false)),
             ([b'?'], 'h') => p.iter().for_each(|&m| self.set_dec_mode(m, true)),
             ([b'?'], 'l') => p.iter().for_each(|&m| self.set_dec_mode(m, false)),
+            ([b'?', b'$'], 'p') => {
+                // DECRQM (DEC private): CSI ? Ps ; Pm $ y
+                let mode = p.first().copied().unwrap_or(0);
+                let state = self.dec_mode_state(mode);
+                self.responses.extend_from_slice(format!("\x1b[?{mode};{state}$y").as_bytes());
+            }
+            ([b'$'], 'p') => {
+                let mode = p.first().copied().unwrap_or(0);
+                let state = match mode {
+                    4 => 2 - self.modes.insert as u8,
+                    20 => 2 - self.modes.linefeed_newline as u8,
+                    _ => 0,
+                };
+                self.responses.extend_from_slice(format!("\x1b[{mode};{state}$y").as_bytes());
+            }
+            ([b'>'], 'q') if arg(p, 0, 0) == 0 => {
+                // XTVERSION
+                let reply = format!("\x1bP>|Seraphim {}\x1b\\", env!("CARGO_PKG_VERSION"));
+                self.responses.extend_from_slice(reply.as_bytes());
+            }
+            ([], 't') if p.first() == Some(&18) => {
+                // Report text area size in characters. (Pixel reports and
+                // window manipulation stay unsupported.)
+                let reply = format!("\x1b[8;{};{}t", self.rows, self.cols);
+                self.responses.extend_from_slice(reply.as_bytes());
+            }
             ([], 'n') => match p.first().copied().unwrap_or(0) {
                 5 => self.responses.extend_from_slice(b"\x1b[0n"),
                 6 => {
                     let row = if self.modes.origin {
-                        self.cursor.row - self.scroll_top
+                        self.cursor.row.saturating_sub(self.scroll_top)
                     } else {
                         self.cursor.row
                     };
@@ -1286,7 +1497,9 @@ impl Perform for State {
         }
     }
 
-    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+    fn esc_dispatch_inner(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.last_printed = None;
+        self.last_wide_at = None;
         if ignore {
             return;
         }
@@ -1327,10 +1540,6 @@ impl Perform for State {
             _ => {}
         }
     }
-
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.osc(params);
-    }
 }
 
 impl Lines for State {
@@ -1361,8 +1570,153 @@ impl Lines for State {
 }
 
 impl State {
+    /// Structural invariants, for fuzzing and tests.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let (rows, cols) = (self.rows, self.cols);
+        if self.cursor.row >= rows || self.cursor.col >= cols {
+            return Err(format!(
+                "cursor {:?} outside {cols}x{rows}",
+                (self.cursor.row, self.cursor.col)
+            ));
+        }
+        if self.scroll_top > self.scroll_bottom || self.scroll_bottom >= rows {
+            return Err(format!("bad scroll region {}..={}", self.scroll_top, self.scroll_bottom));
+        }
+        if self.scrollback.len() > self.scrollback_limit {
+            return Err("scrollback over limit".into());
+        }
+        if self.damage.len() != rows || self.tabs.len() != cols {
+            return Err("damage/tab vectors out of sync with size".into());
+        }
+        for (name, grid) in [("primary", &self.primary), ("alternate", &self.alternate)] {
+            if grid.rows() != rows || grid.cols() != cols {
+                return Err(format!("{name} grid is {}x{}", grid.cols(), grid.rows()));
+            }
+            for (r, row) in grid.rows_iter().enumerate() {
+                if row.cells.len() != cols {
+                    return Err(format!("{name} row {r} has {} cells", row.cells.len()));
+                }
+                row.check_invariants().map_err(|e| format!("{name} row {r}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn indexed_color(&self, i: u8) -> Rgb {
+        self.overrides.indexed[i as usize]
+            .or_else(|| xterm_256(i))
+            .unwrap_or_else(|| self.scheme.ansi[i as usize])
+    }
+
+    fn dynamic_override(&mut self, which: u8) -> &mut Option<Rgb> {
+        match which {
+            10 => &mut self.overrides.foreground,
+            11 => &mut self.overrides.background,
+            _ => &mut self.overrides.cursor,
+        }
+    }
+
+    fn dynamic_color(&self, which: u8) -> Rgb {
+        match which {
+            10 => self.overrides.foreground.unwrap_or(self.scheme.foreground),
+            11 => self.overrides.background.unwrap_or(self.scheme.background),
+            _ => self.overrides.cursor.unwrap_or(self.scheme.cursor),
+        }
+    }
+
+    /// DECRQM reply value: 1 set, 2 reset, 0 unrecognized.
+    fn dec_mode_state(&self, mode: u16) -> u8 {
+        let m = &self.modes;
+        let on = match mode {
+            1 => m.app_cursor,
+            6 => m.origin,
+            7 => m.autowrap,
+            12 => m.cursor_blink,
+            25 => m.cursor_visible,
+            47 | 1047 | 1049 => self.alt_active,
+            66 => m.app_keypad,
+            9 | 1000 => m.mouse == MouseMode::Press,
+            1002 => m.mouse == MouseMode::ButtonMotion,
+            1003 => m.mouse == MouseMode::AnyMotion,
+            1004 => m.focus_events,
+            1005 => m.mouse_encoding == MouseEncoding::Utf8,
+            1006 => m.mouse_encoding == MouseEncoding::Sgr,
+            1007 => m.alternate_scroll,
+            2004 => m.bracketed_paste,
+            2026 => m.synchronized_output,
+            _ => return 0,
+        };
+        if on {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Answer a DECRQSS request: `DCS 1 $ r <value> ST` or `DCS 0 $ r ST`.
+    fn decrqss(&mut self, req: &[u8]) {
+        let value = match req {
+            b"m" => Some(format!("{}m", sgr_string(&self.cursor.attrs))),
+            b" q" => {
+                let blink = self.modes.cursor_blink;
+                let n = match self.modes.cursor_shape {
+                    CursorShape::Block => 1,
+                    CursorShape::Underline => 3,
+                    CursorShape::Bar => 5,
+                } + if blink { 0 } else { 1 };
+                Some(format!("{n} q"))
+            }
+            b"r" => Some(format!("{};{}r", self.scroll_top + 1, self.scroll_bottom + 1)),
+            _ => None,
+        };
+        let reply = match value {
+            Some(v) => format!("\x1bP1$r{v}\x1b\\"),
+            None => "\x1bP0$r\x1b\\".to_owned(),
+        };
+        self.responses.extend_from_slice(reply.as_bytes());
+    }
+
     pub fn selection_text(&self) -> Option<String> {
         let range = self.selection_range()?;
         Some(crate::selection::text(self, &range))
     }
+}
+
+/// SGR parameters that reproduce `a` (for DECRQSS).
+fn sgr_string(a: &Attrs) -> String {
+    let mut parts = vec!["0".to_owned()];
+    let f = a.flags;
+    for (flag, code) in [
+        (Flags::BOLD, "1"),
+        (Flags::DIM, "2"),
+        (Flags::ITALIC, "3"),
+        (Flags::UNDERLINE, "4"),
+        (Flags::DOUBLE_UNDERLINE, "21"),
+        (Flags::CURLY_UNDERLINE, "4:3"),
+        (Flags::BLINK, "5"),
+        (Flags::INVERSE, "7"),
+        (Flags::HIDDEN, "8"),
+        (Flags::STRIKETHROUGH, "9"),
+    ] {
+        if f.contains(flag) {
+            parts.push(code.to_owned());
+        }
+    }
+    let color = |c: Color, base: u8, ext: u8| -> Option<String> {
+        match c {
+            Color::Default => None,
+            Color::Indexed(i) if i < 8 => Some(format!("{}", base + i)),
+            Color::Indexed(i) if i < 16 => Some(format!("{}", base + 60 + i - 8)),
+            Color::Indexed(i) => Some(format!("{ext};5;{i}")),
+            Color::Rgb(r, g, b) => Some(format!("{ext};2;{r};{g};{b}")),
+        }
+    };
+    parts.extend(color(a.fg, 30, 38));
+    parts.extend(color(a.bg, 40, 48));
+    if let Color::Rgb(r, g, b) = a.underline_color {
+        parts.push(format!("58:2::{r}:{g}:{b}"));
+    } else if let Color::Indexed(i) = a.underline_color {
+        parts.push(format!("58:5:{i}"));
+    }
+    parts.join(";")
 }

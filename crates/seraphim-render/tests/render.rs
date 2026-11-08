@@ -228,3 +228,20 @@ fn scrolled_viewport_shows_history_and_moves_cursor() {
     let any_thumb = (0..img.height).any(|yy| rgb(img.pixel(right, yy)) == theme.selection_bg);
     assert!(any_thumb, "scroll indicator drawn");
 }
+
+#[test]
+fn application_color_overrides_are_rendered() {
+    let Some(mut h) = headless() else { return };
+    let mut t = Terminal::new(6, 2);
+    // OSC 11 sets the background; OSC 4 redefines palette red.
+    t.advance(b"\x1b]11;#204060\x07\x1b]4;1;#00ff00\x07\x1b[41m \x1b[0m\x1b[?25l");
+    let img = render(&mut h, &t, true);
+    assert_eq!(rgb(img.pixel(0, 0)), [0x20, 0x40, 0x60], "padding uses the new background");
+    let (x, y, _, _) = cell(&h, 0, 0);
+    assert_eq!(rgb(img.pixel(x, y)), [0, 255, 0], "palette entry 1 redefined");
+    // Resetting returns to the theme.
+    t.advance(b"\x1b]111\x07\x1b]104\x07");
+    let img = render(&mut h, &t, true);
+    assert_eq!(rgb(img.pixel(0, 0)), Theme::default().background);
+    assert_eq!(rgb(img.pixel(x, y)), Theme::default().ansi[1]);
+}

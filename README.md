@@ -21,6 +21,8 @@ crates/
   seraphim-events/     Event Bus: non-blocking, pattern-filtered pub/sub
   seraphim-session/    Sessions: PTY <-> Terminal I/O thread, event publishing, root detection
   seraphim-render/     GPU text renderer (wgpu): fonts + fallback, glyph atlas, one instanced draw
+  seraphim-config/     TOML configuration loading and validation
+  seraphim-conformance/ Differential testing against xterm (golden screens, vttest, triage)
   seraphim/            Application: window (winit + wgpu), plus headless `run` / `replay` tools
 shell-integration/     Bash/Zsh/Fish scripts emitting OSC 133 + OSC 7
 docs/                  ADRs and phase plans
@@ -35,6 +37,10 @@ cargo test --workspace
 The compatibility tests drive real `vim`, `less`, `tmux` and `nano` when they
 are installed, and skip otherwise. Renderer pixel tests need a GPU adapter
 (any Vulkan/GL driver, including lavapipe) and skip without one.
+
+Conformance against xterm (427 recorded screens) runs as part of
+`cargo test`; see [`docs/conformance.md`](docs/conformance.md) for vttest,
+the xterm-refereed triage tool and the fuzzer.
 
 Benchmarks:
 
@@ -64,7 +70,22 @@ opens a window running your shell. Options: `--font FAMILY`,
 | Select while an app uses the mouse | hold `Shift` |
 
 Applications may set the clipboard with OSC 52; reading it requires
-`--allow-clipboard-read`. `SERAPHIM_DEBUG_INPUT=1` logs raw input events.
+`--allow-clipboard-read` (or `clipboard.allow_read` in the config).
+
+### Configuration
+
+Settings live in `~/.config/seraphim/config.toml` (font, window size,
+colors, scrollback, shell, clipboard policy). Print the documented defaults
+with:
+
+```bash
+cargo run -p seraphim -- --print-default-config
+```
+
+Unknown keys and invalid values are reported with their line and column;
+a broken config never stops the terminal from opening (it falls back to the
+defaults and says why). Command-line options override the file;
+`--config PATH` uses another file. `SERAPHIM_DEBUG_INPUT=1` logs raw input events.
 
 Linux build dependencies: a Vulkan or GL driver, plus the usual X11/Wayland
 client libraries (`libxkbcommon`, `libwayland-client`). With no GPU,

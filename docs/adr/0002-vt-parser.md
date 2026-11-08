@@ -29,8 +29,12 @@ wrap rules, scroll regions, modes, alternate screens, SGR, OSC handling.
 2. **Sixel** arrives as DCS via `hook/put/unhook` — supported by `vte`,
    not yet handled by us.
 3. **OSC payload size.** With `std`, `vte`'s OSC buffer grows without
-   limit. An application can send an arbitrarily large OSC 52. Add a cap
-   (e.g. 1 MiB, configurable) in the pre-filter from (1).
+   limit. **Resolved:** `src/prefilter.rs` sits in front of vte, caps OSC
+   at 2 MiB (configurable) by sending CAN and discarding the rest. The
+   APC interception for (1) belongs in the same pre-filter.
+5. **Omitted vs zero parameters.** vte reports `CSI T` and `CSI 0 T`
+   identically; xterm distinguishes them for SD only. Accepted as a known
+   difference (see `docs/conformance.md`).
 4. At most 16 OSC parameters and 2 intermediates — fine for every
    sequence we implement.
 
@@ -42,4 +46,6 @@ wrap rules, scroll regions, modes, alternate screens, SGR, OSC handling.
 * End-to-end tests drive real `vim`, `less`, `tmux`, `nano` and an
   interactive `bash` through a PTY.
 
-Still to do: run `vttest` and `esctest`; add a `cargo-fuzz` target.
+Since then: 427/427 screens identical to recorded xterm output, vttest
+34/35 (the exception is the deliberately unsupported 132-column mode), and
+an invariant-checking fuzzer — see `docs/conformance.md`.

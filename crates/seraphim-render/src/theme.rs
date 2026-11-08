@@ -1,5 +1,6 @@
 //! Color theme and resolution of terminal colors to RGB.
 
+use seraphim_terminal::palette::{xterm_256, ColorOverrides, ColorScheme};
 use seraphim_terminal::{Attrs, Color, Flags};
 
 pub type Rgb = [u8; 3];
@@ -18,6 +19,8 @@ pub struct Theme {
     pub ansi: [Rgb; 16],
     /// Render bold text in colors 0-7 with their bright variants.
     pub bold_is_bright: bool,
+    /// Palette entries changed by the application (OSC 4).
+    palette_overrides: Box<[Option<Rgb>; 256]>,
 }
 
 impl Default for Theme {
@@ -49,31 +52,50 @@ impl Default for Theme {
                 [0xff, 0xff, 0xff], // bright white
             ],
             bold_is_bright: false,
+            palette_overrides: Box::new([None; 256]),
         }
     }
 }
 
 impl Theme {
-    /// xterm 256-color palette entry.
+    /// Palette entry `i` (0-255), including application overrides.
     pub fn indexed(&self, i: u8) -> Rgb {
-        match i {
-            0..=15 => self.ansi[i as usize],
-            16..=231 => {
-                let i = i - 16;
-                let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-                [level(i / 36), level((i / 6) % 6), level(i % 6)]
-            }
-            232..=255 => {
-                let v = 8 + (i - 232) * 10;
-                [v, v, v]
-            }
+        self.palette_overrides[i as usize]
+            .or_else(|| xterm_256(i))
+            .unwrap_or_else(|| self.ansi[i as usize])
+    }
+
+    /// The base colors in the form the Terminal Core uses to answer
+    /// color queries.
+    pub fn scheme(&self) -> ColorScheme {
+        ColorScheme {
+            foreground: self.foreground,
+            background: self.background,
+            cursor: self.cursor,
+            ansi: self.ansi,
         }
+    }
+
+    /// This theme with an application's OSC 4/10/11/12 changes applied.
+    pub fn with_overrides(&self, o: &ColorOverrides) -> Theme {
+        let mut t = self.clone();
+        if let Some(c) = o.foreground {
+            t.foreground = c;
+        }
+        if let Some(c) = o.background {
+            t.background = c;
+        }
+        if let Some(c) = o.cursor {
+            t.cursor = c;
+        }
+        t.palette_overrides = o.indexed.clone();
+        t
     }
 
     fn resolve(&self, c: Color, default: Rgb, bold: bool) -> Rgb {
         match c {
             Color::Default => default,
-            Color::Indexed(i) if bold && self.bold_is_bright && i < 8 => self.ansi[i as usize + 8],
+            Color::Indexed(i) if bold && self.bold_is_bright && i < 8 => self.indexed(i + 8),
             Color::Indexed(i) => self.indexed(i),
             Color::Rgb(r, g, b) => [r, g, b],
         }

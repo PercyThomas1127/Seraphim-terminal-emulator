@@ -43,6 +43,8 @@ pub struct WindowOptions {
     /// Let applications read the clipboard via OSC 52 (off by default:
     /// any program, including one on a remote host, could read it).
     pub allow_clipboard_read: bool,
+    pub theme: Theme,
+    pub scrollback: usize,
 }
 
 impl Default for WindowOptions {
@@ -55,11 +57,16 @@ impl Default for WindowOptions {
             command: None,
             padding: 6.0,
             allow_clipboard_read: false,
+            theme: Theme::default(),
+            scrollback: seraphim_terminal::DEFAULT_SCROLLBACK,
         }
     }
 }
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// Longest we hold back frames while an application has synchronized
+/// output (mode 2026) enabled, in case it never turns it off.
+const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// Lines scrolled per wheel notch when scrolling history.
 const WHEEL_LINES: i64 = 3;
 
@@ -188,6 +195,8 @@ struct Active {
     blink_on: bool,
     blink_deadline: Instant,
     warned_clipboard_read: bool,
+    /// When the app turned on synchronized output with a frame pending.
+    sync_since: Option<Instant>,
 }
 
 struct App {
@@ -244,7 +253,7 @@ impl App {
         let scale = window.scale_factor();
 
         let gpu = init_gpu(event_loop, window.clone())?;
-        let mut renderer = Renderer::new(&gpu.device, gpu.config.format, fonts, Theme::default());
+        let mut renderer = Renderer::new(&gpu.device, gpu.config.format, fonts, o.theme.clone());
         if (font_px(o.font_size, scale) - renderer.fonts().size_px()).abs() > 0.1 {
             renderer.set_fonts(self.fonts_for(scale)?);
         }
@@ -260,7 +269,14 @@ impl App {
         let command = o.command.clone().unwrap_or_else(Command::default_shell);
         let session = Session::spawn(
             1,
-            SessionConfig { command, cols, rows, notify: Some(notify), ..Default::default() },
+            SessionConfig {
+                command,
+                cols,
+                rows,
+                notify: Some(notify),
+                color_scheme: Some(renderer.theme().scheme()),
+                scrollback: o.scrollback,
+            },
             &bus,
         )
         .map_err(|e| format!("cannot start shell: {e}"))?;
@@ -282,6 +298,7 @@ impl App {
             blink_on: true,
             blink_deadline: Instant::now() + BLINK_INTERVAL,
             warned_clipboard_read: false,
+            sync_since: None,
         })
     }
 
@@ -668,7 +685,15 @@ impl ApplicationHandler<UserEvent> for App {
         if a.session.generation() != a.last_generation {
             a.reset_blink();
             a.update_pointer_icon();
-            a.window.request_redraw();
+            let synchronized = a.session.terminal().modes().synchronized_output;
+            if synchronized {
+                // Hold the frame until the app finishes (or the timeout,
+                // handled in about_to_wait).
+                a.sync_since.get_or_insert_with(Instant::now);
+            } else {
+                a.sync_since = None;
+                a.window.request_redraw();
+            }
         }
     }
 
@@ -758,22 +783,36 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(a) = &mut self.active else { return };
+        let now = Instant::now();
+        let mut wake: Option<Instant> = None;
+
+        if let Some(since) = a.sync_since {
+            if now >= since + SYNC_TIMEOUT {
+                a.sync_since = None;
+                a.window.request_redraw();
+            } else {
+                wake = Some(since + SYNC_TIMEOUT);
+            }
+        }
+
         let blinking = {
             let t = a.session.terminal();
             t.modes().cursor_blink && t.modes().cursor_visible && t.display_offset() == 0
         };
-        if !(blinking && a.focused) {
+        if blinking && a.focused {
+            if now >= a.blink_deadline {
+                a.blink_on = !a.blink_on;
+                a.blink_deadline = now + BLINK_INTERVAL;
+                a.window.request_redraw();
+            }
+            wake = Some(wake.map_or(a.blink_deadline, |w| w.min(a.blink_deadline)));
+        } else {
             a.blink_on = true;
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
         }
-        let now = Instant::now();
-        if now >= a.blink_deadline {
-            a.blink_on = !a.blink_on;
-            a.blink_deadline = now + BLINK_INTERVAL;
-            a.window.request_redraw();
-        }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(a.blink_deadline));
+        event_loop.set_control_flow(match wake {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {

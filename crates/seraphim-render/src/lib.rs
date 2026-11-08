@@ -95,7 +95,11 @@ pub struct Renderer {
     atlas: Atlas,
     glyphs: HashMap<GlyphKey, Option<CachedGlyph>>,
     fonts: Fonts,
+    /// The configured theme.
+    base_theme: Theme,
+    /// `base_theme` plus the terminal's color overrides, for this frame.
     theme: Theme,
+    applied_overrides: seraphim_terminal::palette::ColorOverrides,
     instances: Vec<Instance>,
     stats: FrameStats,
 }
@@ -254,7 +258,9 @@ impl Renderer {
             atlas: Atlas::new(ATLAS_SIZE),
             glyphs: HashMap::new(),
             fonts,
+            base_theme: theme.clone(),
             theme,
+            applied_overrides: Default::default(),
             instances: Vec::new(),
             stats: FrameStats::default(),
         }
@@ -273,12 +279,16 @@ impl Renderer {
         self.fonts.metrics()
     }
 
+    /// The configured theme (without application color overrides).
+    #[allow(clippy::misnamed_getters)] // intentionally not the per-frame theme
     pub fn theme(&self) -> &Theme {
-        &self.theme
+        &self.base_theme
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
+        self.base_theme = theme.clone();
         self.theme = theme;
+        self.applied_overrides = Default::default();
     }
 
     /// Replace fonts (e.g. on scale-factor or font-size change).
@@ -365,6 +375,10 @@ impl Renderer {
     /// Returns false if the atlas overflowed.
     fn try_build(&mut self, queue: &wgpu::Queue, term: &Terminal, view: &View) -> bool {
         self.instances.clear();
+        if *term.color_overrides() != self.applied_overrides {
+            self.applied_overrides = term.color_overrides().clone();
+            self.theme = self.base_theme.with_overrides(&self.applied_overrides);
+        }
         let m = self.fonts.metrics();
         let (cw, ch) = (m.width, m.height);
         let pad = view.padding.round();

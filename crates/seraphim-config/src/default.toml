@@ -1,0 +1,48 @@
+# Seraphim configuration.
+#
+# Location: $XDG_CONFIG_HOME/seraphim/config.toml (usually
+# ~/.config/seraphim/config.toml). Every setting is optional; this file
+# lists the defaults. Command-line options override it.
+
+[font]
+# Family name; when unset, the first installed of JetBrains Mono, Fira Code,
+# DejaVu Sans Mono, Liberation Mono, Noto Sans Mono is used.
+# family = "JetBrains Mono"
+# Size in points.
+size = 11.0
+
+[window]
+columns = 100
+rows = 30
+# Space around the text grid, in logical pixels.
+padding = 6.0
+
+[terminal]
+# Lines of history kept per session.
+scrollback = 10000
+
+[shell]
+# Program to run; when unset, $SHELL (then your passwd entry, then /bin/sh).
+# program = "/bin/zsh"
+# args = ["-l"]
+
+[clipboard]
+# Let programs *read* the clipboard with OSC 52. Off by default: any program,
+# including one running on a remote host over ssh, could read it. Programs
+# may always *set* the clipboard.
+allow_read = false
+
+[colors]
+foreground = "#e6e1f0"
+background = "#14121f"
+cursor = "#f5a6d0"
+# Text drawn on top of a block cursor.
+cursor_text = "#14121f"
+selection_background = "#4a3b6b"
+# Text color inside a selection; when unset, text keeps its own color.
+# selection_foreground = "#ffffff"
+# Draw bold text in colors 0-7 with the bright variants 8-15.
+bold_is_bright = false
+# ANSI colors 0-7 and 8-15.
+normal = ["#2a273a", "#ff5577", "#8be9a8", "#f9d98b", "#89a8ff", "#c89bff", "#7fe0e8", "#d8d3e6"]
+bright = ["#5c5775", "#ff7a96", "#a9f5bf", "#fce6a9", "#a8bfff", "#f5a6d0", "#a3eef2", "#ffffff"]

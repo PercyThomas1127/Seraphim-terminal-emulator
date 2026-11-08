@@ -41,7 +41,11 @@ fn micro() {
 
 fn main() {
     if std::env::args().any(|a| a == "--profile") {
-        let data = corpus("ascii", 8);
+        let data = if std::env::var_os("PROFILE_NO_NEWLINE").is_some() {
+            b"abcdefghij".iter().copied().cycle().take(8 << 20).collect()
+        } else {
+            corpus("ascii", 8)
+        };
         let mut term = Terminal::new(200, 50);
         for chunk in data.chunks(64 * 1024) {
             term.advance(chunk);

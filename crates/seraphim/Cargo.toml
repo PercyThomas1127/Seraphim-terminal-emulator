@@ -10,6 +10,7 @@ seraphim-terminal.workspace = true
 seraphim-session.workspace = true
 seraphim-events.workspace = true
 seraphim-render.workspace = true
+seraphim-config.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 pollster.workspace = true

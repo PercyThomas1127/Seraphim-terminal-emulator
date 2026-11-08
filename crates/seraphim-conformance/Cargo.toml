@@ -1,0 +1,14 @@
+[package]
+name = "seraphim-conformance"
+description = "Differential conformance testing of the Seraphim Terminal Core against alacritty_terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+seraphim-terminal.workspace = true
+seraphim-pty.workspace = true
+alacritty_terminal = "0.26"
+serde_json.workspace = true
+unicode-normalization = "0.1"

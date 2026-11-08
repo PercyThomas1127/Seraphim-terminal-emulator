@@ -22,6 +22,8 @@
 mod cell;
 mod grid;
 pub mod input;
+pub mod palette;
+mod prefilter;
 mod selection;
 mod state;
 
@@ -41,6 +43,7 @@ pub const DEFAULT_SCROLLBACK: usize = 10_000;
 pub struct Terminal {
     parser: vte::Parser,
     state: state::State,
+    limiter: prefilter::OscLimiter,
 }
 
 impl Terminal {
@@ -53,12 +56,24 @@ impl Terminal {
         Terminal {
             parser: vte::Parser::new(),
             state: state::State::new(cols.max(1), rows.max(1), scrollback),
+            limiter: prefilter::OscLimiter::new(prefilter::DEFAULT_MAX_OSC),
         }
     }
 
     /// Feed raw bytes from the PTY.
     pub fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.state, bytes);
+        let (parser, state) = (&mut self.parser, &mut self.state);
+        self.limiter.filter(bytes, |part| parser.advance(state, part));
+    }
+
+    /// Maximum OSC payload in bytes; longer ones are discarded.
+    pub fn set_max_osc_len(&mut self, max: usize) {
+        self.limiter.max = max;
+    }
+
+    /// How many oversized OSC sequences were discarded.
+    pub fn dropped_osc_count(&self) -> u64 {
+        self.limiter.dropped
     }
 
     /// Resize the terminal. Content is not reflowed (yet); lines pushed off
@@ -186,6 +201,30 @@ impl Terminal {
     /// Selected text, with soft-wrapped lines joined.
     pub fn selection_text(&self) -> Option<String> {
         self.state.selection_text()
+    }
+
+    // ---- colors -------------------------------------------------------
+
+    /// Set the base colors (normally from the renderer's theme) used to
+    /// answer OSC 4/10/11/12 queries.
+    pub fn set_color_scheme(&mut self, scheme: palette::ColorScheme) {
+        self.state.scheme = scheme;
+    }
+
+    pub fn color_scheme(&self) -> &palette::ColorScheme {
+        &self.state.scheme
+    }
+
+    /// Colors changed by the application (OSC 4/10/11/12); renderers apply
+    /// these on top of their theme.
+    pub fn color_overrides(&self) -> &palette::ColorOverrides {
+        &self.state.overrides
+    }
+
+    /// Verify internal consistency (used by fuzzing and tests).
+    #[doc(hidden)]
+    pub fn check_invariants(&self) -> Result<(), String> {
+        self.state.check_invariants()
     }
 
     /// The whole visible screen as text, one line per row, trailing blanks
