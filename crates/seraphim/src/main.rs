@@ -8,7 +8,7 @@
 //!     ~/.config/seraphim/config.toml, then these options. --preset picks a
 //!     background preset (built-in "heavens", presets/NAME.toml, or "none").
 //!     --extension also loads an extension folder or .lua file (with the
-//!     grants of its [extensions.NAME] entry).
+//!     grants of its [extensions.NAME] entry). --layout opens a [[layout]].
 //!
 //! seraphim --print-default-config
 //!     Print the documented default configuration file.
@@ -30,8 +30,12 @@ mod actions;
 mod bindings;
 mod interaction;
 mod menu;
+mod panel;
+mod panels;
 mod profile;
+mod restore;
 mod scripting;
+mod settings;
 mod tabbar;
 mod watch;
 mod window;
@@ -209,6 +213,7 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
             "--cols" => o.cols = value("--cols")?.parse().map_err(|_| "--cols needs a number")?,
             "--rows" => o.rows = value("--rows")?.parse().map_err(|_| "--rows needs a number")?,
             "--allow-clipboard-read" => o.allow_clipboard_read = true,
+            "--layout" => o.cli_layout = Some(value("--layout")?),
             "--extension" => {
                 let p = std::path::PathBuf::from(value("--extension")?);
                 o.cli_extensions.push(p.canonicalize().unwrap_or(p));
@@ -228,7 +233,7 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),

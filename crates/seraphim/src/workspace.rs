@@ -95,6 +95,23 @@ impl Node {
         }
     }
 
+    /// The split whose second part is exactly pane `pane`.
+    fn find_split_of(&mut self, pane: PaneId) -> Option<&mut Node> {
+        let hit = matches!(self, Node::Split { second, .. } if **second == Node::Pane(pane));
+        if hit {
+            return Some(self);
+        }
+        match self {
+            Node::Pane(_) => None,
+            Node::Split { first, second, .. } => {
+                if let Some(n) = first.find_split_of(pane) {
+                    return Some(n);
+                }
+                second.find_split_of(pane)
+            }
+        }
+    }
+
     /// Replace pane `at` with a split of it and `new`.
     fn split_at(&mut self, at: PaneId, new: PaneId, split: Split) -> bool {
         match self {
@@ -294,9 +311,17 @@ impl Workspace {
 
     /// Split the focused pane; `new` gets the second part and the focus.
     pub fn split(&mut self, new: PaneId, split: Split) -> bool {
+        self.split_with(new, split, 0.5)
+    }
+
+    /// Like [`Workspace::split`], with the focused pane keeping `ratio`.
+    pub fn split_with(&mut self, new: PaneId, split: Split, ratio: f32) -> bool {
         let Some(t) = self.tab_mut() else { return false };
         let at = t.focus;
         if t.root.split_at(at, new, split) {
+            if let Some(Node::Split { ratio: r, .. }) = t.root.find_split_of(new) {
+                *r = ratio.clamp(MIN_RATIO, 1.0 - MIN_RATIO);
+            }
             t.focus = new;
             t.zoomed = false;
             true
@@ -587,6 +612,9 @@ mod tests {
         assert!(r[0].1.w < 740.0, "clamped: {:?}", r[0]);
         w.equalize();
         assert_eq!(w.layout(AREA, 2.0).0[0].1.w, 400.0);
+        let mut z = ws();
+        assert!(z.split_with(9, Split::Right, 0.7));
+        assert_eq!(z.layout(AREA, 2.0).0[0].1.w, 560.0);
         w.toggle_zoom();
         assert_eq!(w.layout(AREA, 2.0).0, [(3, AREA)]);
         w.toggle_zoom();

@@ -2194,6 +2194,7 @@ dependencies = [
  "pollster",
  "seraphim-config",
  "seraphim-events",
+ "seraphim-pty",
  "seraphim-render",
  "seraphim-script",
  "seraphim-session",
@@ -2202,6 +2203,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "toml_edit",
  "unicode-width",
  "wgpu",
  "winit",
@@ -2688,6 +2690,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

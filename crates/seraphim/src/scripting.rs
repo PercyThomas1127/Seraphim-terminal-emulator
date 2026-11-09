@@ -78,6 +78,21 @@ pub enum Effect {
     /// Script bindings changed: rebuild the binding set.
     BindsChanged,
     Redraw,
+    /// Show an extension's panel (`ext:id`) right, down or in a tab.
+    OpenPanel {
+        name: String,
+        place: String,
+    },
+    /// An extension stopped: close its panels.
+    ClosePanels(String),
+}
+
+/// A panel an extension registered, with its latest widgets.
+pub struct ScriptPanel {
+    pub ext: String,
+    pub id: String,
+    pub title: String,
+    pub widgets: Vec<crate::panel::Widget>,
 }
 
 /// What the runtime was started from (restart when it changes).
@@ -100,6 +115,10 @@ pub struct ScriptHost {
     binds: Vec<(String, u64, Bind)>,
     /// (extension, command id, title), for the Extensions menu.
     pub commands: Vec<(String, String, String)>,
+    pub panels: Vec<ScriptPanel>,
+    /// Every extension found (name, permissions it asks for), enabled or
+    /// not: the settings panel lists them.
+    pub installed: Vec<(String, String)>,
     keys: Vec<(String, Chord, String)>,
     privileged: Option<Subscription>,
     /// Sessions running as root, and the focused one.
@@ -119,6 +138,8 @@ impl Default for ScriptHost {
             layers: Vec::new(),
             binds: Vec::new(),
             commands: Vec::new(),
+            panels: Vec::new(),
+            installed: Vec::new(),
             keys: Vec::new(),
             privileged: None,
             roots: HashSet::new(),
@@ -205,6 +226,13 @@ impl ScriptHost {
             None => seraphim_script::discover(Path::new("/nonexistent"), &src.cli),
         };
         warnings.extend(errors);
+        self.installed = found
+            .iter()
+            .map(|e| {
+                let asks: Vec<&str> = e.requested.iter().map(|p| p.name()).collect();
+                (e.name.clone(), asks.join(", "))
+            })
+            .collect();
         let mut list: Vec<(Extension, Grant)> = Vec::new();
         for ext in found {
             let cfg = src.extensions.get(&ext.name);
@@ -251,13 +279,15 @@ impl ScriptHost {
         let had = !self.binds.is_empty() || !self.commands.is_empty();
         self.binds.clear();
         self.commands.clear();
+        let had = had || !self.panels.is_empty();
+        let closing: Vec<String> = self.panels.drain(..).map(|p| p.ext).collect();
         self.keys.clear();
         self.dirs.clear();
+        let mut fx: Vec<Effect> = closing.into_iter().map(Effect::ClosePanels).collect();
         if had {
-            vec![Effect::BindsChanged, Effect::MenuChanged]
-        } else {
-            Vec::new()
+            fx.extend([Effect::BindsChanged, Effect::MenuChanged]);
         }
+        fx
     }
 
     /// Bindings scripts created.
@@ -304,6 +334,21 @@ impl ScriptHost {
         }
         parts.push(k);
         parts.join("+")
+    }
+
+    /// An extension panel's title and widgets.
+    pub fn panel(&self, ext: &str, id: &str) -> Option<(&str, &[crate::panel::Widget])> {
+        self.panels
+            .iter()
+            .find(|p| p.ext == ext && p.id == id)
+            .map(|p| (p.title.as_str(), p.widgets.as_slice()))
+    }
+
+    /// Tell an extension about its panel.
+    pub fn panel_event(&self, ext: &str, id: &str, event: seraphim_script::PanelEvent) {
+        if let Some(rt) = &self.runtime {
+            rt.panel(ext, id, event);
+        }
     }
 
     pub fn invoke(&self, ext: &str, command: &str) {
@@ -536,6 +581,22 @@ impl ScriptHost {
                 fx.push(Effect::MenuChanged);
             }
             Sc::Action { name, .. } => fx.push(Effect::Action(name)),
+            Sc::RegisterPanel { ext, id, title } => {
+                self.panels.retain(|p| !(p.ext == ext && p.id == id));
+                self.panels.push(ScriptPanel { ext, id, title, widgets: Vec::new() });
+                fx.push(Effect::MenuChanged);
+            }
+            Sc::PanelContent { ext, id, widgets } => {
+                let w: Vec<crate::panel::Widget> =
+                    serde_json::from_value(widgets).map_err(|e| format!("panel {id}: {e}"))?;
+                if let Some(p) = self.panels.iter_mut().find(|p| p.ext == ext && p.id == id) {
+                    p.widgets = w;
+                    fx.push(Effect::Redraw);
+                }
+            }
+            Sc::OpenPanel { ext, id, place } => {
+                fx.push(Effect::OpenPanel { name: format!("{ext}:{id}"), place })
+            }
             Sc::Reset { ext } => {
                 let fade = Transition::tween(0.3);
                 for (_, l) in self.layers.iter().filter(|(e, _)| *e == ext) {
@@ -544,6 +605,8 @@ impl ScriptHost {
                 self.layers.retain(|(e, _)| *e != ext);
                 self.binds.retain(|(e, _, _)| *e != ext);
                 self.commands.retain(|(e, _, _)| *e != ext);
+                self.panels.retain(|p| p.ext != ext);
+                fx.push(Effect::ClosePanels(ext.clone()));
                 self.keys.retain(|(e, _, _)| *e != ext);
                 self.warned.retain(|w| !w.starts_with(&format!("{ext}:")));
                 fx.extend([Effect::BindsChanged, Effect::MenuChanged, Effect::Redraw]);

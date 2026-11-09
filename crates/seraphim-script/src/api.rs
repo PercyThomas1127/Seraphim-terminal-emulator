@@ -88,6 +88,18 @@ pub(crate) enum TimerAction {
     Command(Command),
     /// Publish `animation.completed` for this animation.
     Completed(String),
+    /// Re-render an open panel.
+    RenderPanel(String),
+}
+
+/// A panel an extension registered.
+#[derive(Clone)]
+pub(crate) struct PanelDef {
+    pub render: Function,
+    pub on_select: Option<Function>,
+    pub on_key: Option<Function>,
+    pub interval: Option<Duration>,
+    pub open: bool,
 }
 
 pub(crate) struct Timer {
@@ -117,6 +129,7 @@ pub(crate) struct State {
     pub timers: Vec<Timer>,
     pub callbacks: HashMap<u64, Function>,
     pub commands: HashMap<String, Function>,
+    pub panels: HashMap<String, PanelDef>,
     animations: HashMap<String, Vec<Step>>,
     next_id: u64,
     sampler: Sampler,
@@ -127,6 +140,10 @@ impl State {
     fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    pub fn next_timer_id(&mut self) -> u64 {
+        self.id()
     }
 
     /// Drop every handler, timer and callback (the extension stopped).
@@ -182,6 +199,20 @@ fn ser() -> mlua::serde::ser::Options {
 
 pub(crate) fn to_lua(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value> {
     lua.to_value_with(v, ser())
+}
+
+/// A panel's `render` result (a list of widget tables) as JSON; the
+/// window validates the widgets.
+pub(crate) fn widgets_json(lua: &Lua, v: Value) -> Result<serde_json::Value, String> {
+    match v {
+        Value::Table(_) => match from_lua(lua, v).map_err(|e| e.to_string())? {
+            j @ serde_json::Value::Array(_) => Ok(j),
+            serde_json::Value::Object(m) if m.is_empty() => Ok(serde_json::Value::Array(vec![])),
+            _ => Err("render must return a list of widgets".into()),
+        },
+        Value::Nil => Ok(serde_json::Value::Array(vec![])),
+        _ => Err("render must return a list of widgets".into()),
+    }
 }
 
 fn from_lua(lua: &Lua, v: Value) -> mlua::Result<serde_json::Value> {
@@ -865,6 +896,61 @@ fn ui(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
                 _ => return Err(err("ui.key(chord, command_id or function)")),
             };
             c.send(Command::RegisterKey { ext: c.name.clone(), chord, command });
+            Ok(())
+        })?,
+    )?;
+
+    let c = ctx.clone();
+    t.set(
+        "panel",
+        lua.create_function(move |_, (id, spec): (String, Table)| {
+            let render: Function =
+                spec.get("render").map_err(|_| err("ui.panel: render must be a function"))?;
+            let title = spec.get::<Option<String>>("title")?.unwrap_or_else(|| id.clone());
+            let interval = spec
+                .get::<Option<f64>>("interval")?
+                .map(|ms| Duration::from_millis(ms.max(100.0) as u64));
+            let def = PanelDef {
+                render,
+                on_select: spec.get("on_select")?,
+                on_key: spec.get("on_key")?,
+                interval,
+                open: false,
+            };
+            c.state.lock().unwrap().panels.insert(id.clone(), def);
+            c.send(Command::RegisterPanel { ext: c.name.clone(), id, title });
+            Ok(())
+        })?,
+    )?;
+
+    let c = ctx.clone();
+    t.set(
+        "refresh",
+        lua.create_function(move |lua, id: String| {
+            let def = c.state.lock().unwrap().panels.get(&id).cloned();
+            let def = def.ok_or_else(|| err(format!("ui.refresh: no panel {id:?}")))?;
+            if !def.open {
+                return Ok(());
+            }
+            let v = def.render.call::<Value>(())?;
+            let widgets = widgets_json(lua, v).map_err(err)?;
+            c.send(Command::PanelContent { ext: c.name.clone(), id, widgets });
+            Ok(())
+        })?,
+    )?;
+
+    let c = ctx.clone();
+    t.set(
+        "open_panel",
+        lua.create_function(move |_, (id, opts): (String, Option<Table>)| {
+            if !c.state.lock().unwrap().panels.contains_key(&id) {
+                return Err(err(format!("ui.open_panel: no panel {id:?} (ui.panel first)")));
+            }
+            let place = opt::<String>(&opts, "place")?.unwrap_or_else(|| "right".into());
+            if !["right", "down", "tab"].contains(&place.as_str()) {
+                return Err(err("ui.open_panel: place is right, down or tab"));
+            }
+            c.send(Command::OpenPanel { ext: c.name.clone(), id, place });
             Ok(())
         })?,
     )?;

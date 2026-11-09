@@ -21,6 +21,10 @@
 # soon as they are saved. Ctrl+Shift+R reloads by hand.
 live_reload = true
 
+# Reopen the last session's tabs, splits, directories and recent screen
+# text at startup.
+restore_session = false
+
 [font]
 # Family name; when unset, the first installed of JetBrains Mono, Fira Code,
 # DejaVu Sans Mono, Liberation Mono, Noto Sans Mono is used.
@@ -224,6 +228,25 @@ selection_fade_ms = 90
 # layer = "base"
 # param = "color"
 # colors = { "0" = "#f5a6d0", default = "#ff5577" }
+
+# Named arrangements of tabs and panes (spec §9.5); open one from the
+# View menu, with --layout NAME, or at startup with startup_layout.
+# A pane runs the shell, a `command` (through the shell), or shows a
+# `panel` (system, sessions, history, packages, settings, or an
+# extension's "name:id"); `split` divides it into `first` and `second`.
+#
+# (set startup_layout = "dev" at the top of the file)
+#
+# [[layout]]
+# name = "dev"
+#
+# [[layout.tab]]
+# label = "code"
+# pane = { split = "right", ratio = 0.6, first = { cwd = "~/src" }, second = { split = "down", first = { command = "htop" }, second = { panel = "history" } } }
+#
+# [[layout.tab]]
+# label = "notes"
+# profile = "work"
 
 # Tabs (Ctrl+Shift+T new, Ctrl+Shift+W close, Ctrl+PgUp/PgDown switch,
 # Alt+1..9 jump). bar: auto (shown with two or more tabs), always, never.

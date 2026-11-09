@@ -16,6 +16,8 @@ pub enum Command {
     /// Type this text into the shell.
     Send(String),
     Profile(String),
+    /// Open a `[[layout]]`.
+    Layout(String),
     /// A command an extension registered.
     Script {
         ext: String,
@@ -60,6 +62,8 @@ pub struct Context {
     pub profile: String,
     pub menu_bar: bool,
     pub fullscreen: bool,
+    /// `[[layout]]` names.
+    pub layouts: Vec<String>,
 }
 
 /// `"&File"` → ("File", Some(0)); `"&&"` is a literal `&`. Without a
@@ -123,6 +127,24 @@ pub fn build(menus: &[seraphim_config::Menu], ctx: &Context) -> Vec<Menu> {
                     // No leading or doubled separators.
                     if items.last().is_some_and(|l| *l != Item::Separator) {
                         items.push(Item::Separator);
+                    }
+                    continue;
+                }
+                if it.action.as_deref() == Some("layouts") {
+                    if ctx.layouts.is_empty() {
+                        continue;
+                    }
+                    if items.last().is_some_and(|l| *l != Item::Separator) {
+                        items.push(Item::Separator);
+                    }
+                    for l in &ctx.layouts {
+                        items.push(Item::Entry {
+                            label: format!("Layout: {l}"),
+                            key: None,
+                            shortcut: String::new(),
+                            command: Command::Layout(l.clone()),
+                            checked: false,
+                        });
                     }
                     continue;
                 }
@@ -652,6 +674,7 @@ mod tests {
             profile: "work".into(),
             menu_bar: true,
             fullscreen: false,
+            layouts: vec!["dev".into()],
         }
     }
 
@@ -688,7 +711,7 @@ mod tests {
     fn builtin_layout_and_context() {
         let b = bar();
         let titles: Vec<&str> = b.menus.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, ["File", "Edit", "View", "Profiles", "Help"]);
+        assert_eq!(titles, ["File", "Edit", "View", "Profiles", "Settings", "Help"]);
         assert_eq!(entry(&b, 1, 0), ("Copy".into(), "Ctrl+Shift+C".into(), false));
         assert_eq!(entry(&b, 2, 0), ("Show Menubar".into(), "Ctrl+Shift+M".into(), true));
         // Profiles: the list (current checked), then the rest.
@@ -709,14 +732,14 @@ mod tests {
         .menu;
         let menus = build(&merge(&seraphim_config::builtin_menu(), &user), &ctx());
         let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, ["File", "Edit", "View", "Profiles", "Tools", "Help"]);
+        assert_eq!(titles, ["File", "Edit", "View", "Profiles", "Settings", "Tools", "Help"]);
         assert_eq!(menus[5].items.len(), 1, "replaced");
         let last = menus[1].items.last().unwrap();
         assert!(
             matches!(last, Item::Entry { command: Command::Profile(p), checked: true, .. } if p == "work")
         );
         assert!(
-            matches!(&menus[4].items[0], Item::Entry { command: Command::Send(s), .. } if s == "htop\n")
+            matches!(&menus[5].items[0], Item::Entry { command: Command::Send(s), .. } if s == "htop\n")
         );
     }
 
@@ -726,13 +749,15 @@ mod tests {
         b.open_menu(0);
         assert_eq!(b.hover, Some(0), "first entry");
         assert_eq!(b.key(MenuKey::Down), Outcome::Stay);
-        assert_eq!(b.hover, Some(2), "skips the separator");
+        assert_eq!(b.key(MenuKey::Down), Outcome::Stay);
+        assert_eq!(b.hover, Some(3), "skips the separator");
         assert_eq!(b.key(MenuKey::Up), Outcome::Stay);
         assert_eq!(b.key(MenuKey::Up), Outcome::Stay);
-        assert_eq!(b.hover, Some(4), "wraps to Close Window");
+        assert_eq!(b.key(MenuKey::Up), Outcome::Stay);
+        assert_eq!(b.hover, Some(6), "wraps to Close Window");
         assert_eq!(b.key(MenuKey::Enter), Outcome::Run(Command::Action(Action::CloseWindow)));
         assert_eq!(b.key(MenuKey::Left), Outcome::Stay);
-        assert_eq!(b.open, Some(4), "Left from File wraps to Help");
+        assert_eq!(b.open, Some(5), "Left from File wraps to Help");
         assert_eq!(b.key(MenuKey::Char('e')), Outcome::Stay);
         assert_eq!(b.open, Some(1), "title access key opens Edit");
         assert_eq!(b.key(MenuKey::Char('A')), Outcome::Run(Command::Action(Action::SelectAll)));
@@ -770,7 +795,7 @@ mod tests {
             .lines()
             .next()
             .unwrap()
-            .starts_with("  File  Edit  View  Profiles  Help"));
+            .starts_with("  File  Edit  View  Profiles  Settings  Help"));
         b.open_menu(1);
         let mut t = seraphim_terminal::Terminal::new(80, 20);
         t.advance(&b.paint(80, 20, false, &p));

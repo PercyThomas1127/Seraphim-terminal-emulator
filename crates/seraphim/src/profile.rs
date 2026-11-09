@@ -95,6 +95,10 @@ pub fn options_from_config(
         cli_extensions: Vec::new(),
         tabs: c.tabs.clone(),
         panes: c.panes.clone(),
+        layouts: c.layout.clone(),
+        startup_layout: c.startup_layout.clone(),
+        restore_session: c.restore_session,
+        cli_layout: None,
     };
     (o, warnings)
 }

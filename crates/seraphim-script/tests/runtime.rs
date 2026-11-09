@@ -504,3 +504,61 @@ fn network_only_to_approved_hosts_without_redirects() {
     assert!(n.contains(&"got 200 hello yes"), "{n:?}");
     assert!(n.contains(&"then 302"), "redirects are returned, not followed: {n:?}");
 }
+
+#[test]
+fn extension_panels_render_and_react() {
+    let root = dir("panels");
+    let bus = EventBus::new();
+    let e = ext(
+        &root,
+        "pkg",
+        &["interface"],
+        r##"
+        local picked = "nothing"
+        ui.panel("status", {
+          title = "Package Status",
+          render = function()
+            return {
+              { type = "heading", text = "Packages" },
+              { type = "list", items = { { text = "firefox" }, { text = "gimp" } } },
+              { type = "text", text = "picked " .. picked },
+            }
+          end,
+          on_select = function(n) picked = tostring(n) end,
+        })
+        ui.open_panel("status", { place = "down" })
+        local ok, err = pcall(ui.open_panel, "nope")
+        ui.notify(err)
+        ui.notify("ready")"##,
+    );
+    let rt = start(vec![(e, grant(V))], &root, &bus);
+    let got = ready(&rt, 1);
+    assert!(got.contains(&Command::RegisterPanel {
+        ext: "pkg".into(),
+        id: "status".into(),
+        title: "Package Status".into()
+    }));
+    assert!(got.contains(&Command::OpenPanel {
+        ext: "pkg".into(),
+        id: "status".into(),
+        place: "down".into()
+    }));
+    assert!(notices(&got)[0].contains("no panel \"nope\""));
+    rt.panel("pkg", "status", seraphim_script::PanelEvent::Open(true));
+    let got = wait(&rt, |c| c.iter().any(|c| matches!(c, Command::PanelContent { .. })));
+    let Some(Command::PanelContent { widgets, .. }) =
+        got.iter().find(|c| matches!(c, Command::PanelContent { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(widgets[1]["items"][1]["text"], "gimp");
+    assert_eq!(widgets[2]["text"], "picked nothing");
+    rt.panel("pkg", "status", seraphim_script::PanelEvent::Select(2));
+    let got = wait(&rt, |c| c.iter().any(|c| matches!(c, Command::PanelContent { .. })));
+    let Some(Command::PanelContent { widgets, .. }) =
+        got.iter().find(|c| matches!(c, Command::PanelContent { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(widgets[2]["text"], "picked 2", "re-rendered after the selection");
+}

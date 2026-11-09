@@ -37,7 +37,7 @@ use crate::workspace::{Closed, Direction, Divider, Node, Rect, Split, Workspace}
 /// `panes` field, so other fields stay usable while the terminal is locked.
 macro_rules! focused {
     ($a:expr) => {
-        $a.panes.get(&$a.ws.focus().unwrap_or(0)).expect("a focused pane").session
+        $a.panes.get(&$a.term_focus).expect("a terminal pane").session
     };
 }
 
@@ -120,6 +120,11 @@ pub struct WindowOptions {
     pub cli_extensions: Vec<std::path::PathBuf>,
     pub tabs: seraphim_config::Tabs,
     pub panes: seraphim_config::Panes,
+    pub layouts: Vec<seraphim_config::Layout>,
+    pub startup_layout: Option<String>,
+    pub restore_session: bool,
+    /// `--layout`: open this instead of the startup layout or session.
+    pub cli_layout: Option<String>,
 }
 
 impl WindowOptions {
@@ -193,6 +198,10 @@ impl Default for WindowOptions {
             cli_extensions: Vec::new(),
             tabs: Default::default(),
             panes: Default::default(),
+            layouts: Vec::new(),
+            startup_layout: None,
+            restore_session: false,
+            cli_layout: None,
         }
     }
 }
@@ -324,8 +333,20 @@ struct Active {
     window: Arc<Window>,
     gpu: Gpu,
     renderer: Renderer,
-    /// Terminal panes by id; `ws` arranges them into tabs and splits.
+    /// Terminal panes by id; `ws` arranges them (and panels) into tabs
+    /// and splits.
     panes: std::collections::BTreeMap<u64, Pane>,
+    /// Panel panes by id.
+    panels: std::collections::BTreeMap<u64, crate::panels::PanelState>,
+    /// The terminal that has (or last had) focus: typing goes there.
+    term_focus: u64,
+    /// Finished commands and Gabriel events, for their panels.
+    history: std::collections::VecDeque<crate::panels::HistoryEntry>,
+    packages: std::collections::VecDeque<crate::panels::PackageEvent>,
+    layouts: Vec<seraphim_config::Layout>,
+    config_path: Option<std::path::PathBuf>,
+    /// Extensions installed (name, permissions asked), for settings.
+    extension_list: Vec<(String, String)>,
     ws: Workspace,
     next_pane: u64,
     /// The pane that had focus last (to notice changes).
@@ -518,6 +539,8 @@ impl App {
                 "terminal.bell".into(),
                 "terminal.progress".into(),
                 "session.privileged".into(),
+                "command.completed".into(),
+                "gabriel.*".into(),
             ]),
             1024,
         );
@@ -539,6 +562,13 @@ impl App {
             gpu,
             renderer,
             panes: Default::default(),
+            panels: Default::default(),
+            term_focus: FIRST_PANE,
+            history: Default::default(),
+            packages: Default::default(),
+            layouts: o.layouts.clone(),
+            config_path: o.config_path.clone(),
+            extension_list: Vec::new(),
             ws: Workspace::new(),
             next_pane: 0,
             last_focus: FIRST_PANE,
@@ -592,8 +622,29 @@ impl App {
             scripts: crate::scripting::ScriptHost::default(),
             config_binds: o.binds.clone(),
         };
-        let first = active.spawn_pane(None, None)?;
-        active.ws.add_tab(Node::Pane(first), None);
+        // What the window opens with: --layout, a restored session, the
+        // startup layout, or one shell.
+        let saved = (o.restore_session && o.command.is_none() && o.cli_layout.is_none())
+            .then(crate::restore::load)
+            .flatten();
+        let layout = o.cli_layout.clone().or(o.startup_layout.clone()).filter(|_| saved.is_none());
+        let restored = saved.is_some_and(|s| active.restore(s));
+        if !restored {
+            if let Some(name) = layout {
+                active.open_layout(&name);
+            }
+        }
+        if active.ws.tabs.is_empty() || active.panes.is_empty() {
+            let first = active.spawn_pane(None, None)?;
+            active.ws.add_tab(Node::Pane(first), None);
+        }
+        active.term_focus = active
+            .ws
+            .tab()
+            .map(|t| t.focus)
+            .filter(|f| active.panes.contains_key(f))
+            .unwrap_or_else(|| *active.panes.keys().next().expect("a terminal"));
+        active.last_focus = active.term_focus;
         active.apply_layout();
         let proxy = self.proxy.clone();
         let wake: seraphim_script::Waker = Arc::new(move || {
@@ -607,6 +658,7 @@ impl App {
         if let Some(w) = warnings.into_iter().next() {
             active.notify(w);
         }
+        active.extension_list = active.scripts.installed.clone();
         active.rebuild_menu();
         Ok(active)
     }
@@ -837,6 +889,8 @@ impl App {
         for w in &script_warnings {
             eprintln!("seraphim: {w}");
         }
+        a.extension_list = a.scripts.installed.clone();
+        a.layouts = o.layouts.clone();
         a.interactions.replace(o.rules.clone(), &a.bus, &mut a.visual);
         a.config_binds = o.binds.clone();
         let all: Vec<_> = a.config_binds.iter().chain(a.scripts.binds()).cloned().collect();
@@ -1135,6 +1189,12 @@ impl Active {
                 self.ws.equalize();
                 self.apply_layout();
             }
+            Action::OpenPanel(p) => {
+                let kind = crate::panels::Kind::parse(p.name()).expect("built-in panel");
+                // Settings get a tab of their own; the others sit beside.
+                let place = if p == actions::PanelId::Settings { "tab" } else { "right" };
+                self.toggle_panel(kind, place);
+            }
         }
     }
 
@@ -1262,11 +1322,24 @@ impl Active {
     /// new session, switch to the tab's profile.
     fn focus_changed(&mut self) {
         let id = self.focus_id();
-        if id == self.last_focus || !self.panes.contains_key(&id) {
+        if id == self.last_focus {
             return;
         }
-        if self.focused {
-            if let Some(old) = self.panes.get(&self.last_focus) {
+        if self.panels.contains_key(&id) {
+            // A panel has the keyboard; typing targets stay with the
+            // terminal that had focus.
+            self.last_focus = id;
+            self.check_tab_profile();
+            self.window.request_redraw();
+            return;
+        }
+        if !self.panes.contains_key(&id) {
+            return;
+        }
+        let previous = self.term_focus;
+        self.term_focus = id;
+        if self.focused && previous != id {
+            if let Some(old) = self.panes.get(&previous) {
                 let bytes = encode_focus(false, old.session.terminal().modes());
                 let _ = old.session.write(&bytes);
             }
@@ -1293,12 +1366,235 @@ impl Active {
             Some(id),
             seraphim_events::json!({ "pane": id, "tab": self.ws.active }),
         );
+        self.check_tab_profile();
+        self.window.request_redraw();
+    }
+
+    /// Switch to the active tab's profile if it has its own.
+    fn check_tab_profile(&mut self) {
         let want =
             self.ws.tab().and_then(|t| t.profile.clone()).unwrap_or(self.base_profile.clone());
         if want != self.menu_src.2 {
             self.pending = Some(Request::TabProfile(want));
         }
-        self.window.request_redraw();
+    }
+
+    /// Open a panel (`place`: right, down or tab), or close it if one of
+    /// that kind is open.
+    fn toggle_panel(&mut self, kind: crate::panels::Kind, place: &str) {
+        if let Some((&id, _)) = self.panels.iter().find(|(_, p)| p.kind == kind) {
+            if self.close_pane(id) {
+                self.pending = Some(Request::Quit);
+            }
+            return;
+        }
+        self.open_panel(kind, place);
+    }
+
+    fn open_panel(&mut self, kind: crate::panels::Kind, place: &str) -> u64 {
+        self.next_pane += 1;
+        let id = self.next_pane;
+        if let crate::panels::Kind::Script { ext, id: pid } = &kind {
+            self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(true));
+        }
+        self.panels.insert(id, crate::panels::PanelState::new(kind));
+        match place {
+            "tab" => {
+                self.ws.add_tab(Node::Pane(id), None);
+            }
+            "down" => {
+                self.ws.split_with(id, Split::Down, 0.65);
+            }
+            _ => {
+                self.ws.split_with(id, Split::Right, 0.62);
+            }
+        }
+        self.apply_layout();
+        self.focus_changed();
+        id
+    }
+
+    /// Spawn the panes of a layout tree; returns its workspace node.
+    fn build_layout(&mut self, p: &seraphim_config::LayoutPane) -> Result<Node, String> {
+        if let (Some(split), Some(a), Some(b)) = (&p.split, &p.first, &p.second) {
+            let first = self.build_layout(a)?;
+            let second = self.build_layout(b)?;
+            let split = if split == "down" { Split::Down } else { Split::Right };
+            return Ok(Node::Split {
+                split,
+                ratio: p.ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            });
+        }
+        if let Some(name) = &p.panel {
+            let kind =
+                crate::panels::Kind::parse(name).ok_or_else(|| format!("no panel {name:?}"))?;
+            self.next_pane += 1;
+            let id = self.next_pane;
+            if let crate::panels::Kind::Script { ext, id: pid } = &kind {
+                self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(true));
+            }
+            self.panels.insert(id, crate::panels::PanelState::new(kind));
+            return Ok(Node::Pane(id));
+        }
+        let cwd = p.cwd.as_deref().map(|c| match c.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(rest),
+            None => std::path::PathBuf::from(c),
+        });
+        let command = p.command.as_ref().map(|c| {
+            let shell = seraphim_pty::default_shell_path();
+            Command::new(shell).args(["-c", c.as_str()])
+        });
+        let cwd = cwd.or_else(|| self.focused_cwd());
+        Ok(Node::Pane(self.spawn_pane(cwd, command)?))
+    }
+
+    /// Everything restoration needs, from the current tabs.
+    fn saved_session(&self) -> crate::restore::Saved {
+        use crate::restore::{SavedPane, SavedTab, LINES};
+        let tabs = self
+            .ws
+            .tabs
+            .iter()
+            .map(|t| {
+                let mut panes = std::collections::BTreeMap::new();
+                for id in t.root.panes() {
+                    if let Some(p) = self.panes.get(&id) {
+                        let (cwd, text) = {
+                            let term = p.session.terminal();
+                            let mut lines: Vec<String> =
+                                term.scrollback().iter().map(|r| r.text()).collect();
+                            lines.extend(term.screen().rows_iter().map(|r| r.text()));
+                            while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                                lines.pop();
+                            }
+                            let skip = lines.len().saturating_sub(LINES);
+                            (term.cwd().map(str::to_owned), lines.split_off(skip))
+                        };
+                        let cwd = cwd.or_else(|| {
+                            p.session
+                                .foreground_process()
+                                .and_then(|i| i.cwd)
+                                .map(|c| c.display().to_string())
+                        });
+                        panes.insert(id, SavedPane::Terminal { cwd, text });
+                    } else if let Some(p) = self.panels.get(&id) {
+                        panes.insert(id, SavedPane::Panel { panel: p.kind.name() });
+                    }
+                }
+                SavedTab {
+                    root: t.root.clone(),
+                    focus: t.focus,
+                    label: t.label.clone(),
+                    profile: t.profile.clone(),
+                    panes,
+                }
+            })
+            .collect();
+        crate::restore::Saved { version: 1, active: self.ws.active, tabs }
+    }
+
+    /// Rebuild saved tabs. Returns false if nothing could be restored.
+    fn restore(&mut self, saved: crate::restore::Saved) -> bool {
+        use crate::restore::SavedPane;
+        let when = {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()) as libc::time_t;
+            // SAFETY: localtime_r writes into the zeroed struct we own.
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            unsafe { libc::localtime_r(&secs, &mut tm) };
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min
+            )
+        };
+        let mut any = false;
+        for t in saved.tabs {
+            // New ids for the saved ones.
+            let mut map = std::collections::HashMap::new();
+            for (old, p) in &t.panes {
+                let new = match p {
+                    SavedPane::Terminal { cwd, text } => {
+                        match self.spawn_pane(cwd.as_ref().map(std::path::PathBuf::from), None) {
+                            Ok(id) => {
+                                if !text.is_empty() {
+                                    let bytes = crate::restore::replay(text, &when);
+                                    self.panes[&id].session.terminal().advance(&bytes);
+                                }
+                                id
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                    SavedPane::Panel { panel } => {
+                        let Some(kind) = crate::panels::Kind::parse(panel) else { continue };
+                        self.next_pane += 1;
+                        self.panels.insert(self.next_pane, crate::panels::PanelState::new(kind));
+                        self.next_pane
+                    }
+                };
+                map.insert(*old, new);
+            }
+            fn remap(n: &Node, map: &std::collections::HashMap<u64, u64>) -> Option<Node> {
+                match n {
+                    Node::Pane(p) => map.get(p).map(|q| Node::Pane(*q)),
+                    Node::Split { split, ratio, first, second } => {
+                        match (remap(first, map), remap(second, map)) {
+                            (Some(a), Some(b)) => Some(Node::Split {
+                                split: *split,
+                                ratio: *ratio,
+                                first: Box::new(a),
+                                second: Box::new(b),
+                            }),
+                            (a, b) => a.or(b),
+                        }
+                    }
+                }
+            }
+            let Some(root) = remap(&t.root, &map) else { continue };
+            let i = self.ws.add_tab(root, t.profile.clone());
+            self.ws.tabs[i].label = t.label.clone();
+            if let Some(f) = map.get(&t.focus) {
+                self.ws.tabs[i].focus = *f;
+            }
+            any = true;
+        }
+        if any {
+            self.ws.active = saved.active.min(self.ws.tabs.len() - 1);
+        }
+        any && !self.panes.is_empty()
+    }
+
+    /// Open a `[[layout]]`'s tabs after the current ones.
+    fn open_layout(&mut self, name: &str) {
+        let Some(layout) = self.layouts.iter().find(|l| l.name == name).cloned() else {
+            return self.notify(format!("No layout {name:?}"));
+        };
+        let mut first = None;
+        for t in &layout.tab {
+            match self.build_layout(&t.pane) {
+                Ok(root) => {
+                    let i = self.ws.add_tab(root, t.profile.clone());
+                    self.ws.tabs[i].label = t.label.clone();
+                    first.get_or_insert(i);
+                }
+                Err(e) => self.notify(format!("Layout {name}: {e}")),
+            }
+        }
+        if let Some(i) = first {
+            self.ws.active = i;
+        }
+        self.apply_layout();
+        self.focus_changed();
     }
 
     fn new_tab(&mut self) {
@@ -1335,24 +1631,56 @@ impl Active {
     /// window's last.
     fn close_pane(&mut self, id: u64) -> bool {
         let closed = self.ws.close(id);
+        if let Some(p) = self.panels.remove(&id) {
+            if let crate::panels::Kind::Script { ext, id: pid } = &p.kind {
+                self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(false));
+            }
+        }
         self.panes.remove(&id);
         self.renderer.drop_slot(id);
-        if closed == Closed::Last {
+        if closed == Closed::Last || self.panes.is_empty() {
+            // Panels alone don't keep a window open.
             return true;
         }
+        self.fix_term_focus();
         self.apply_layout();
         self.focus_changed();
         false
     }
 
+    /// Keep `term_focus` on a live terminal: the focused pane if it is
+    /// one, else one in the active tab, else any.
+    fn fix_term_focus(&mut self) {
+        if self.panes.contains_key(&self.term_focus) {
+            return;
+        }
+        let focus = self.focus_id();
+        let in_tab = self.ws.tab().map(|t| t.root.panes()).unwrap_or_default();
+        self.term_focus = if self.panes.contains_key(&focus) {
+            focus
+        } else {
+            in_tab
+                .into_iter()
+                .chain(self.ws.panes())
+                .find(|p| self.panes.contains_key(p))
+                .unwrap_or_else(|| *self.panes.keys().next().unwrap_or(&0))
+        };
+    }
+
     fn close_tab(&mut self, i: usize) -> bool {
         for id in self.ws.close_tab(i) {
+            if let Some(p) = self.panels.remove(&id) {
+                if let crate::panels::Kind::Script { ext, id: pid } = &p.kind {
+                    self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(false));
+                }
+            }
             self.panes.remove(&id);
             self.renderer.drop_slot(id);
         }
-        if self.ws.tabs.is_empty() {
+        if self.ws.tabs.is_empty() || self.panes.is_empty() {
             return true;
         }
+        self.fix_term_focus();
         self.apply_layout();
         self.focus_changed();
         false
@@ -1397,6 +1725,170 @@ impl Active {
             _ => {}
         }
         self.window.request_redraw();
+    }
+
+    /// Facts panels show, gathered from the panes and tabs.
+    fn session_rows(&self) -> Vec<crate::panels::SessionRow> {
+        let mut rows = Vec::new();
+        for (ti, t) in self.ws.tabs.iter().enumerate() {
+            for id in t.root.panes() {
+                let Some(p) = self.panes.get(&id) else { continue };
+                let fg = p.session.foreground_process();
+                let cwd = p
+                    .session
+                    .terminal()
+                    .cwd()
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        fg.as_ref().and_then(|f| f.cwd.as_ref()).map(|c| c.display().to_string())
+                    })
+                    .unwrap_or_default();
+                rows.push(crate::panels::SessionRow {
+                    pane: id,
+                    tab: ti,
+                    label: self.tab_label(ti),
+                    program: fg.map(|f| f.name).unwrap_or_default(),
+                    cwd,
+                    root: p.root,
+                    focused: id == self.term_focus,
+                });
+            }
+        }
+        rows
+    }
+
+    /// Paint every visible panel into its renderer slot.
+    fn paint_panels(&mut self, rects: &[(u64, Rect)], pad: f32) {
+        let visible: Vec<(u64, Rect)> =
+            rects.iter().filter(|(id, _)| self.panels.contains_key(id)).cloned().collect();
+        if visible.is_empty() {
+            return;
+        }
+        let sessions = self.session_rows();
+        let settings: Vec<(crate::settings::Setting, String)> = match (
+            visible.iter().any(|(id, _)| self.panels[id].kind == crate::panels::Kind::Settings),
+            &self.config_path,
+        ) {
+            (true, Some(path)) => {
+                let dir = path.parent().unwrap_or(std::path::Path::new("."));
+                let all = crate::settings::all(dir, &self.extension_list);
+                let values = crate::settings::values(path, &all);
+                all.into_iter().zip(values).collect()
+            }
+            _ => Vec::new(),
+        };
+        let theme = self.renderer.theme().clone();
+        let palette = menu::Palette::from_theme(&theme);
+        let colors = crate::panel::Colors::from_theme(&theme);
+        let focus = self.focus_id();
+        for (id, r) in visible {
+            let script = match &self.panels[&id].kind {
+                crate::panels::Kind::Script { ext, id } => self.scripts.panel(ext, id),
+                _ => None,
+            };
+            let ctx = crate::panels::Ctx {
+                sessions: &sessions,
+                history: &self.history,
+                packages: &self.packages,
+                settings: &settings,
+                script,
+            };
+            let state = self.panels.get_mut(&id).expect("visible panel");
+            let title = state.title(&ctx);
+            let widgets = state.widgets(&ctx);
+            let (cols, rows) =
+                self.renderer.grid_size(r.w.max(1.0) as u32, r.h.max(1.0) as u32, pad);
+            let (cols, rows) = (cols as usize, rows as usize);
+            let painted = crate::panel::paint(
+                &title,
+                &widgets,
+                cols,
+                rows,
+                &palette,
+                colors,
+                state.selected,
+                self.focused && id == focus,
+            );
+            state.items = painted.items;
+            state.rows = painted.rows.clone();
+            if let Some(sel) = state.selected {
+                if painted.items > 0 && sel >= painted.items {
+                    state.selected = Some(painted.items - 1);
+                }
+            }
+            let mut t = seraphim_terminal::Terminal::with_scrollback(cols, rows, 0);
+            t.set_color_scheme(theme.scheme());
+            t.advance(&painted.bytes);
+            let view = View {
+                width: r.w.max(1.0) as u32,
+                height: r.h.max(1.0) as u32,
+                padding: pad,
+                focused: false,
+                cursor_on: false,
+            };
+            self.renderer.select(&self.gpu.device, id);
+            self.renderer.prepare(&self.gpu.device, &self.gpu.queue, &t, view);
+        }
+    }
+
+    /// Carry out what a panel asked for.
+    fn panel_act(&mut self, id: u64, act: crate::panels::Act) {
+        use crate::panels::Act;
+        match act {
+            Act::None => return,
+            Act::Redraw => {}
+            Act::FocusPane(p) => {
+                self.ws.set_focus(p);
+                self.apply_layout();
+                self.focus_changed();
+            }
+            Act::Type(text) => {
+                let bytes = encode_paste(&text, focused!(self).terminal().modes());
+                self.write(&bytes);
+            }
+            Act::Setting(i, dir) => self.change_setting(i, dir),
+            Act::Script(ev) => {
+                if let Some(crate::panels::Kind::Script { ext, id: pid }) =
+                    self.panels.get(&id).map(|p| p.kind.clone())
+                {
+                    let event = match (ev["select"].as_i64(), ev["key"].as_str()) {
+                        (Some(n), _) => seraphim_script::PanelEvent::Select(n),
+                        (None, Some(k)) => seraphim_script::PanelEvent::Key {
+                            key: k.to_owned(),
+                            selected: ev["selected"].as_i64(),
+                        },
+                        _ => return,
+                    };
+                    self.scripts.panel_event(&ext, &pid, event);
+                }
+            }
+            Act::Close => {
+                if self.close_pane(id) {
+                    self.pending = Some(Request::Quit);
+                }
+                return;
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// Settings panel: write one setting to the configuration file, then
+    /// apply it the way live reload does.
+    fn change_setting(&mut self, i: usize, dir: i32) {
+        let Some(path) = self.config_path.clone() else {
+            return self.notify("No configuration file to change");
+        };
+        let d = path.parent().unwrap_or(std::path::Path::new("."));
+        let all = crate::settings::all(d, &self.extension_list);
+        let Some(st) = all.get(i) else { return };
+        let current = crate::settings::values(&path, std::slice::from_ref(st)).remove(0);
+        let value = crate::settings::step(st, &current, dir);
+        match crate::settings::set(&path, &st.key, value) {
+            // With live reload on, the file watcher applies it.
+            Ok(()) if self.watcher.is_some() => {}
+            Ok(()) => self.pending = Some(Request::Files(vec![path])),
+            Err(e) => self.notify(e),
+        }
     }
 
     /// The pane under a pixel position.
@@ -1481,6 +1973,45 @@ impl Active {
         let visible: Vec<u64> = self.ws.tab().map(|t| t.root.panes()).unwrap_or_default();
         let mut changed = false;
         for e in self.pane_events.drain() {
+            if e.name == "command.completed" {
+                if let Some(cmd) = e.data["command"].as_str().filter(|c| !c.trim().is_empty()) {
+                    self.history.retain(|h| h.command != cmd);
+                    self.history.push_back(crate::panels::HistoryEntry {
+                        command: cmd.to_owned(),
+                        exit_code: e.data["exit_code"].as_i64(),
+                        duration_ms: e.data["duration_ms"].as_u64().unwrap_or(0),
+                        at: e.timestamp,
+                    });
+                    if self.history.len() > 500 {
+                        self.history.pop_front();
+                    }
+                    changed |= !self.panels.is_empty();
+                }
+                continue;
+            }
+            if let Some(what) = e.name.strip_prefix("gabriel.") {
+                let d = &e.data;
+                let detail = ["version", "progress", "message", "error"]
+                    .iter()
+                    .filter_map(|k| match &d[*k] {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        v => Some(v.to_string()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.packages.push_back(crate::panels::PackageEvent {
+                    at: e.timestamp,
+                    what: what.to_owned(),
+                    package: d["package"].as_str().unwrap_or("").to_owned(),
+                    detail,
+                });
+                if self.packages.len() > 500 {
+                    self.packages.pop_front();
+                }
+                changed |= !self.panels.is_empty();
+                continue;
+            }
             let Some(p) = e.session.and_then(|id| self.panes.get_mut(&id)) else { continue };
             let id = e.session.unwrap_or(0);
             match e.name.as_str() {
@@ -1527,10 +2058,11 @@ impl Active {
             profile: profile.clone(),
             menu_bar: self.menu_pinned,
             fullscreen: self.window.fullscreen().is_some(),
+            layouts: self.layouts.iter().map(|l| l.name.clone()).collect(),
         };
         self.menu.menus = menu::build(menus, &ctx);
         // Commands extensions registered, in their own menu before Help.
-        if !self.scripts.commands.is_empty() {
+        if !self.scripts.commands.is_empty() || !self.scripts.panels.is_empty() {
             let items = self
                 .scripts
                 .commands
@@ -1542,6 +2074,15 @@ impl Active {
                     command: MenuCommand::Script { ext: ext.clone(), id: id.clone() },
                     checked: false,
                 })
+                .chain(self.scripts.panels.iter().map(|p| menu::Item::Entry {
+                    label: format!("{} (panel)", p.title),
+                    key: None,
+                    shortcut: String::new(),
+                    command: MenuCommand::Script { ext: p.ext.clone(), id: format!("panel:{}", p.id) },
+                    checked: self.panels.values().any(|s| {
+                        matches!(&s.kind, crate::panels::Kind::Script { ext, id } if *ext == p.ext && *id == p.id)
+                    }),
+                }))
                 .collect();
             let m = menu::Menu { title: "Extensions".into(), key: Some(1), items };
             let at = self
@@ -1571,6 +2112,26 @@ impl Active {
                 Effect::MenuChanged => menu = true,
                 Effect::BindsChanged => binds = true,
                 Effect::Redraw => self.window.request_redraw(),
+                Effect::OpenPanel { name, place } => {
+                    if let Some(kind) = crate::panels::Kind::parse(&name) {
+                        if !self.panels.values().any(|p| p.kind == kind) {
+                            self.open_panel(kind, &place);
+                        }
+                    }
+                }
+                Effect::ClosePanels(ext) => {
+                    let ids: Vec<u64> = self
+                        .panels
+                        .iter()
+                        .filter(|(_, p)| matches!(&p.kind, crate::panels::Kind::Script { ext: e, .. } if *e == ext))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in ids {
+                        if self.close_pane(id) {
+                            self.pending = Some(Request::Quit);
+                        }
+                    }
+                }
             }
         }
         if binds {
@@ -1609,7 +2170,14 @@ impl Active {
             MenuCommand::Action(a) => self.run_action(a),
             MenuCommand::Send(text) => self.write(text.as_bytes()),
             MenuCommand::Profile(name) => self.pending = Some(Request::Profile(name)),
-            MenuCommand::Script { ext, id } => self.scripts.invoke(&ext, &id),
+            MenuCommand::Script { ext, id } => match id.strip_prefix("panel:") {
+                Some(panel) => self.toggle_panel(
+                    crate::panels::Kind::Script { ext, id: panel.to_owned() },
+                    "right",
+                ),
+                None => self.scripts.invoke(&ext, &id),
+            },
+            MenuCommand::Layout(name) => self.open_layout(&name),
         }
     }
 
@@ -1853,6 +2421,26 @@ impl Active {
                 return;
             }
         }
+        // Clicks in a panel pick its rows.
+        if let Some(id) = self.pane_at(x, y).filter(|id| self.panels.contains_key(id)) {
+            if pressed && button == WButton::Left {
+                let r =
+                    self.drawn.iter().find(|(p, _)| *p == id).map(|(_, r)| *r).unwrap_or_default();
+                let ch = self.renderer.cell_metrics().height;
+                let row = ((y - r.y - pad) / ch).floor().max(0.0) as usize;
+                let sessions = self.session_rows();
+                let ctx = crate::panels::Ctx {
+                    sessions: &sessions,
+                    history: &self.history,
+                    packages: &self.packages,
+                    settings: &[],
+                    script: None,
+                };
+                let act = self.panels.get_mut(&id).expect("panel").click(row, &ctx);
+                self.panel_act(id, act);
+            }
+            return;
+        }
         let cell = self.cell_at(pad);
         match button {
             WButton::Left => self.mouse.left = pressed,
@@ -1908,6 +2496,23 @@ impl Active {
         };
         let notches = lines.round() as i64;
         if notches == 0 {
+            return;
+        }
+        let (x, y) = (self.mouse.pos.0 as f32, self.mouse.pos.1 as f32);
+        if let Some(id) = self.pane_at(x, y).filter(|id| self.panels.contains_key(id)) {
+            let k = if notches > 0 { crate::panels::Key::Up } else { crate::panels::Key::Down };
+            let ctx = crate::panels::Ctx {
+                sessions: &[],
+                history: &self.history,
+                packages: &self.packages,
+                settings: &[],
+                script: None,
+            };
+            let p = self.panels.get_mut(&id).expect("panel");
+            for _ in 0..notches.unsigned_abs() {
+                p.key(k, &ctx);
+            }
+            self.window.request_redraw();
             return;
         }
         let cell = self.cell_at(pad);
@@ -2050,6 +2655,38 @@ impl Active {
         };
         if let Some(action) = sk.and_then(|k| actions::shortcut_in(k, m, alt_screen, ctx)) {
             self.run_action(action);
+            return;
+        }
+        let focus = self.focus_id();
+        if self.panels.contains_key(&focus) {
+            use crate::panels::Key as P;
+            let key = match &event.logical_key {
+                WKey::Named(NamedKey::ArrowUp) => Some(P::Up),
+                WKey::Named(NamedKey::ArrowDown) => Some(P::Down),
+                WKey::Named(NamedKey::ArrowLeft) => Some(P::Left),
+                WKey::Named(NamedKey::ArrowRight) => Some(P::Right),
+                WKey::Named(NamedKey::Enter) => Some(P::Enter),
+                WKey::Named(NamedKey::Space) => Some(P::Char(' ')),
+                WKey::Named(NamedKey::Home) => Some(P::Home),
+                WKey::Named(NamedKey::End) => Some(P::End),
+                WKey::Named(NamedKey::PageUp) => Some(P::PageUp),
+                WKey::Named(NamedKey::PageDown) => Some(P::PageDown),
+                WKey::Named(NamedKey::Escape) => Some(P::Escape),
+                WKey::Character(s) if !m.ctrl && !m.alt => s.chars().next().map(P::Char),
+                _ => None,
+            };
+            if let Some(k) = key {
+                let sessions = self.session_rows();
+                let ctx = crate::panels::Ctx {
+                    sessions: &sessions,
+                    history: &self.history,
+                    packages: &self.packages,
+                    settings: &[],
+                    script: None,
+                };
+                let act = self.panels.get_mut(&focus).expect("panel").key(k, &ctx);
+                self.panel_act(focus, act);
+            }
             return;
         }
         if let Some(input) = key_input(event, self.mods()) {
@@ -2212,6 +2849,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             if visible.contains(id) {
                 other_changed = true;
+            } else if p.last_generation == u64::MAX {
+                // Never shown (a new background tab printing its prompt):
+                // that isn't activity.
+                p.last_generation = p.session.generation();
             } else if !p.activity {
                 p.activity = true;
                 p.last_generation = p.session.generation();
@@ -2337,6 +2978,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let size = a.window.inner_size();
                 let (rects, dividers) = a.ws.layout(a.pane_area(), a.gap());
                 let focus = a.focus_id();
+                a.paint_panels(&rects, pad);
                 for (id, r) in &rects {
                     let Some(p) = a.panes.get_mut(id) else { continue };
                     let view = View {
@@ -2467,6 +3109,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // Panels that change by themselves (the system monitor).
+        let visible: Vec<u64> = a.drawn.iter().map(|(id, _)| *id).collect();
+        for (id, p) in a.panels.iter_mut().filter(|(id, _)| visible.contains(id)) {
+            let _ = id;
+            if let Some((sampled, next)) = p.tick(now) {
+                if sampled {
+                    a.window.request_redraw();
+                }
+                wake = Some(wake.map_or(next, |w| w.min(next)));
+            }
+        }
+
         // Extensions that read the terminal see it at most 50 ms late.
         let focus = a.focus_id();
         if let Some(t) =
@@ -2539,6 +3193,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(a) = &self.active {
+            if self.options.restore_session {
+                if let Err(e) = crate::restore::save(&a.saved_session()) {
+                    eprintln!("seraphim: saving the session: {e}");
+                }
+            }
+        }
         // Dropping the session hangs up the shell (SIGHUP to its group).
         self.active = None;
     }

@@ -43,6 +43,12 @@ pub struct Config {
     /// Apply changes to the configuration files (and shaders, images)
     /// as soon as they are saved.
     pub live_reload: bool,
+    /// Reopen the last session's tabs, splits and directories at startup.
+    pub restore_session: bool,
+    /// A `[[layout]]` to open at startup (unless a session is restored).
+    pub startup_layout: Option<String>,
+    /// Named arrangements of tabs and panes.
+    pub layout: Vec<Layout>,
     pub font: Font,
     pub window: Window,
     pub terminal: TerminalConfig,
@@ -70,6 +76,94 @@ pub struct Config {
     pub scripting: Scripting,
     /// Per-extension switches and permissions, by extension name.
     pub extensions: std::collections::BTreeMap<String, ExtensionConfig>,
+}
+
+/// Built-in panels a layout (or the View menu) can open.
+pub const PANELS: &[&str] = &["system", "sessions", "history", "packages", "settings"];
+
+/// `[[layout]]`: a named arrangement of tabs (spec §9.5).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Layout {
+    pub name: String,
+    /// `[[layout.tab]]`, in order.
+    pub tab: Vec<LayoutTab>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutTab {
+    pub label: Option<String>,
+    pub profile: Option<String>,
+    /// What fills the tab (default: a shell).
+    pub pane: LayoutPane,
+}
+
+/// A pane, or a split of two (`split` with `first` and `second`).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutPane {
+    /// `right` (side by side) or `down`.
+    pub split: Option<String>,
+    /// The first part's share.
+    pub ratio: f32,
+    pub first: Option<Box<LayoutPane>>,
+    pub second: Option<Box<LayoutPane>>,
+    /// A command line to run through the shell (default: the shell).
+    pub command: Option<String>,
+    /// Working directory (`~` works).
+    pub cwd: Option<String>,
+    /// A built-in panel ([`PANELS`]) or an extension's (`extension:id`).
+    pub panel: Option<String>,
+}
+
+impl Default for LayoutPane {
+    fn default() -> Self {
+        LayoutPane {
+            split: None,
+            ratio: 0.5,
+            first: None,
+            second: None,
+            command: None,
+            cwd: None,
+            panel: None,
+        }
+    }
+}
+
+impl LayoutPane {
+    fn validate(&self) -> Result<(), String> {
+        match (&self.split, &self.first, &self.second) {
+            (Some(s), Some(a), Some(b)) => {
+                if s != "right" && s != "down" {
+                    return Err(format!("split must be right or down (got {s:?})"));
+                }
+                if !(0.05..=0.95).contains(&self.ratio) {
+                    return Err("ratio must be 0.05-0.95".into());
+                }
+                if self.command.is_some() || self.panel.is_some() || self.cwd.is_some() {
+                    return Err("a split has first and second, not command/cwd/panel".into());
+                }
+                a.validate()?;
+                b.validate()
+            }
+            (None, None, None) => {
+                if let Some(p) = &self.panel {
+                    if !PANELS.contains(&p.as_str()) && !p.contains(':') {
+                        return Err(format!(
+                            "unknown panel {p:?} ({}, or extension:id)",
+                            PANELS.join(", ")
+                        ));
+                    }
+                    if self.command.is_some() {
+                        return Err("a pane is a panel or a command, not both".into());
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("a split needs split, first and second".into()),
+        }
+    }
 }
 
 /// `[tabs]`.
@@ -170,6 +264,28 @@ pub const MENU_ACTIONS: &[&str] = &[
     "open-config-folder",
     "shortcuts",
     "about",
+    "new-tab",
+    "close-tab",
+    "next-tab",
+    "previous-tab",
+    "move-tab-left",
+    "move-tab-right",
+    "rename-tab",
+    "split-right",
+    "split-down",
+    "close-pane",
+    "focus-left",
+    "focus-right",
+    "focus-up",
+    "focus-down",
+    "zoom-pane",
+    "equalize-panes",
+    "panel-system",
+    "panel-sessions",
+    "panel-history",
+    "panel-packages",
+    "settings",
+    "layouts",
 ];
 
 /// One menu of the menu bar.
@@ -218,7 +334,7 @@ impl Menu {
                 if !MENU_ACTIONS.contains(&a.as_str()) {
                     return err(format!("unknown action {a:?} ({})", MENU_ACTIONS.join(", ")));
                 }
-                if a == "profiles" {
+                if a == "profiles" || a == "layouts" {
                     continue; // expands to the profile list; no label
                 }
             }
@@ -246,6 +362,9 @@ impl Default for Config {
             theme: None,
             profile: None,
             live_reload: true,
+            restore_session: false,
+            startup_layout: None,
+            layout: Vec::new(),
             font: Default::default(),
             window: Default::default(),
             terminal: Default::default(),
@@ -895,6 +1014,27 @@ impl Config {
         if f.family.as_deref().is_some_and(|s| s.trim().is_empty()) {
             return Err("font.family must not be empty (remove it to use the default)".into());
         }
+        for (i, l) in self.layout.iter().enumerate() {
+            if l.name.trim().is_empty() {
+                return Err(format!("layout {}: needs a name", i + 1));
+            }
+            if self.layout[..i].iter().any(|o| o.name == l.name) {
+                return Err(format!("layout {:?} is defined twice", l.name));
+            }
+            if l.tab.is_empty() {
+                return Err(format!("layout {:?}: needs at least one [[layout.tab]]", l.name));
+            }
+            for (j, t) in l.tab.iter().enumerate() {
+                t.pane
+                    .validate()
+                    .map_err(|e| format!("layout {:?}, tab {}: {e}", l.name, j + 1))?;
+            }
+        }
+        if let Some(n) = &self.startup_layout {
+            if !partial && !self.layout.iter().any(|l| &l.name == n) {
+                return Err(format!("startup_layout {n:?}: no [[layout]] with that name"));
+            }
+        }
         if !["auto", "always", "never"].contains(&self.tabs.bar.as_str()) {
             return Err(format!(
                 "tabs.bar must be auto, always or never (got {:?})",
@@ -1011,6 +1151,40 @@ mod tests {
 
     fn parse(s: &str) -> Result<Config, String> {
         Config::parse(s, Path::new("test.toml")).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn layouts() {
+        let c = parse(r#"
+startup_layout = "dev"
+
+[[layout]]
+name = "dev"
+
+[[layout.tab]]
+label = "code"
+pane = { split = "right", ratio = 0.6, first = { command = "nvim", cwd = "~/src" }, second = { split = "down", first = {}, second = { panel = "system" } } }
+
+[[layout.tab]]
+profile = "work"
+"#).unwrap();
+        assert_eq!(c.layout[0].tab.len(), 2);
+        let p = &c.layout[0].tab[0].pane;
+        assert_eq!(p.split.as_deref(), Some("right"));
+        assert_eq!(
+            p.second.as_ref().unwrap().second.as_ref().unwrap().panel.as_deref(),
+            Some("system")
+        );
+        for (bad, why) in [
+            ("[[layout]]\nname = \"x\"\n", "at least one"),
+            ("[[layout]]\nname = \"x\"\n[[layout.tab]]\npane = { split = \"left\", first = {}, second = {} }\n", "right or down"),
+            ("[[layout]]\nname = \"x\"\n[[layout.tab]]\npane = { split = \"down\", first = {} }\n", "needs split, first and second"),
+            ("[[layout]]\nname = \"x\"\n[[layout.tab]]\npane = { panel = \"clock\" }\n", "unknown panel"),
+            ("startup_layout = \"nope\"\n", "no [[layout]]"),
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]
@@ -1141,7 +1315,7 @@ mod tests {
     fn menus() {
         let builtin = builtin_menu();
         let titles: Vec<String> = builtin.iter().map(|m| m.title.replace('&', "")).collect();
-        assert_eq!(titles, ["File", "Edit", "View", "Profiles", "Help"]);
+        assert_eq!(titles, ["File", "Edit", "View", "Profiles", "Settings", "Help"]);
         for m in &builtin {
             m.validate().unwrap();
         }

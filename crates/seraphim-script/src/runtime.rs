@@ -24,10 +24,36 @@ const MAX_QUEUED: usize = 1024;
 /// Error notices per extension per minute (the rest go to stderr).
 const NOTICES_PER_MINUTE: u32 = 5;
 
+/// What happened in an extension's panel.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PanelEvent {
+    Open(bool),
+    /// An item was chosen (1-based).
+    Select(i64),
+    /// A key, with the selected item (1-based) if any.
+    Key {
+        key: String,
+        selected: Option<i64>,
+    },
+}
+
 pub(crate) enum Inbox {
     Event(Arc<Event>),
-    Invoke { ext: String, command: String },
-    Done { ext: String, callback: u64, result: serde_json::Value },
+    Invoke {
+        ext: String,
+        command: String,
+    },
+    Done {
+        ext: String,
+        callback: u64,
+        result: serde_json::Value,
+    },
+    /// A key or selection in an extension's panel, or it opened/closed.
+    Panel {
+        ext: String,
+        id: String,
+        event: PanelEvent,
+    },
     Replace(Vec<(Extension, Grant)>),
     Shutdown,
 }
@@ -122,6 +148,11 @@ impl Runtime {
     /// Run a command an extension registered (menu item or shortcut).
     pub fn invoke(&self, ext: &str, command: &str) {
         let _ = self.inbox.send(Inbox::Invoke { ext: ext.into(), command: command.into() });
+    }
+
+    /// Something happened in an extension's panel.
+    pub fn panel(&self, ext: &str, id: &str, event: PanelEvent) {
+        let _ = self.inbox.send(Inbox::Panel { ext: ext.into(), id: id.into(), event });
     }
 
     /// Replace every extension (configuration reload).
@@ -230,6 +261,49 @@ impl Thread {
                         f.call::<()>(v).map(|_| mlua::Value::Nil)
                     });
                 }
+            }
+            Inbox::Panel { ext, id, event } => {
+                let Some(i) = self.find(&ext) else { return };
+                let def = self.exts[i].ctx.state.lock().unwrap().panels.get(&id).cloned();
+                let Some(def) = def else { return };
+                let ctx = self.exts[i].ctx.clone();
+                match event {
+                    PanelEvent::Open(open) => {
+                        let mut st = ctx.state.lock().unwrap();
+                        let tag = format!("panel:{id}");
+                        st.timers.retain(|t| t.tag.as_deref() != Some(tag.as_str()));
+                        if let (true, Some(every)) = (open, def.interval) {
+                            let tid = st.next_timer_id();
+                            st.timers.push(api::Timer {
+                                id: tid,
+                                due: Instant::now() + every,
+                                every: Some(every),
+                                action: TimerAction::RenderPanel(id.clone()),
+                                tag: Some(tag),
+                            });
+                        }
+                        if let Some(p) = st.panels.get_mut(&id) {
+                            p.open = open;
+                        }
+                        drop(st);
+                        if !open {
+                            return;
+                        }
+                    }
+                    PanelEvent::Select(n) => {
+                        if let Some(f) = def.on_select {
+                            self.call(i, |_| f.call::<()>(n).map(|_| mlua::Value::Nil));
+                        }
+                    }
+                    PanelEvent::Key { key, selected } => {
+                        if let Some(f) = def.on_key {
+                            self.call(i, |_| {
+                                f.call::<()>((key, selected)).map(|_| mlua::Value::Nil)
+                            });
+                        }
+                    }
+                }
+                self.render_panel(i, &id);
             }
             Inbox::Replace(list) => self.replace(list),
             Inbox::Shutdown => {}
@@ -521,6 +595,7 @@ impl Thread {
                         let _ = self.shared.out.send(c);
                         (self.shared.wake)();
                     }
+                    TimerAction::RenderPanel(id) => self.render_panel(i, &id),
                     TimerAction::Completed(name) => {
                         let ext = self.exts[i].ctx.name.clone();
                         self.shared.bus.publisher("animation").publish(
@@ -531,6 +606,31 @@ impl Thread {
                     }
                 }
             }
+        }
+    }
+
+    /// Call a panel's `render` and send its widgets to the window.
+    fn render_panel(&mut self, i: usize, id: &str) {
+        let def = self.exts[i].ctx.state.lock().unwrap().panels.get(id).cloned();
+        let Some(def) = def else { return };
+        let name = self.exts[i].ctx.name.clone();
+        let mut result = None;
+        let out = self.call(i, |lua| {
+            let v = def.render.call::<mlua::Value>(())?;
+            result = Some(api::widgets_json(lua, v));
+            Ok(mlua::Value::Nil)
+        });
+        match (out, result) {
+            (Some(_), Some(Ok(widgets))) => {
+                let _ = self.shared.out.send(Command::PanelContent {
+                    ext: name,
+                    id: id.into(),
+                    widgets,
+                });
+                (self.shared.wake)();
+            }
+            (Some(_), Some(Err(e))) => self.notify(i, format!("panel {id}: {e}"), true),
+            _ => {}
         }
     }
 

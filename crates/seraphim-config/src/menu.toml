@@ -9,10 +9,12 @@
 [[menu]]
 title = "&File"
 items = [
+    { label = "New &Tab", action = "new-tab" },
     { label = "&New Window", action = "new-window" },
     { separator = true },
     { label = "Open &File Manager", action = "open-file-manager" },
     { separator = true },
+    { label = "C&lose Tab", action = "close-tab" },
     { label = "&Close Window", action = "close-window" },
 ]
 
@@ -40,6 +42,21 @@ items = [
     { separator = true },
     { label = "Scroll to &Top", action = "scroll-top" },
     { label = "Scroll to &Bottom", action = "scroll-bottom" },
+    { separator = true },
+    { label = "Split &Right", action = "split-right" },
+    { label = "Split &Down", action = "split-down" },
+    { label = "&Close Pane", action = "close-pane" },
+    { label = "&Zoom Pane", action = "zoom-pane" },
+    { label = "E&qual Pane Sizes", action = "equalize-panes" },
+    { separator = true },
+    { label = "Rename T&ab", action = "rename-tab" },
+    { label = "Move Tab &Left", action = "move-tab-left" },
+    { label = "Move Tab Ri&ght", action = "move-tab-right" },
+    { separator = true },
+    { label = "S&ystem Monitor", action = "panel-system" },
+    { label = "Sessio&ns", action = "panel-sessions" },
+    { label = "Command &History", action = "panel-history" },
+    { label = "&Package Activity", action = "panel-packages" },
 ]
 
 [[menu]]
@@ -50,6 +67,14 @@ items = [
     { label = "&Next Profile", action = "next-profile" },
     { label = "&Reload Configuration", action = "reload-config" },
     { label = "&Open Configuration Folder", action = "open-config-folder" },
+]
+
+[[menu]]
+title = "&Settings"
+items = [
+    { label = "&Configure Seraphim…", action = "settings" },
+    { separator = true },
+    { action = "layouts" },
 ]
 
 [[menu]]

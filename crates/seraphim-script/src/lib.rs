@@ -27,7 +27,7 @@ use std::time::Duration;
 
 pub use manifest::{discover, Extension, Manifest, API_VERSION};
 pub use perm::{Grant, Permission, DEFAULT_GRANT, PERMISSIONS};
-pub use runtime::Runtime;
+pub use runtime::{PanelEvent, Runtime};
 
 /// How a change animates: over `duration_ms` with an easing name
 /// (`linear`, `ease-in-out`, `spring`, `instant`, …; validated by the host).
@@ -132,6 +132,24 @@ pub enum Command {
     Reset {
         ext: String,
     },
+    /// A panel the extension provides (spec §9.4).
+    RegisterPanel {
+        ext: String,
+        id: String,
+        title: String,
+    },
+    /// A panel's widgets (a list of widget tables), after it rendered.
+    PanelContent {
+        ext: String,
+        id: String,
+        widgets: serde_json::Value,
+    },
+    /// Show a panel: `place` is `right`, `down` or `tab`.
+    OpenPanel {
+        ext: String,
+        id: String,
+        place: String,
+    },
 }
 
 impl Command {
@@ -150,7 +168,10 @@ impl Command {
             | Command::RegisterCommand { ext, .. }
             | Command::RegisterKey { ext, .. }
             | Command::Action { ext, .. }
-            | Command::Reset { ext } => ext,
+            | Command::Reset { ext }
+            | Command::RegisterPanel { ext, .. }
+            | Command::PanelContent { ext, .. }
+            | Command::OpenPanel { ext, .. } => ext,
         }
     }
 }

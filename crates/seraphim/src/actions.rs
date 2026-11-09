@@ -62,6 +62,30 @@ pub enum Action {
     /// The focused pane fills the tab (and back).
     ZoomPane,
     EqualizePanes,
+    /// Open (or close) a built-in panel.
+    OpenPanel(PanelId),
+}
+
+/// The built-in panels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelId {
+    System,
+    Sessions,
+    History,
+    Packages,
+    Settings,
+}
+
+impl PanelId {
+    pub fn name(self) -> &'static str {
+        match self {
+            PanelId::System => "system",
+            PanelId::Sessions => "sessions",
+            PanelId::History => "history",
+            PanelId::Packages => "packages",
+            PanelId::Settings => "settings",
+        }
+    }
 }
 
 impl Action {
@@ -105,6 +129,11 @@ impl Action {
             "focus-down" => FocusDown,
             "zoom-pane" => ZoomPane,
             "equalize-panes" => EqualizePanes,
+            "panel-system" => OpenPanel(PanelId::System),
+            "panel-sessions" => OpenPanel(PanelId::Sessions),
+            "panel-history" => OpenPanel(PanelId::History),
+            "panel-packages" => OpenPanel(PanelId::Packages),
+            "settings" => OpenPanel(PanelId::Settings),
             _ => return None,
         })
     }
@@ -147,6 +176,8 @@ impl Action {
             FocusLeft | FocusRight | FocusUp | FocusDown => "Alt+Arrows",
             ResizeLeft | ResizeRight | ResizeUp | ResizeDown => "Ctrl+Alt+Arrows",
             ZoomPane => "Ctrl+Shift+Z",
+            OpenPanel(PanelId::Settings) => "Ctrl+Shift+,",
+            OpenPanel(_) => "",
             OpenFileManager | ClearScrollback | OpenConfigFolder | Shortcuts | About
             | EqualizePanes => "",
         }
@@ -195,6 +226,11 @@ impl Action {
             ResizeLeft | ResizeRight | ResizeUp | ResizeDown => "Resize the pane",
             ZoomPane => "Zoom the pane",
             EqualizePanes => "Equal pane sizes",
+            OpenPanel(PanelId::System) => "System monitor",
+            OpenPanel(PanelId::Sessions) => "Sessions",
+            OpenPanel(PanelId::History) => "Command history",
+            OpenPanel(PanelId::Packages) => "Package activity",
+            OpenPanel(PanelId::Settings) => "Settings",
         }
     }
 }
@@ -233,6 +269,7 @@ pub const SHORTCUT_HELP: &[Action] = &[
     Action::FocusLeft,
     Action::ResizeLeft,
     Action::ZoomPane,
+    Action::OpenPanel(PanelId::Settings),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +318,7 @@ pub fn shortcut_in(
         K::Char(c) if ctrl_shift && letter(c, 'x') => Some(Action::ClosePane),
         K::Char(c) if ctrl_shift && letter(c, 'z') => Some(Action::ZoomPane),
         K::Char(c) if ctrl_alt && letter(c, 's') => Some(Action::RenameTab),
+        K::Char(',' | '<') if ctrl_shift => Some(Action::OpenPanel(PanelId::Settings)),
         K::PageDown if ctrl_only => Some(Action::NextTab),
         K::PageUp if ctrl_only => Some(Action::PrevTab),
         K::Tab if ctrl_only => Some(Action::NextTab),
@@ -446,7 +484,10 @@ mod tests {
     #[test]
     fn every_menu_action_name_maps() {
         for name in seraphim_config::MENU_ACTIONS {
-            assert!(*name == "profiles" || Action::from_name(name).is_some(), "{name}");
+            assert!(
+                ["profiles", "layouts"].contains(name) || Action::from_name(name).is_some(),
+                "{name}"
+            );
         }
     }
 
