@@ -135,3 +135,90 @@ fn scrollback_limit_counts_rows_after_reflow() {
     assert_eq!(history(&t), ["aaaaa", "bbbbb", "bbbbb"]);
     t.check_invariants().unwrap();
 }
+
+/// Colored art wider than the terminal, each line reset before its newline
+/// (like ANSI art printed with `cat`): `lines` lines of `width` cells.
+fn art(width: usize, lines: usize) -> String {
+    let mut s = String::new();
+    for l in 0..lines {
+        for c in 0..width {
+            s.push_str(&format!(
+                "\x1b[4{}m{}",
+                (l + c) % 7 + 1,
+                if c % 3 == 0 { '#' } else { ' ' }
+            ));
+        }
+        s.push_str("\x1b[0m\r\n");
+    }
+    s
+}
+
+/// Every line's cells (history first), as (char, bg), trailing default
+/// blanks dropped.
+fn cells(t: &Terminal) -> Vec<Vec<(char, seraphim_terminal::Color)>> {
+    t.scrollback()
+        .iter()
+        .chain(t.screen().rows_iter())
+        .map(|r| {
+            let mut v: Vec<_> = r.cells.iter().map(|c| (c.ch, c.attrs.bg)).collect();
+            while v.last().is_some_and(|c| c.0 == ' ' && c.1 == seraphim_terminal::Color::Default) {
+                v.pop();
+            }
+            v
+        })
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// A line that autowraps in the middle of colored text scrolls in a new
+/// row filled with that color (background color erase, as in xterm).
+/// Widening must not make that fill part of the line: the art, printed at
+/// 40 columns and widened to 80, is exactly the art printed at 80.
+#[test]
+fn widening_does_not_spread_the_scroll_fill_of_a_wrapped_line() {
+    let input = art(50, 12);
+    let mut narrow = Terminal::with_scrollback(40, 6, 100);
+    narrow.advance(input.as_bytes());
+    // At 40 columns the fill is visible, as in xterm.
+    let cont = narrow.screen().row(narrow.rows() - 2);
+    assert_ne!(
+        cont.cells[39].attrs.bg,
+        seraphim_terminal::Color::Default,
+        "BCE fill on the wrapped row"
+    );
+    narrow.resize(80, 6);
+    let mut wide = Terminal::with_scrollback(80, 6, 100);
+    wide.advance(input.as_bytes());
+    let (a, b) = (cells(&narrow), cells(&wide));
+    assert!(a.iter().all(|l| l.len() == 50), "{:?}", a.iter().map(|l| l.len()).collect::<Vec<_>>());
+    assert_eq!(a, b);
+    // And back: narrowing again rewraps to two rows per line, not more.
+    narrow.resize(40, 6);
+    assert!(cells(&narrow).iter().all(|l| l.len() <= 40));
+}
+
+#[test]
+fn narrowing_a_scroll_filled_row_does_not_wrap_the_fill() {
+    // A full-width colored fill from scrolling, with a short prompt on it.
+    let mut t = Terminal::with_scrollback(40, 3, 100);
+    t.advance(b"a\r\nb\r\n\x1b[44m\r\n\x1b[0m$ ");
+    t.resize(20, 3);
+    let prompt = t.screen().row(t.cursor().row);
+    assert_eq!(prompt.text().trim_end(), "$");
+    assert!(!prompt.wrapped, "the fill must not wrap into a second row");
+}
+
+#[test]
+fn explicitly_colored_lines_keep_their_color_after_a_scroll_fill() {
+    // A line wraps onto a scroll-filled row, and then the program colors
+    // the rest of that row on purpose (erase to end of line): that is
+    // content and survives the rejoin.
+    let mut t = Terminal::with_scrollback(10, 2, 100);
+    t.advance(b"x\r\n\x1b[45m0123456789ab\x1b[K\x1b[0m");
+    t.resize(20, 2);
+    let row = t.screen().row(t.cursor().row);
+    assert_eq!(row.text().trim_end(), "0123456789ab");
+    for col in 12..20 {
+        assert_eq!(row.cells[col].attrs.bg, seraphim_terminal::Color::Indexed(5), "col {col}");
+    }
+}

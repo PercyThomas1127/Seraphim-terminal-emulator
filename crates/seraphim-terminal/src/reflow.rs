@@ -26,9 +26,11 @@ struct Logical {
 }
 
 /// Number of cells of `row` that carry content (trailing default blanks
-/// dropped, and the padding of a wrapped wide character).
+/// dropped, and the padding of a wrapped wide character). On a row whose
+/// blanks are a scroll fill, only what was printed counts.
 fn content_len(row: &Row) -> usize {
-    // Everything past `occupied()` is blank by invariant; start there.
+    // Everything past `occupied()` is blank (or scroll fill) by invariant;
+    // start there.
     let mut n = row.occupied().min(row.cells.len());
     while n > 0 && (row.cells[n - 1] == Cell::default() || row.cells[n - 1].is_wide_padding()) {
         n -= 1;

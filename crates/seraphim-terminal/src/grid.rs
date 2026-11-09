@@ -18,16 +18,30 @@ pub struct Row {
     /// Zero-width combining marks, as `(column, marks)`. Almost always
     /// empty, so it costs one empty `Vec` per row.
     combining: Vec<(u16, Box<[char]>)>,
-    /// Invariant: `cells[occ..]` are all `Cell::default()`. Lets `reset`
-    /// clear only the written prefix (a 70-char line in a 200-col terminal
-    /// clears 70 cells, not 200).
+    /// Invariant: `cells[occ..]` are all `Cell::default()`, or blanks of
+    /// the scroll fill while `scroll_fill` is set. Lets `reset` clear only
+    /// the written prefix (a 70-char line in a 200-col terminal clears 70
+    /// cells, not 200), and tells reflow where printing ended.
     occ: usize,
+    /// The row's blanks came from scrolling while a background color was
+    /// set (xterm's background color erase), not from the application:
+    /// e.g. a line that autowrapped onto a fresh row in the middle of
+    /// colored text. `occ` then counts only what was printed, so reflow
+    /// leaves the fill out of the line when the window widens. Cleared by
+    /// any explicit erase or edit of the row.
+    scroll_fill: bool,
 }
 
 impl Row {
     pub fn new(cols: usize, template: &Attrs) -> Self {
         let occ = if default_blank(template) { 0 } else { cols };
-        Row { cells: vec![Cell::blank(template); cols], wrapped: false, combining: Vec::new(), occ }
+        Row {
+            cells: vec![Cell::blank(template); cols],
+            wrapped: false,
+            combining: Vec::new(),
+            occ,
+            scroll_fill: false,
+        }
     }
 
     /// Build a row from cells and their combining marks (used by reflow).
@@ -37,13 +51,34 @@ impl Row {
         wrapped: bool,
     ) -> Self {
         let occ = cells.iter().rposition(|c| *c != Cell::default()).map_or(0, |i| i + 1);
-        Row { cells, wrapped, combining, occ }
+        Row { cells, wrapped, combining, occ, scroll_fill: false }
     }
 
     /// Cells beyond this index are all `Cell::default()`.
     #[inline]
     pub(crate) fn occupied(&self) -> usize {
         self.occ
+    }
+
+    /// The application changed the row other than by printing (an erase,
+    /// insert or delete): its colors are intended from now on.
+    #[inline]
+    pub(crate) fn edited(&mut self) {
+        if self.scroll_fill {
+            self.scroll_fill = false;
+            // The fill past `occ` is content now.
+            self.occ = self.cells.len();
+        }
+    }
+
+    /// Blank the row with `template` as scrolling does: a colored template
+    /// is a scroll fill (see the field).
+    fn scroll_reset(&mut self, cols: usize, template: &Attrs) {
+        self.reset(cols, template);
+        if !default_blank(template) {
+            self.scroll_fill = true;
+            self.occ = 0;
+        }
     }
 
     /// Take the combining marks out (used by reflow).
@@ -53,7 +88,13 @@ impl Row {
 
     /// An empty row (no cells) used as a reusable buffer.
     pub(crate) fn empty(capacity: usize) -> Self {
-        Row { cells: Vec::with_capacity(capacity), wrapped: false, combining: Vec::new(), occ: 0 }
+        Row {
+            cells: Vec::with_capacity(capacity),
+            wrapped: false,
+            combining: Vec::new(),
+            occ: 0,
+            scroll_fill: false,
+        }
     }
 
     /// Wide-character pairing and the `occ` invariant.
@@ -66,7 +107,8 @@ impl Row {
             if c.is_wide_spacer() && !(i > 0 && self.cells[i - 1].is_wide()) {
                 return Err(format!("orphan spacer at {i}"));
             }
-            if i >= self.occ && *c != Cell::default() {
+            let blank = c.ch == ' ' && !c.attrs.flags.intersects(Flags::WIDE | Flags::WIDE_SPACER);
+            if i >= self.occ && *c != Cell::default() && !(self.scroll_fill && blank) {
                 return Err(format!("cell {i} written beyond occ {}", self.occ));
             }
         }
@@ -155,7 +197,7 @@ impl Row {
 
     /// Blank the row in place, reusing its allocation.
     pub(crate) fn reset(&mut self, cols: usize, template: &Attrs) {
-        if default_blank(template) && self.cells.len() == cols {
+        if default_blank(template) && self.cells.len() == cols && !self.scroll_fill {
             self.cells[..self.occ].fill(Cell::default());
             self.occ = 0;
         } else {
@@ -165,6 +207,7 @@ impl Row {
         }
         self.wrapped = false;
         self.combining.clear();
+        self.scroll_fill = false;
     }
 
     pub(crate) fn resize(&mut self, cols: usize) {
@@ -215,6 +258,13 @@ impl Grid {
         let r = &mut self.lines[i];
         r.occ = r.cells.len();
         r
+    }
+
+    /// The application erased or edited row `i` (see `Row::edited`);
+    /// leaves the `occ` bookkeeping alone.
+    #[inline]
+    pub(crate) fn edited(&mut self, i: usize) {
+        self.lines[i].edited();
     }
 
     /// Mutable access to one cell (marks it written).
@@ -274,7 +324,7 @@ impl Grid {
         // Evict the departing rows first, while they are still at the top.
         for row in &mut self.lines[top..top + n] {
             evict(row);
-            row.reset(self.cols, t);
+            row.scroll_reset(self.cols, t);
         }
         self.lines[top..=bottom].rotate_left(n);
     }
@@ -285,7 +335,7 @@ impl Grid {
         let n = n.min(bottom + 1 - top);
         self.lines[top..=bottom].rotate_right(n);
         for row in &mut self.lines[top..top + n] {
-            row.reset(self.cols, t);
+            row.scroll_reset(self.cols, t);
         }
     }
 

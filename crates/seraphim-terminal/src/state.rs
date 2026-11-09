@@ -588,6 +588,7 @@ impl State {
         let grid = self.grid();
         grid.split_wide(row, from);
         grid.split_wide(row, to - 1);
+        grid.edited(row);
         if attrs.bg == Color::Default {
             // Writing default blanks never breaks the `occ` invariant.
             grid.clear_combining(row, from, to);
@@ -618,6 +619,7 @@ impl State {
         let grid = self.grid();
         grid.split_wide_boundary(row, col);
         let r = grid.row_mut(row);
+        r.edited();
         r.shift_combining(col, n as isize, cols);
         let line = &mut r.cells;
         line[col..].rotate_right(n);
@@ -640,6 +642,7 @@ impl State {
             grid.split_wide_boundary(row, col + n);
         }
         let r = grid.row_mut(row);
+        r.edited();
         r.clear_combining(col, col + n);
         r.shift_combining(col + n, -(n as isize), cols);
         let line = &mut r.cells;
