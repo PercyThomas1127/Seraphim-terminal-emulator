@@ -10,6 +10,10 @@
 //!     --extension also loads an extension folder or .lua file (with the
 //!     grants of its [extensions.NAME] entry). --layout opens a [[layout]].
 //!
+//! seraphim bench [--json] [--frames N]
+//!     Measure parser throughput, frame preparation and GPU frame times on
+//!     this machine (no window needed).
+//!
 //! seraphim --print-default-config
 //!     Print the documented default configuration file.
 //!
@@ -27,6 +31,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod actions;
+mod bench;
 mod bindings;
 mod interaction;
 mod menu;
@@ -259,14 +264,24 @@ fn install_terminfo() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    let _ = window::STARTED.set(std::time::Instant::now());
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim --install-terminfo\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim --install-terminfo\n       seraphim bench [--json] [--frames N]\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),
         Some("--version") => {
             println!("seraphim {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
+        }
+        Some("bench") => {
+            let json = args.iter().any(|a| a == "--json");
+            let frames = args
+                .iter()
+                .position(|a| a == "--frames")
+                .and_then(|i| args.get(i + 1)?.parse().ok())
+                .unwrap_or(120);
+            bench::run(json, frames).map(|_| ExitCode::SUCCESS)
         }
         Some("--install-terminfo") => install_terminfo().map(|_| ExitCode::SUCCESS),
         Some("--print-default-config") => {

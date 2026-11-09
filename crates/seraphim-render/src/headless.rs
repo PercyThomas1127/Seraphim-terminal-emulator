@@ -117,6 +117,57 @@ impl Headless {
         })
     }
 
+    /// Draw one frame into an offscreen target and wait for the GPU to
+    /// finish (no readback). Returns the wall time from recording to
+    /// completion: GPU plus driver cost of a frame, for benchmarks.
+    pub fn time_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        pre: &mut dyn FnMut(&mut wgpu::CommandEncoder),
+        draw: &mut dyn FnMut(&mut Renderer, &mut wgpu::RenderPass<'_>),
+    ) -> std::time::Duration {
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bench target"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let start = std::time::Instant::now();
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        pre(&mut encoder);
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bench"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.renderer.clear_color()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            draw(&mut self.renderer, &mut pass);
+        }
+        self.queue.submit([encoder.finish()]);
+        self.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .expect("device poll");
+        start.elapsed()
+    }
+
     /// Several terminals in one frame, each in its own renderer slot and
     /// viewport `[x, y, w, h]` (pixels); `view` sizes are the panes'.
     pub fn render_panes(

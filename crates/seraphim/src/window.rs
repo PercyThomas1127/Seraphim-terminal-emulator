@@ -65,6 +65,39 @@ struct SpawnConfig {
     grapheme_clustering: bool,
 }
 
+/// `SERAPHIM_TIMING=1`: time to first frame, and key press to echo.
+#[derive(Default)]
+struct Timing {
+    first_frame: bool,
+    /// A key went to the shell and its echo hasn't been drawn yet.
+    key_at: Option<Instant>,
+    /// Output arrived after that key press.
+    echoed: bool,
+    /// Key → frame showing the response, in milliseconds.
+    samples: Vec<f64>,
+}
+
+impl Timing {
+    fn report(&self) {
+        let mut v = self.samples.clone();
+        if v.is_empty() {
+            return;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        let at = |q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
+        eprintln!(
+            "seraphim: timing: key press to echo on screen over {} keys: median {:.1} ms, p95 {:.1} ms, max {:.1} ms (includes the shell's echo)",
+            v.len(),
+            at(0.5),
+            at(0.95),
+            v[v.len() - 1]
+        );
+    }
+}
+
+/// When the process started (set by `main`).
+pub static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 /// Renderer slot for pane dividers and dimming.
 const DECOR_SLOT: u64 = u64::MAX;
 /// Overlay slot for the tab bar (slot 0 is the menu bar).
@@ -365,6 +398,7 @@ struct Active {
     base_profile: String,
     /// Pane rectangles drawn this frame.
     drawn: Vec<(u64, Rect)>,
+    timing: Option<Timing>,
     /// Click targets in the tab bar.
     tab_hits: crate::tabbar::Hits,
     /// A divider being dragged.
@@ -589,6 +623,7 @@ impl App {
             panes_cfg: o.panes.clone(),
             base_profile: o.profile.clone(),
             drawn: Vec::new(),
+            timing: std::env::var_os("SERAPHIM_TIMING").is_some().then(Timing::default),
             tab_hits: Default::default(),
             drag: None,
             tab_drag: None,
@@ -2705,6 +2740,12 @@ impl Active {
             let bytes = encode_key_input(&input, &modes);
             if !bytes.is_empty() {
                 self.renderer.key_pressed();
+                if let Some(t) = &mut self.timing {
+                    if t.key_at.is_none() {
+                        t.key_at = Some(Instant::now());
+                        t.echoed = false;
+                    }
+                }
             }
             self.write(&bytes);
         }
@@ -2876,6 +2917,9 @@ impl ApplicationHandler<UserEvent> for App {
         let focused_changed =
             a.panes.get(&focus).is_some_and(|p| p.session.generation() != p.last_generation);
         if focused_changed {
+            if let Some(t) = &mut a.timing {
+                t.echoed |= t.key_at.is_some();
+            }
             a.reset_blink();
             a.update_pointer_icon();
             let synchronized = focused!(a).terminal().modes().synchronized_output;
@@ -3204,6 +3248,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(t) = self.active.as_ref().and_then(|a| a.timing.as_ref()) {
+            t.report();
+        }
         if let Some(a) = &self.active {
             if self.options.restore_session {
                 if let Err(e) = crate::restore::save(&a.saved_session()) {
@@ -3288,6 +3335,24 @@ fn draw(a: &mut Active) {
     a.gpu.queue.submit([encoder.finish()]);
     a.window.pre_present_notify();
     a.gpu.queue.present(frame);
+    if let Some(t) = &mut a.timing {
+        let now = Instant::now();
+        if !t.first_frame {
+            t.first_frame = true;
+            if let Some(s) = STARTED.get() {
+                eprintln!(
+                    "seraphim: timing: first frame {:.1} ms after start",
+                    (now - *s).as_secs_f64() * 1e3
+                );
+            }
+        }
+        if t.echoed {
+            if let Some(k) = t.key_at.take() {
+                t.samples.push((now - k).as_secs_f64() * 1e3);
+            }
+            t.echoed = false;
+        }
+    }
 }
 
 /// Translate a winit key event into a protocol-neutral [`KeyInput`].

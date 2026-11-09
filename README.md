@@ -309,7 +309,28 @@ into the history, move with scroll regions, and can sit under or over the
 text (kitty z-index). Kitty animations play, Unicode placeholders work (so
 images show through tmux), and local tools can hand images over through
 shared memory or files. The PTY reports pixel sizes, so tools size
-pictures correctly.
+pictures correctly. Tested with `kitten icat`, `chafa`, `img2sixel`, `timg`
+and tmux; see [docs/image-tools.md](docs/image-tools.md).
+
+For 24-bit color and images inside tmux (and undercurl and cursor shapes
+in programs that read terminfo), install Seraphim's terminfo entry once:
+
+```bash
+seraphim --install-terminfo
+```
+
+New sessions then use `TERM=xterm-seraphim`. Hosts you ssh into need the
+entry too, or set `terminal.term = "xterm-256color"`.
+
+### Performance
+
+Seraphim draws a frame only when something changed, and then rebuilds only
+the rows that changed and uploads only the bytes that differ. `seraphim
+bench` measures parser throughput, frame preparation and GPU frame times on
+your machine. `SERAPHIM_TIMING=1 seraphim` logs time to first frame and
+key-to-echo latency. Numbers so far, all from software rendering, are in
+[docs/benchmarks.md](docs/benchmarks.md); results from real GPUs are
+welcome there.
 
 ### Configuration
 

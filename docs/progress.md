@@ -110,7 +110,7 @@ decorations, custom tab designs beyond the label format.
 | Area | Status |
 |---|---|
 | Reliability | Shader, image and video failures are contained and reported |
-| Performance | Parity with alacritty's parser; frames drawn only when something changes; frame pacing for animations. **Gap:** the cell renderer rebuilds every visible cell each frame (spec §4.4 asks for partial redraws / dirty regions) |
+| Performance | Parity with alacritty's parser; frames drawn only when something changes; frame pacing for animations; partial redraws (only changed rows are rebuilt, only changed bytes uploaded; `docs/benchmarks.md`). **Gap:** no real-GPU measurements yet |
 | Isolation, responsiveness | Scripts on their own thread, sandboxed, budgeted; they send commands and never block rendering or I/O |
 | Accessibility | Reduced motion everywhere, font zoom; no contrast checks yet |
 | Compatibility | xterm conformance suite, vttest, golden screens |
@@ -123,9 +123,8 @@ decorations, custom tab designs beyond the label format.
 
 1. Phase V: a real Gabriel connection, audio, desktop integration, the
    Gallery and an SDK.
-2. Dirty-region rendering (spec §4.4).
-3. Measurements on real GPUs (everything so far ran on llvmpipe).
-4. Testing with real image tools (`kitten icat`, `chafa`, `img2sixel`,
-   tmux), which aren't available in the development container.
-5. WebAssembly extensions for untrusted Gallery code (ADR 0005), with the
+2. Measurements on real GPUs: `seraphim bench --json` and
+   `SERAPHIM_TIMING=1` are ready; the development container has no GPU
+   (`docs/benchmarks.md`).
+3. WebAssembly extensions for untrusted Gallery code (ADR 0005), with the
    Gallery itself (Phase V).
