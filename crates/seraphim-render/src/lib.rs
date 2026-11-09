@@ -90,6 +90,10 @@ pub struct FrameStats {
     pub instances: usize,
     pub glyphs_rasterized: usize,
     pub atlas_resets: usize,
+    /// Rows whose instances were built this frame (the rest were reused).
+    pub rows_rebuilt: usize,
+    /// Instance bytes sent to the GPU this frame.
+    pub uploaded_bytes: usize,
 }
 
 pub struct Renderer {
@@ -117,6 +121,14 @@ pub struct Renderer {
     bg_end: u32,
     images: images::Images,
     fx: cursorfx::Fx,
+    /// Instances of each visible row from earlier frames (partial redraw,
+    /// spec §4.4): a row is rebuilt only when it, its selection, or the
+    /// cursor on it changed.
+    rows_cache: Vec<RowCache>,
+    /// Cell size, padding and columns the cache was built for.
+    cache_key: Option<[u32; 4]>,
+    /// The instances the GPU buffer holds.
+    uploaded: Vec<Instance>,
     /// What new slots need.
     format: wgpu::TextureFormat,
     layout: wgpu::BindGroupLayout,
@@ -142,6 +154,27 @@ struct Slot {
     fx: cursorfx::Fx,
     theme: Theme,
     applied_overrides: seraphim_terminal::palette::ColorOverrides,
+    rows_cache: Vec<RowCache>,
+    cache_key: Option<[u32; 4]>,
+    uploaded: Vec<Instance>,
+}
+
+/// What a row's instances depend on besides the global key.
+#[derive(Clone, Debug, PartialEq)]
+struct RowKey {
+    row: seraphim_terminal::Row,
+    /// Selected columns (empty: none), and the selection's fade.
+    selected: Vec<bool>,
+    sel_alpha: u32,
+    /// Column of a block cursor inverting the text in this row.
+    inverted: Option<usize>,
+}
+
+#[derive(Default)]
+struct RowCache {
+    key: Option<RowKey>,
+    bg: Vec<Instance>,
+    fg: Vec<Instance>,
 }
 
 impl Renderer {
@@ -307,6 +340,9 @@ impl Renderer {
             bg_end: 0,
             images,
             fx: Default::default(),
+            rows_cache: Vec::new(),
+            cache_key: None,
+            uploaded: Vec::new(),
             format,
             layout,
             atlas_view,
@@ -358,6 +394,17 @@ impl Renderer {
             fx,
             theme: self.base_theme.clone(),
             applied_overrides: Default::default(),
+            rows_cache: Vec::new(),
+            cache_key: None,
+            uploaded: Vec::new(),
+        }
+    }
+
+    /// Forget every slot's cached rows (glyph positions or colors moved).
+    fn clear_row_caches(&mut self) {
+        self.rows_cache.clear();
+        for s in self.slots.values_mut() {
+            s.rows_cache.clear();
         }
     }
 
@@ -373,6 +420,9 @@ impl Renderer {
         std::mem::swap(&mut self.fx, &mut slot.fx);
         std::mem::swap(&mut self.theme, &mut slot.theme);
         std::mem::swap(&mut self.applied_overrides, &mut slot.applied_overrides);
+        std::mem::swap(&mut self.rows_cache, &mut slot.rows_cache);
+        std::mem::swap(&mut self.cache_key, &mut slot.cache_key);
+        std::mem::swap(&mut self.uploaded, &mut slot.uploaded);
     }
 
     /// Draw state for pane `id` from now on (created on first use). A
@@ -458,6 +508,7 @@ impl Renderer {
         }
         self.theme = theme;
         self.applied_overrides = Default::default();
+        self.clear_row_caches();
     }
 
     /// Replace fonts (e.g. on scale-factor or font-size change).
@@ -466,6 +517,7 @@ impl Renderer {
         self.glyphs.clear();
         self.shaped.clear();
         self.atlas.clear();
+        self.clear_row_caches();
     }
 
     pub fn fonts(&self) -> &Fonts {
@@ -503,8 +555,32 @@ impl Renderer {
         if self.instances.len() > self.instance_capacity {
             self.instance_capacity = self.instances.len().next_power_of_two();
             self.instance_buffer = Self::make_instance_buffer(device, self.instance_capacity);
+            self.uploaded.clear();
         }
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
+        // Upload only the span that differs from what the GPU has.
+        let new: &[u8] = bytemuck::cast_slice(&self.instances);
+        let old: &[u8] = bytemuck::cast_slice(&self.uploaded);
+        let size = std::mem::size_of::<Instance>();
+        let (first, last) = if new == old {
+            (0, 0)
+        } else {
+            // Compare whole instances (memcmp), not bytes.
+            let pairs = || new.chunks_exact(size).zip(old.chunks_exact(size));
+            let first =
+                pairs().position(|(a, b)| a != b).unwrap_or(new.len().min(old.len()) / size);
+            let last = if new.len() == old.len() {
+                pairs().rposition(|(a, b)| a != b).map_or(first, |i| i + 1)
+            } else {
+                new.len() / size
+            };
+            (first * size, last * size)
+        };
+        if last > first {
+            queue.write_buffer(&self.instance_buffer, first as u64, &new[first..last]);
+        }
+        self.stats.uploaded_bytes = last.saturating_sub(first);
+        self.uploaded.clear();
+        self.uploaded.extend_from_slice(&self.instances);
         let globals = Globals {
             screen: [view.width.max(1) as f32, view.height.max(1) as f32],
             atlas: [ATLAS_SIZE as f32, ATLAS_SIZE as f32],
@@ -537,6 +613,8 @@ impl Renderer {
             self.instance_buffer = Self::make_instance_buffer(device, self.instance_capacity);
         }
         queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
+        self.uploaded.clear();
+        self.uploaded.extend_from_slice(&self.instances);
         let globals = Globals {
             screen: [width.max(1) as f32, height.max(1) as f32],
             atlas: [ATLAS_SIZE as f32, ATLAS_SIZE as f32],
@@ -581,6 +659,8 @@ impl Renderer {
             }
             self.glyphs.clear();
             self.atlas.clear();
+            // Cached rows point into the old atlas (in every pane).
+            self.clear_row_caches();
             self.stats.atlas_resets += 1;
             if attempt == 1 {
                 // Pathological screen (more distinct glyphs than fit); draw
@@ -596,11 +676,17 @@ impl Renderer {
         if *term.color_overrides() != self.applied_overrides {
             self.applied_overrides = term.color_overrides().clone();
             self.theme = self.base_theme.with_overrides(&self.applied_overrides);
+            self.rows_cache.clear();
         }
         let m = self.fonts.metrics();
         let (cw, ch) = (m.width, m.height);
         let pad = view.padding.round();
         let (rows, cols) = (term.rows(), term.cols());
+        let key = [cw.to_bits(), ch.to_bits(), pad.to_bits(), cols as u32];
+        if self.cache_key != Some(key) {
+            self.rows_cache.clear();
+            self.cache_key = Some(key);
+        }
         let offset = term.display_offset();
         let selection = term.selection_range();
         let cursor = term.cursor();
@@ -632,33 +718,93 @@ impl Renderer {
             })
         };
 
-        // 1. Backgrounds, merged into runs of equal color. A new
-        // selection fades in.
+        let inverts = block_cursor && settled && blink > 0.5;
+        // Reuse rows from the last frame: at the same place, or moved by
+        // scrolling (cached instances are relative to their row's top).
+        let mut old = std::mem::take(&mut self.rows_cache);
+        let mut cache: Vec<RowCache> = Vec::with_capacity(rows);
+        // Rows to build (with their keys).
+        let mut fresh: Vec<Option<RowKey>> = Vec::with_capacity(rows);
+        let mut shift: isize = 0;
         for r in 0..rows {
             let row = term.visible_row(r);
-            let y = pad + r as f32 * ch;
-            let mut run: Option<(usize, Rgb, bool)> = None;
             let n = row.cells.len().min(cols);
-            for (c, cell) in row.cells[..n].iter().enumerate() {
-                let sel = selected(r, c);
-                let (_, bg) = self.colors(&cell.attrs, sel);
-                match (run, bg) {
-                    (Some((_, rc, rs)), Some(b)) if rc == b && rs == sel => {}
-                    _ => {
-                        if let Some((start, color, s)) = run.take() {
-                            let a = if s { sel_alpha } else { 1.0 };
-                            let w = (c - start) as f32 * cw;
-                            self.push_rect(pad + start as f32 * cw, y, w, ch, to_f32(color, a));
-                        }
-                        run = bg.map(|b| (c, b, sel));
-                    }
+            let mut sel: Vec<bool> = if selection.is_some() {
+                (0..n).map(|c| selected(r, c)).collect()
+            } else {
+                Vec::new()
+            };
+            if !sel.iter().any(|s| *s) {
+                sel.clear();
+            }
+            let alpha = if sel.is_empty() { 0 } else { sel_alpha.to_bits() };
+            let inverted = (inverts && r == cursor_vrow).then_some(cursor.col);
+            let fits = |c: &RowCache| {
+                c.key.as_ref().is_some_and(|k| {
+                    k.inverted == inverted
+                        && k.sel_alpha == alpha
+                        && k.selected == sel
+                        && k.row == *row
+                })
+            };
+            let near = [r as isize, r as isize + shift]
+                .into_iter()
+                .filter(|j| *j >= 0 && (*j as usize) < old.len())
+                .map(|j| j as usize)
+                .find(|j| fits(&old[*j]));
+            let found = near.or_else(|| (0..old.len()).find(|j| fits(&old[*j])));
+            match found {
+                Some(j) => {
+                    shift = j as isize - r as isize;
+                    // Each old row is used once (identical rows, like blank
+                    // ones, have their own entries).
+                    cache.push(std::mem::take(&mut old[j]));
+                    fresh.push(None);
+                }
+                None => {
+                    cache.push(RowCache::default());
+                    fresh.push(Some(RowKey {
+                        row: row.clone(),
+                        selected: sel,
+                        sel_alpha: alpha,
+                        inverted,
+                    }));
                 }
             }
-            if let Some((start, color, s)) = run {
-                let a = if s { sel_alpha } else { 1.0 };
-                let w = (n - start) as f32 * cw;
-                self.push_rect(pad + start as f32 * cw, y, w, ch, to_f32(color, a));
+        }
+        drop(old);
+        self.rows_cache = cache;
+        self.stats.rows_rebuilt = fresh.iter().filter(|f| f.is_some()).count();
+        let row_y = |r: usize| pad + r as f32 * ch;
+        // Cached instances are stored relative to their row.
+        fn place(out: &mut Vec<Instance>, from: &[Instance], dy: f32) {
+            out.extend(from.iter().map(|i| {
+                let mut i = *i;
+                i.rect[1] += dy;
+                i
+            }));
+        }
+        fn relative(from: &[Instance], dy: f32) -> Vec<Instance> {
+            from.iter()
+                .map(|i| {
+                    let mut i = *i;
+                    i.rect[1] -= dy;
+                    i
+                })
+                .collect()
+        }
+
+        // 1. Backgrounds, merged into runs of equal color. A new
+        // selection fades in.
+        for (r, f) in fresh.iter().enumerate() {
+            let y = row_y(r);
+            if f.is_none() {
+                place(&mut self.instances, &self.rows_cache[r].bg, y);
+                continue;
             }
+            let start = self.instances.len();
+            self.build_row_bg(term, r, cols, pad, cw, ch, sel_alpha, &selected);
+            self.rows_cache[r].bg = relative(&self.instances[start..], y);
         }
 
         // Ripples and glow sit under the text.
@@ -700,111 +846,20 @@ impl Renderer {
         self.bg_end = self.instances.len() as u32;
 
         // 3. Glyphs and decorations.
-        for r in 0..rows {
-            let row = term.visible_row(r);
-            let y = pad + r as f32 * ch;
-            let n = row.cells.len().min(cols);
-            for (c, cell) in row.cells[..n].iter().enumerate() {
-                if cell.is_wide_spacer() {
-                    continue;
-                }
-                let x = pad + c as f32 * cw;
-                let width = if cell.is_wide() { 2.0 * cw } else { cw };
-                let (mut fg, _) = self.colors(&cell.attrs, selected(r, c));
-                // Text inverts under the block only once it has arrived and
-                // is mostly opaque.
-                let under_cursor =
-                    block_cursor && settled && blink > 0.5 && r == cursor_vrow && c == cursor.col;
-                if under_cursor {
-                    fg = self.theme.cursor_text;
-                }
-                let flags = cell.attrs.flags;
-                // Unicode image placeholders draw as images (images.rs).
-                let placeholder = cell.ch == seraphim_terminal::graphics::PLACEHOLDER;
-                if cell.ch != ' ' && !placeholder && !flags.contains(Flags::HIDDEN) {
-                    let style =
-                        FontStyle::new(flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
-                    let marks = row.combining(c);
-                    let ok = if !marks.is_empty() {
-                        let mut text = String::with_capacity(8);
-                        text.push(cell.ch);
-                        text.extend(marks.iter());
-                        self.push_cluster(queue, &text, style, x, y, width, fg)
-                    } else if is_private_use(cell.ch) {
-                        // Nerd Font icons may spill into a following blank.
-                        let next_blank = c + 1 < n
-                            && row.cells[c + 1].ch == ' '
-                            && !row.cells[c + 1].is_wide_spacer()
-                            && row.combining(c + 1).is_empty();
-                        // Powerline separators (U+E0A0-E0D7) must stay one
-                        // cell wide so segment edges meet their backgrounds.
-                        let powerline = matches!(cell.ch as u32, 0xE0A0..=0xE0D7);
-                        let box_w = if next_blank && !cell.is_wide() && !powerline {
-                            2.0 * cw
-                        } else {
-                            width
-                        };
-                        self.push_symbol(queue, cell.ch, style, x, y, box_w, fg)
-                    } else if is_ignorable(cell.ch) {
-                        true
-                    } else {
-                        self.push_glyph(queue, cell.ch, style, x, y, width, fg)
-                    };
-                    if !ok {
-                        return false;
-                    }
-                }
-                let stroke = m.stroke;
-                if flags.intersects(Flags::ALL_UNDERLINES) {
-                    let uc = self.theme.underline_color(&cell.attrs, fg);
-                    let uy = y + m.underline_y;
-                    // Patterns are aligned to absolute x so they continue
-                    // seamlessly across cells.
-                    let pattern = |r: &mut Self, on: f32, off: f32, dy: f32| {
-                        let period = on + off;
-                        let mut sx = x - ((x - pad) % period);
-                        while sx < x + width {
-                            let a = sx.max(x);
-                            let b = (sx + on).min(x + width);
-                            if b > a {
-                                r.push_solid(a, uy + dy, b - a, stroke, uc);
-                            }
-                            sx += period;
-                        }
-                    };
-                    if flags.contains(Flags::CURLY_UNDERLINE) {
-                        // A wave: alternating raised and lowered segments.
-                        let seg = (cw / 4.0).max(1.0);
-                        pattern(self, seg, seg, -stroke);
-                        let mut sx = x - ((x - pad) % (2.0 * seg)) + seg;
-                        while sx < x + width {
-                            let a = sx.max(x);
-                            let b = (sx + seg).min(x + width);
-                            if b > a {
-                                self.push_solid(a, uy, b - a, stroke, uc);
-                            }
-                            sx += 2.0 * seg;
-                        }
-                    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
-                        let dot = stroke.max(1.0);
-                        pattern(self, dot, dot, 0.0);
-                    } else if flags.contains(Flags::DASHED_UNDERLINE) {
-                        let dash = (cw * 0.5).round().max(2.0);
-                        pattern(self, dash, (cw * 0.25).round().max(1.0), 0.0);
-                    } else {
-                        self.push_solid(x, uy, width, stroke, uc);
-                        if flags.contains(Flags::DOUBLE_UNDERLINE) {
-                            self.push_solid(x, (uy - 2.0 * stroke).max(y), width, stroke, uc);
-                        }
-                    }
-                }
-                if flags.contains(Flags::OVERLINE) {
-                    self.push_solid(x, y, width, stroke, fg);
-                }
-                if flags.contains(Flags::STRIKETHROUGH) {
-                    self.push_solid(x, y + m.strike_y, width, stroke, fg);
-                }
+        for (r, f) in fresh.iter_mut().enumerate() {
+            let y = row_y(r);
+            let Some(k) = f.take() else {
+                place(&mut self.instances, &self.rows_cache[r].fg, y);
+                continue;
+            };
+            let start = self.instances.len();
+            if !self.build_row_fg(queue, term, r, cols, pad, cw, ch, &m, k.inverted, &selected) {
+                // The atlas overflowed: everything is rebuilt.
+                self.rows_cache.clear();
+                return false;
             }
+            self.rows_cache[r].fg = relative(&self.instances[start..], y);
+            self.rows_cache[r].key = Some(k);
         }
 
         // 4. Non-block cursors draw over the text.
@@ -844,6 +899,165 @@ impl Renderer {
         } else {
             (fg, bg)
         }
+    }
+
+    /// Backgrounds of visible row `r`, merged into runs of equal color.
+    #[allow(clippy::too_many_arguments)]
+    fn build_row_bg(
+        &mut self,
+        term: &Terminal,
+        r: usize,
+        cols: usize,
+        pad: f32,
+        cw: f32,
+        ch: f32,
+        sel_alpha: f32,
+        selected: &dyn Fn(usize, usize) -> bool,
+    ) {
+        let row = term.visible_row(r);
+        let y = pad + r as f32 * ch;
+        let mut run: Option<(usize, Rgb, bool)> = None;
+        let n = row.cells.len().min(cols);
+        for (c, cell) in row.cells[..n].iter().enumerate() {
+            let sel = selected(r, c);
+            let (_, bg) = self.colors(&cell.attrs, sel);
+            match (run, bg) {
+                (Some((_, rc, rs)), Some(b)) if rc == b && rs == sel => {}
+                _ => {
+                    if let Some((start, color, s)) = run.take() {
+                        let a = if s { sel_alpha } else { 1.0 };
+                        let w = (c - start) as f32 * cw;
+                        self.push_rect(pad + start as f32 * cw, y, w, ch, to_f32(color, a));
+                    }
+                    run = bg.map(|b| (c, b, sel));
+                }
+            }
+        }
+        if let Some((start, color, s)) = run {
+            let a = if s { sel_alpha } else { 1.0 };
+            let w = (n - start) as f32 * cw;
+            self.push_rect(pad + start as f32 * cw, y, w, ch, to_f32(color, a));
+        }
+    }
+
+    /// Glyphs and decorations of visible row `r`. `inverted`: the column
+    /// of a block cursor drawing its text in the cursor-text color.
+    /// Returns false if the glyph atlas overflowed.
+    #[allow(clippy::too_many_arguments)]
+    fn build_row_fg(
+        &mut self,
+        queue: &wgpu::Queue,
+        term: &Terminal,
+        r: usize,
+        cols: usize,
+        pad: f32,
+        cw: f32,
+        ch: f32,
+        m: &CellMetrics,
+        inverted: Option<usize>,
+        selected: &dyn Fn(usize, usize) -> bool,
+    ) -> bool {
+        let row = term.visible_row(r);
+        let y = pad + r as f32 * ch;
+        let n = row.cells.len().min(cols);
+        for (c, cell) in row.cells[..n].iter().enumerate() {
+            if cell.is_wide_spacer() {
+                continue;
+            }
+            let x = pad + c as f32 * cw;
+            let width = if cell.is_wide() { 2.0 * cw } else { cw };
+            let (mut fg, _) = self.colors(&cell.attrs, selected(r, c));
+            // Text inverts under the block only once it has arrived and
+            // is mostly opaque.
+            let under_cursor = inverted == Some(c);
+            if under_cursor {
+                fg = self.theme.cursor_text;
+            }
+            let flags = cell.attrs.flags;
+            // Unicode image placeholders draw as images (images.rs).
+            let placeholder = cell.ch == seraphim_terminal::graphics::PLACEHOLDER;
+            if cell.ch != ' ' && !placeholder && !flags.contains(Flags::HIDDEN) {
+                let style =
+                    FontStyle::new(flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
+                let marks = row.combining(c);
+                let ok = if !marks.is_empty() {
+                    let mut text = String::with_capacity(8);
+                    text.push(cell.ch);
+                    text.extend(marks.iter());
+                    self.push_cluster(queue, &text, style, x, y, width, fg)
+                } else if is_private_use(cell.ch) {
+                    // Nerd Font icons may spill into a following blank.
+                    let next_blank = c + 1 < n
+                        && row.cells[c + 1].ch == ' '
+                        && !row.cells[c + 1].is_wide_spacer()
+                        && row.combining(c + 1).is_empty();
+                    // Powerline separators (U+E0A0-E0D7) must stay one
+                    // cell wide so segment edges meet their backgrounds.
+                    let powerline = matches!(cell.ch as u32, 0xE0A0..=0xE0D7);
+                    let box_w =
+                        if next_blank && !cell.is_wide() && !powerline { 2.0 * cw } else { width };
+                    self.push_symbol(queue, cell.ch, style, x, y, box_w, fg)
+                } else if is_ignorable(cell.ch) {
+                    true
+                } else {
+                    self.push_glyph(queue, cell.ch, style, x, y, width, fg)
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            let stroke = m.stroke;
+            if flags.intersects(Flags::ALL_UNDERLINES) {
+                let uc = self.theme.underline_color(&cell.attrs, fg);
+                let uy = y + m.underline_y;
+                // Patterns are aligned to absolute x so they continue
+                // seamlessly across cells.
+                let pattern = |r: &mut Self, on: f32, off: f32, dy: f32| {
+                    let period = on + off;
+                    let mut sx = x - ((x - pad) % period);
+                    while sx < x + width {
+                        let a = sx.max(x);
+                        let b = (sx + on).min(x + width);
+                        if b > a {
+                            r.push_solid(a, uy + dy, b - a, stroke, uc);
+                        }
+                        sx += period;
+                    }
+                };
+                if flags.contains(Flags::CURLY_UNDERLINE) {
+                    // A wave: alternating raised and lowered segments.
+                    let seg = (cw / 4.0).max(1.0);
+                    pattern(self, seg, seg, -stroke);
+                    let mut sx = x - ((x - pad) % (2.0 * seg)) + seg;
+                    while sx < x + width {
+                        let a = sx.max(x);
+                        let b = (sx + seg).min(x + width);
+                        if b > a {
+                            self.push_solid(a, uy, b - a, stroke, uc);
+                        }
+                        sx += 2.0 * seg;
+                    }
+                } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                    let dot = stroke.max(1.0);
+                    pattern(self, dot, dot, 0.0);
+                } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                    let dash = (cw * 0.5).round().max(2.0);
+                    pattern(self, dash, (cw * 0.25).round().max(1.0), 0.0);
+                } else {
+                    self.push_solid(x, uy, width, stroke, uc);
+                    if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                        self.push_solid(x, (uy - 2.0 * stroke).max(y), width, stroke, uc);
+                    }
+                }
+            }
+            if flags.contains(Flags::OVERLINE) {
+                self.push_solid(x, y, width, stroke, fg);
+            }
+            if flags.contains(Flags::STRIKETHROUGH) {
+                self.push_solid(x, y + m.strike_y, width, stroke, fg);
+            }
+        }
+        true
     }
 
     fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
