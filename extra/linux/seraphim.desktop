@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Seraphim
+GenericName=Terminal
+Comment=The programmable terminal of Divinity OS
+Exec=seraphim
+Icon=seraphim
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;console;terminal;
+StartupNotify=true
+StartupWMClass=seraphim
+X-TerminalArgExec=-e
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=seraphim

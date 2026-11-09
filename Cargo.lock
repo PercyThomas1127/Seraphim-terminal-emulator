@@ -2191,6 +2191,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "libc",
+ "png",
  "pollster",
  "seraphim-config",
  "seraphim-events",

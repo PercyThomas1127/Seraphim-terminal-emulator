@@ -62,6 +62,24 @@ cargo run --release -p seraphim-terminal --example throughput
 cargo run --release -p seraphim-render --example frame_time
 ```
 
+## Install
+
+```bash
+cargo install --path crates/seraphim --profile dist --locked --root ~/.local
+seraphim --install-desktop    # menu entry and icon (KDE, GNOME, …)
+seraphim --install-terminfo   # 24-bit color in tmux, undercurl, cursor shapes
+```
+
+This puts `seraphim` in `~/.local/bin` and adds it to the application menu
+with its icon, for your user. The `dist` profile is the release build
+without its line-level debug info (about 25 MB instead of 120). To remove
+it, run `seraphim --uninstall-desktop`, then `cargo uninstall --root ~/.local seraphim`.
+
+Packagers: the menu entry is [`extra/linux/seraphim.desktop`](extra/linux/seraphim.desktop),
+the icons are in [`extra/icons/hicolor`](extra/icons) (install them under
+`/usr/share/icons/hicolor`) and the terminfo source is in
+[`extra/terminfo`](extra/terminfo).
+
 ## Run it
 
 ```bash

@@ -21,6 +21,10 @@
 //! seraphim bench --list-gpus
 //!     List GPUs; SERAPHIM_GPU=NAME (any part of a name) picks one.
 //!
+//! seraphim --install-desktop | --uninstall-desktop
+//!     Add Seraphim (this binary) to the application menu with its icon, for
+//!     this user, or remove it.
+//!
 //! seraphim --print-default-config
 //!     Print the documented default configuration file.
 //!
@@ -40,6 +44,7 @@ use std::time::Duration;
 mod actions;
 mod bench;
 mod bindings;
+mod desktop;
 mod interaction;
 mod menu;
 mod panel;
@@ -273,7 +278,7 @@ fn install_terminfo() -> Result<(), String> {
 fn main() -> ExitCode {
     let _ = window::STARTED.set(std::time::Instant::now());
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim --install-terminfo\n       seraphim bench [--json] [--frames N] [--gpu NAME] | --window [--keys N] [--preset NAME] | --list-gpus\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim --install-terminfo\n       seraphim --install-desktop | --uninstall-desktop\n       seraphim bench [--json] [--frames N] [--gpu NAME] | --window [--keys N] [--preset NAME] | --list-gpus\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),
@@ -300,6 +305,8 @@ fn main() -> ExitCode {
             }
         }
         Some("--install-terminfo") => install_terminfo().map(|_| ExitCode::SUCCESS),
+        Some("--install-desktop") => desktop::install().map(|_| ExitCode::SUCCESS),
+        Some("--uninstall-desktop") => desktop::uninstall().map(|_| ExitCode::SUCCESS),
         Some("--print-default-config") => {
             print!("{}", seraphim_config::DEFAULT_TOML);
             Ok(ExitCode::SUCCESS)

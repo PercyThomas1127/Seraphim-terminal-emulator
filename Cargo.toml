@@ -39,3 +39,11 @@ arboard = { version = "3.7", default-features = false, features = ["wayland-data
 
 [profile.release]
 debug = "line-tables-only"
+
+# For installing and packaging: the release build without its line tables
+# (122 MB -> about 25 MB). Function names stay, so backtraces still say
+# where a crash happened.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = "debuginfo"

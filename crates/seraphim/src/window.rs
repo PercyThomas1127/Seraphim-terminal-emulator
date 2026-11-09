@@ -587,7 +587,16 @@ impl App {
             .with_min_inner_size(PhysicalSize::new(
                 (m.width * 10.0) as u32,
                 (m.height * 3.0) as u32,
-            ));
+            ))
+            .with_window_icon(crate::desktop::window_icon());
+        // WM_CLASS / app id: desktops match the window to seraphim.desktop
+        // (its menu entry and icon). Both X11 and Wayland read this name.
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+        let attrs = winit::platform::x11::WindowAttributesExtX11::with_name(
+            attrs,
+            crate::desktop::APP_ID,
+            crate::desktop::APP_ID,
+        );
         phase(timed, "fonts loaded");
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
         phase(timed, "window created");
