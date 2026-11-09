@@ -39,7 +39,8 @@ pub(crate) struct Tracked {
     pub last_command: Option<String>,
     pub running: Option<String>,
     pub cwd: Option<String>,
-    pub root: bool,
+    /// Sessions running as root.
+    pub roots: std::collections::HashSet<u64>,
 }
 
 impl Shared {
@@ -53,7 +54,14 @@ impl Shared {
                 t.last_command = e.data["command"].as_str().map(str::to_owned);
             }
             "session.cwd.changed" => t.cwd = e.data["cwd"].as_str().map(str::to_owned),
-            "session.privileged" => t.root = e.data["root"].as_bool().unwrap_or(false),
+            "session.privileged" => {
+                let id = e.session.unwrap_or(0);
+                if e.data["root"].as_bool().unwrap_or(false) {
+                    t.roots.insert(id);
+                } else {
+                    t.roots.remove(&id);
+                }
+            }
             _ => {}
         }
     }
@@ -762,7 +770,7 @@ fn terminal(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
         getter!("title", |_l, c| Ok(snap(&c).title));
         getter!("alt_screen", |_l, c| Ok(snap(&c).alt_screen));
         getter!("selection", |_l, c| Ok(snap(&c).selection));
-        getter!("root", |_l, c| Ok(c.shared.tracked.lock().unwrap().root || snap(&c).root));
+        getter!("root", |_l, c| Ok(snap(&c).root));
         getter!("cwd", |_l, c| Ok(c.shared.tracked.lock().unwrap().cwd.clone()));
         getter!("last_exit_code", |_l, c| Ok(c.shared.tracked.lock().unwrap().last_exit_code));
         getter!("last_command", |_l, c| Ok(c.shared.tracked.lock().unwrap().last_command.clone()));
@@ -794,8 +802,8 @@ fn terminal(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
             lua.create_function(move |_, text: String| {
                 // An extension never types into a root shell: that would
                 // hand it the session's privileges (spec §8.5).
-                let root =
-                    c.shared.tracked.lock().unwrap().root || c.shared.snapshot.read().unwrap().root;
+                let root = !c.shared.tracked.lock().unwrap().roots.is_empty()
+                    || c.shared.snapshot.read().unwrap().root;
                 if root {
                     return Err(err("terminal.send: refused, the session runs as root"));
                 }

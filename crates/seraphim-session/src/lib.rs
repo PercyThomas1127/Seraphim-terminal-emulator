@@ -24,6 +24,7 @@
 //! | `terminal.text.changed`  | `{}` — the screen changed (once per chunk of output) |
 //! | `terminal.cursor.moved`  | `{row, col}` — 0-based, after a chunk of output |
 //! | `terminal.screen.alternate` | `{active}`                               |
+//! | `terminal.progress`      | `{state, percent}` — OSC 9;4 (0 clear, 1 normal, 2 error, 3 indeterminate, 4 paused) |
 //! | `shell.prompt`           | `{}`                                        |
 //! | `command.started`        | `{command?}`                                |
 //! | `command.completed`      | `{command?, exit_code?, duration_ms}`       |
@@ -438,6 +439,9 @@ impl IoLoop {
             }
             TerminalEvent::AlternateScreen(active) => {
                 p.publish("terminal.screen.alternate", id, json!({"active": active}));
+            }
+            TerminalEvent::Progress { state, percent } => {
+                p.publish("terminal.progress", id, json!({"state": state, "percent": percent}));
             }
             TerminalEvent::PromptStarted => {
                 p.publish("shell.prompt", id, json!({}));

@@ -225,6 +225,20 @@ selection_fade_ms = 90
 # param = "color"
 # colors = { "0" = "#f5a6d0", default = "#ff5577" }
 
+# Tabs (Ctrl+Shift+T new, Ctrl+Shift+W close, Ctrl+PgUp/PgDown switch,
+# Alt+1..9 jump). bar: auto (shown with two or more tabs), always, never.
+# label: {title}, {program}, {cwd} (last part of the directory), {index}.
+[tabs]
+bar = "auto"
+icons = true
+label = "{title}"
+
+# Split panes (Ctrl+Shift+E right, Ctrl+Shift+O down, Ctrl+Shift+X close,
+# Alt+arrows focus, Ctrl+Alt+arrows resize, Ctrl+Shift+Z zoom).
+[panes]
+divider = 2.0
+dim_inactive = 0.25
+
 # Lua extensions: folders in extensions/ (extension.toml + init.lua) and
 # one-file scripts in scripts/*.lua, next to this file. Each runs in its
 # own sandbox on a script thread; a handler that runs longer than

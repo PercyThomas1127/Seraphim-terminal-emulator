@@ -117,6 +117,31 @@ pub struct Renderer {
     bg_end: u32,
     images: images::Images,
     fx: cursorfx::Fx,
+    /// What new slots need.
+    format: wgpu::TextureFormat,
+    layout: wgpu::BindGroupLayout,
+    atlas_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    linear_sampler: wgpu::Sampler,
+    /// The slot whose state is in the fields above, and the others.
+    current: u64,
+    slots: HashMap<u64, Slot>,
+}
+
+/// One pane's draw state. The renderer holds the selected slot's state in
+/// its own fields and parks the others here; the glyph atlas, fonts,
+/// shaping cache and pipeline are shared.
+struct Slot {
+    globals: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    instance_count: u32,
+    bg_end: u32,
+    images: images::Images,
+    fx: cursorfx::Fx,
+    theme: Theme,
+    applied_overrides: seraphim_terminal::palette::ColorOverrides,
 }
 
 impl Renderer {
@@ -282,7 +307,100 @@ impl Renderer {
             bg_end: 0,
             images,
             fx: Default::default(),
+            format,
+            layout,
+            atlas_view,
+            sampler,
+            linear_sampler,
+            current: 0,
+            slots: HashMap::new(),
         }
+    }
+
+    fn new_slot(&self, device: &wgpu::Device) -> Slot {
+        let globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globals"),
+            size: std::mem::size_of::<Globals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cells"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+            ],
+        });
+        let images = images::Images::new(device, self.format, &globals);
+        let mut fx = cursorfx::Fx::default();
+        fx.cfg = self.fx.cfg;
+        fx.clock = self.fx.clock;
+        Slot {
+            globals,
+            bind_group,
+            instance_buffer: Self::make_instance_buffer(device, 1024),
+            instance_capacity: 1024,
+            instance_count: 0,
+            bg_end: 0,
+            images,
+            fx,
+            theme: self.base_theme.clone(),
+            applied_overrides: Default::default(),
+        }
+    }
+
+    /// Swap the selected slot's state with `slot`'s.
+    fn swap_slot(&mut self, slot: &mut Slot) {
+        std::mem::swap(&mut self.globals, &mut slot.globals);
+        std::mem::swap(&mut self.bind_group, &mut slot.bind_group);
+        std::mem::swap(&mut self.instance_buffer, &mut slot.instance_buffer);
+        std::mem::swap(&mut self.instance_capacity, &mut slot.instance_capacity);
+        std::mem::swap(&mut self.instance_count, &mut slot.instance_count);
+        std::mem::swap(&mut self.bg_end, &mut slot.bg_end);
+        std::mem::swap(&mut self.images, &mut slot.images);
+        std::mem::swap(&mut self.fx, &mut slot.fx);
+        std::mem::swap(&mut self.theme, &mut slot.theme);
+        std::mem::swap(&mut self.applied_overrides, &mut slot.applied_overrides);
+    }
+
+    /// Draw state for pane `id` from now on (created on first use). A
+    /// window with several panes calls this before each pane's
+    /// [`Renderer::prepare`] and [`Renderer::render`]; panes share the
+    /// glyph atlas and fonts. Slot 0 exists from the start.
+    pub fn select(&mut self, device: &wgpu::Device, id: u64) {
+        if id == self.current {
+            return;
+        }
+        let mut target = match self.slots.remove(&id) {
+            Some(s) => s,
+            None => self.new_slot(device),
+        };
+        self.swap_slot(&mut target);
+        // `target` now holds the previously selected slot's state.
+        self.slots.insert(self.current, target);
+        self.current = id;
+    }
+
+    /// Forget a pane's draw state.
+    pub fn drop_slot(&mut self, id: u64) {
+        self.slots.remove(&id);
+    }
+
+    /// The selected slot.
+    pub fn slot(&self) -> u64 {
+        self.current
     }
 
     fn make_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -297,11 +415,17 @@ impl Renderer {
     /// Cursor and selection effects (none by default).
     pub fn set_cursor_effects(&mut self, fx: cursorfx::CursorEffects) {
         self.fx.cfg = fx;
+        for s in self.slots.values_mut() {
+            s.fx.cfg = fx;
+        }
     }
 
     /// Use a fixed time for effects instead of the clock (tests).
     pub fn set_effects_clock(&mut self, now: Option<std::time::Instant>) {
         self.fx.clock = now;
+        for s in self.slots.values_mut() {
+            s.fx.clock = now;
+        }
     }
 
     /// A key was pressed (for typing ripples).
@@ -311,7 +435,9 @@ impl Renderer {
 
     /// An effect is in motion: the window should keep drawing frames.
     pub fn effects_animating(&self) -> bool {
-        self.fx.animating() || self.images.animating
+        self.fx.animating()
+            || self.images.animating
+            || self.slots.values().any(|s| s.fx.animating() || s.images.animating)
     }
 
     pub fn cell_metrics(&self) -> CellMetrics {
@@ -326,6 +452,10 @@ impl Renderer {
 
     pub fn set_theme(&mut self, theme: Theme) {
         self.base_theme = theme.clone();
+        for s in self.slots.values_mut() {
+            s.theme = theme.clone();
+            s.applied_overrides = Default::default();
+        }
         self.theme = theme;
         self.applied_overrides = Default::default();
     }
@@ -385,6 +515,35 @@ impl Renderer {
         self.images.prepare(device, queue, term, view.padding.round(), (m.width, m.height), now);
         self.instance_count = self.instances.len() as u32;
         self.stats.instances = self.instances.len();
+    }
+
+    /// Fill the selected slot with plain rectangles (`[x, y, w, h]` in
+    /// pixels of a `width` x `height` target, premultiplied RGBA): pane
+    /// dividers, focus accents. Draw it with [`Renderer::render`].
+    pub fn prepare_rects(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        rects: &[([f32; 4], [f32; 4])],
+    ) {
+        self.instances.clear();
+        for ([x, y, w, h], c) in rects {
+            self.push_rect(*x, *y, *w, *h, *c);
+        }
+        if self.instances.len() > self.instance_capacity {
+            self.instance_capacity = self.instances.len().next_power_of_two();
+            self.instance_buffer = Self::make_instance_buffer(device, self.instance_capacity);
+        }
+        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
+        let globals = Globals {
+            screen: [width.max(1) as f32, height.max(1) as f32],
+            atlas: [ATLAS_SIZE as f32, ATLAS_SIZE as f32],
+        };
+        queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+        self.instance_count = self.instances.len() as u32;
+        self.bg_end = self.instance_count;
     }
 
     /// Record the draw into an existing render pass.

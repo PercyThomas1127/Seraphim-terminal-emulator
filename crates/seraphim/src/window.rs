@@ -31,6 +31,42 @@ use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::actions::{self, Action, ClickTracker, ShortcutKey};
+use crate::workspace::{Closed, Direction, Divider, Node, Rect, Split, Workspace};
+
+/// The focused pane's session. A macro, not a method: it borrows only the
+/// `panes` field, so other fields stay usable while the terminal is locked.
+macro_rules! focused {
+    ($a:expr) => {
+        $a.panes.get(&$a.ws.focus().unwrap_or(0)).expect("a focused pane").session
+    };
+}
+
+/// One terminal pane.
+struct Pane {
+    session: Session,
+    /// Terminal generation last drawn.
+    last_generation: u64,
+    /// Output arrived while the pane was out of sight.
+    activity: bool,
+    bell: bool,
+    progress: Option<crate::tabbar::Progress>,
+    root: bool,
+    /// Where it was last laid out (pixels).
+    rect: Rect,
+}
+
+/// What new panes run.
+#[derive(Clone)]
+struct SpawnConfig {
+    command: Command,
+    scrollback: usize,
+    grapheme_clustering: bool,
+}
+
+/// Renderer slot for pane dividers and dimming.
+const DECOR_SLOT: u64 = u64::MAX;
+/// Overlay slot for the tab bar (slot 0 is the menu bar).
+const TAB_BAR_SLOT: u64 = 1;
 use crate::menu::{self, Command as MenuCommand, Hit, MenuBar, MenuKey, Outcome};
 
 #[derive(Clone, Debug)]
@@ -82,6 +118,8 @@ pub struct WindowOptions {
     pub extensions: std::collections::BTreeMap<String, seraphim_config::ExtensionConfig>,
     /// `--extension` paths.
     pub cli_extensions: Vec<std::path::PathBuf>,
+    pub tabs: seraphim_config::Tabs,
+    pub panes: seraphim_config::Panes,
 }
 
 impl WindowOptions {
@@ -153,6 +191,8 @@ impl Default for WindowOptions {
             scripting: Default::default(),
             extensions: Default::default(),
             cli_extensions: Vec::new(),
+            tabs: Default::default(),
+            panes: Default::default(),
         }
     }
 }
@@ -284,7 +324,31 @@ struct Active {
     window: Arc<Window>,
     gpu: Gpu,
     renderer: Renderer,
-    session: Session,
+    /// Terminal panes by id; `ws` arranges them into tabs and splits.
+    panes: std::collections::BTreeMap<u64, Pane>,
+    ws: Workspace,
+    next_pane: u64,
+    /// The pane that had focus last (to notice changes).
+    last_focus: u64,
+    spawn: SpawnConfig,
+    notifier: Notifier,
+    pad: f32,
+    tabs_cfg: seraphim_config::Tabs,
+    panes_cfg: seraphim_config::Panes,
+    /// The window's own profile (tabs without one use it).
+    base_profile: String,
+    /// Pane rectangles drawn this frame.
+    drawn: Vec<(u64, Rect)>,
+    /// Click targets in the tab bar.
+    tab_hits: crate::tabbar::Hits,
+    /// A divider being dragged.
+    drag: Option<Divider>,
+    /// A tab being dragged to a new place.
+    tab_drag: Option<usize>,
+    /// Rename Tab: the label being typed.
+    renaming: Option<String>,
+    /// Tab bar indicators (bells, progress, root) from the bus.
+    pane_events: seraphim_events::Subscription,
     bus: EventBus,
     clipboards: Clipboards,
     modifiers: ModifiersState,
@@ -292,7 +356,6 @@ struct Active {
     focused: bool,
     scale: f64,
     title: String,
-    last_generation: u64,
     blink_on: bool,
     blink_deadline: Instant,
     warned_clipboard_read: bool,
@@ -351,6 +414,8 @@ enum Request {
     /// Live reload: these watched files changed.
     Files(Vec<std::path::PathBuf>),
     Profile(String),
+    /// Switching to a tab with its own profile (quietly).
+    TabProfile(String),
     /// Font size steps: +1, -1, or 0 to reset.
     Zoom(i8),
     ToggleMenuBar,
@@ -443,28 +508,20 @@ impl App {
             let _ = proxy.send_event(UserEvent::Wake);
         }));
         let command = o.command.clone().unwrap_or_else(Command::default_shell);
-        // Subscribe before the session starts: it reports privilege at once.
-        const SESSION_ID: u64 = 1;
-        let interactions = Interactions::new(o.rules.clone(), &bus, SESSION_ID);
-        let bindings = crate::bindings::Bindings::new(o.binds.clone(), &bus, SESSION_ID);
-        let session = Session::spawn(
-            SESSION_ID,
-            SessionConfig {
-                command,
-                cols,
-                rows,
-                notify: Some(notify),
-                color_scheme: Some(renderer.theme().scheme()),
-                scrollback: o.scrollback,
-                grapheme_clustering: o.grapheme_clustering,
-                cell_pixels: {
-                    let m = renderer.cell_metrics();
-                    Some((m.width, m.height))
-                },
-            },
-            &bus,
-        )
-        .map_err(|e| format!("cannot start shell: {e}"))?;
+        // Subscribe before the first session starts: it reports privilege
+        // at once.
+        const FIRST_PANE: u64 = 1;
+        let interactions = Interactions::new(o.rules.clone(), &bus, FIRST_PANE);
+        let bindings = crate::bindings::Bindings::new(o.binds.clone(), &bus, FIRST_PANE);
+        let pane_events = bus.subscribe(
+            seraphim_events::Pattern::Any(vec![
+                "terminal.bell".into(),
+                "terminal.progress".into(),
+                "session.privileged".into(),
+            ]),
+            1024,
+        );
+        let _ = (cols, rows);
 
         let mut visual = VisualEngine::new(&gpu.device, &gpu.queue, gpu.config.format);
         visual.set_reduced_motion(o.visual.reduced_motion);
@@ -481,7 +538,26 @@ impl App {
             window,
             gpu,
             renderer,
-            session,
+            panes: Default::default(),
+            ws: Workspace::new(),
+            next_pane: 0,
+            last_focus: FIRST_PANE,
+            spawn: SpawnConfig {
+                command,
+                scrollback: o.scrollback,
+                grapheme_clustering: o.grapheme_clustering,
+            },
+            notifier: notify,
+            pad,
+            tabs_cfg: o.tabs.clone(),
+            panes_cfg: o.panes.clone(),
+            base_profile: o.profile.clone(),
+            drawn: Vec::new(),
+            tab_hits: Default::default(),
+            drag: None,
+            tab_drag: None,
+            renaming: None,
+            pane_events,
             bus,
             clipboards: Clipboards::new(),
             modifiers: ModifiersState::empty(),
@@ -489,7 +565,6 @@ impl App {
             focused: true,
             scale,
             title: String::new(),
-            last_generation: u64::MAX,
             blink_on: true,
             blink_deadline: Instant::now() + BLINK_INTERVAL,
             warned_clipboard_read: false,
@@ -517,6 +592,9 @@ impl App {
             scripts: crate::scripting::ScriptHost::default(),
             config_binds: o.binds.clone(),
         };
+        let first = active.spawn_pane(None, None)?;
+        active.ws.add_tab(Node::Pane(first), None);
+        active.apply_layout();
         let proxy = self.proxy.clone();
         let wake: seraphim_script::Waker = Arc::new(move || {
             let _ = proxy.send_event(UserEvent::Script);
@@ -540,9 +618,11 @@ impl App {
     fn handle(&mut self, request: Request, event_loop: &ActiveEventLoop) {
         match request {
             Request::Quit => event_loop.exit(),
-            Request::NextProfile | Request::Reload | Request::Profile(_) | Request::Files(_) => {
-                self.apply_profile(request)
-            }
+            Request::NextProfile
+            | Request::Reload
+            | Request::Profile(_)
+            | Request::TabProfile(_)
+            | Request::Files(_) => self.apply_profile(request),
             Request::Zoom(step) => {
                 self.zoom = match step {
                     0 => 0.0,
@@ -573,9 +653,7 @@ impl App {
                 if let Some(p) = &self.options.cli_preset {
                     cmd.args(["--preset", p]);
                 }
-                if let Some(cwd) =
-                    self.active.as_ref().and_then(|a| a.session.terminal().cwd().map(str::to_owned))
-                {
+                if let Some(cwd) = self.active.as_ref().and_then(|a| a.focused_cwd()) {
                     cmd.current_dir(cwd);
                 }
                 if let Err(e) = cmd.spawn() {
@@ -609,7 +687,9 @@ impl App {
                 a.renderer.set_fonts(f);
                 a.overlay.set_fonts(g);
                 let m = a.renderer.cell_metrics();
-                let _ = a.session.set_cell_pixels(m.width, m.height);
+                for p in a.panes.values() {
+                    let _ = p.session.set_cell_pixels(m.width, m.height);
+                }
                 self.resize_grid();
             }
             (Err(e), _) | (_, Err(e)) => eprintln!("seraphim: {e}"),
@@ -621,12 +701,8 @@ impl App {
         let Some(scale) = self.active.as_ref().map(|a| a.scale) else { return };
         let pad = self.padding(scale);
         let a = self.active.as_mut().unwrap();
-        let size = a.window.inner_size();
-        let top = a.top_inset();
-        let (cols, rows) =
-            a.renderer.grid_size(size.width, size.height.saturating_sub(top).max(1), pad);
-        let _ = a.session.resize(cols, rows);
-        a.window.request_redraw();
+        a.pad = pad;
+        a.apply_layout();
     }
 
     fn apply_profile(&mut self, request: Request) {
@@ -637,7 +713,7 @@ impl App {
         let path = self.options.config_path.clone();
         let current = self.options.profile.clone();
         let name = match request {
-            Request::Profile(name) => name,
+            Request::Profile(name) | Request::TabProfile(name) => name,
             Request::NextProfile => {
                 let all = path
                     .as_deref()
@@ -701,9 +777,23 @@ impl App {
         }
         a.rebuild_menu();
         {
-            let mut t = a.session.terminal();
-            t.set_color_scheme(o.theme.scheme());
-            t.set_grapheme_clustering(o.grapheme_clustering);
+            for p in a.panes.values() {
+                let mut t = p.session.terminal();
+                t.set_color_scheme(o.theme.scheme());
+                t.set_grapheme_clustering(o.grapheme_clustering);
+            }
+            a.spawn.scrollback = o.scrollback;
+            a.spawn.grapheme_clustering = o.grapheme_clustering;
+            a.tabs_cfg = o.tabs.clone();
+            a.panes_cfg = o.panes.clone();
+            // A profile chosen here becomes the tab's; a tab switch
+            // (TabProfile) only applies the tab's own.
+            if matches!(request_kind, Request::Profile(_) | Request::NextProfile) {
+                let name = o.profile.clone();
+                if let Some(t) = a.ws.tab_mut() {
+                    t.profile = Some(name);
+                }
+            }
         }
         a.visual.set_reduced_motion(o.visual.reduced_motion);
         a.visual.set_global_opacity(o.visual.window_opacity);
@@ -766,7 +856,7 @@ impl App {
         let a = self.active.as_mut().unwrap();
         a.bus.publisher("visual").publish(
             "visual.profile.changed",
-            Some(a.session.id()),
+            Some(focused!(a).id()),
             seraphim_events::json!({ "profile": self.options.profile }),
         );
         let msg = match (
@@ -779,9 +869,14 @@ impl App {
             (_, Some(problem)) => problem,
             (Request::Files(_), None) => "Configuration reloaded".to_owned(),
             (Request::Reload, None) => "Configuration reloaded".to_owned(),
+            (Request::TabProfile(_), None) => String::new(),
             _ => format!("Profile: {}", self.options.profile),
         };
-        a.notify(msg);
+        if !msg.is_empty() {
+            a.notify(msg);
+        }
+        // The tab bar may have appeared or gone (tabs.bar).
+        a.apply_layout();
         a.window.request_redraw();
     }
 
@@ -874,14 +969,14 @@ impl Active {
         }
         // Typing returns the view to the live screen.
         {
-            let mut t = self.session.terminal();
+            let mut t = focused!(self).terminal();
             if t.display_offset() > 0 {
                 t.scroll_to_bottom();
                 self.window.request_redraw();
             }
         }
         self.reset_blink();
-        let _ = self.session.write(bytes);
+        let _ = focused!(self).write(bytes);
     }
 
     fn paste(&mut self, board: Board) {
@@ -889,21 +984,21 @@ impl Active {
         if text.is_empty() {
             return;
         }
-        let bytes = encode_paste(&text, self.session.terminal().modes());
+        let bytes = encode_paste(&text, focused!(self).terminal().modes());
         self.write(&bytes);
     }
 
     fn copy_selection(&mut self, board: Board) {
-        let text = self.session.terminal().selection_text();
+        let text = focused!(self).terminal().selection_text();
         if let Some(text) = text.filter(|t| !t.is_empty()) {
             self.clipboards.set(board, text);
         }
     }
 
     fn run_action(&mut self, action: Action) {
-        let rows = self.session.terminal().rows() as i64;
+        let rows = focused!(self).terminal().rows() as i64;
         let scroll = |a: &mut Active, delta: i64| {
-            a.session.terminal().scroll_display(delta);
+            focused!(a).terminal().scroll_display(delta);
             a.window.request_redraw();
         };
         match action {
@@ -917,14 +1012,14 @@ impl Active {
             Action::ZoomReset => self.pending = Some(Request::Zoom(0)),
             Action::OpenConfigFolder => self.pending = Some(Request::OpenConfigFolder),
             Action::OpenFileManager => {
-                let cwd = self.session.terminal().cwd().map(std::path::PathBuf::from);
+                let cwd = focused!(self).terminal().cwd().map(std::path::PathBuf::from);
                 let dir = cwd
                     .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
                     .unwrap_or_else(|| "/".into());
                 open_path(&dir);
             }
             Action::SelectAll => {
-                let mut t = self.session.terminal();
+                let mut t = focused!(self).terminal();
                 let history = t.scrollback().len() as i64;
                 let (rows, cols) = (t.rows() as i64, t.cols());
                 t.start_selection(
@@ -937,13 +1032,13 @@ impl Active {
                 self.window.request_redraw();
             }
             Action::ClearScrollback => {
-                self.session.terminal().advance(b"\x1b[3J");
+                focused!(self).terminal().advance(b"\x1b[3J");
                 self.window.request_redraw();
             }
             Action::ClearAndReset => {
                 // Konsole's "Clear Scrollback and Reset": RIS, then drop
                 // the history.
-                self.session.terminal().advance(b"\x1bc\x1b[3J");
+                focused!(self).terminal().advance(b"\x1bc\x1b[3J");
                 self.window.request_redraw();
             }
             Action::Fullscreen => {
@@ -980,16 +1075,426 @@ impl Active {
             Action::ScrollLineDown => scroll(self, -1),
             Action::ScrollTop => scroll(self, i64::MAX / 2),
             Action::ScrollBottom => scroll(self, -(i64::MAX / 2)),
+            Action::NewTab => self.new_tab(),
+            Action::CloseTab => {
+                if self.close_tab(self.ws.active) {
+                    self.pending = Some(Request::Quit);
+                }
+            }
+            Action::NextTab => self.switch_tab(|w| w.cycle(1)),
+            Action::PrevTab => self.switch_tab(|w| w.cycle(-1)),
+            Action::MoveTabLeft => self.switch_tab(|w| w.move_tab(-1)),
+            Action::MoveTabRight => self.switch_tab(|w| w.move_tab(1)),
+            Action::GotoTab(n) => {
+                let last = self.ws.tabs.len().saturating_sub(1);
+                let i = if n >= 9 { last } else { (n as usize).saturating_sub(1).min(last) };
+                self.switch_tab(|w| {
+                    w.goto(i);
+                });
+            }
+            Action::RenameTab => {
+                let current = self.ws.tab().and_then(|t| t.label.clone()).unwrap_or_default();
+                self.renaming = Some(current);
+                self.apply_layout();
+            }
+            Action::SplitRight => self.split(Split::Right),
+            Action::SplitDown => self.split(Split::Down),
+            Action::ClosePane => {
+                if self.close_pane(self.focus_id()) {
+                    self.pending = Some(Request::Quit);
+                }
+            }
+            Action::FocusLeft | Action::FocusRight | Action::FocusUp | Action::FocusDown => {
+                let dir = match action {
+                    Action::FocusLeft => Direction::Left,
+                    Action::FocusRight => Direction::Right,
+                    Action::FocusUp => Direction::Up,
+                    _ => Direction::Down,
+                };
+                let (area, gap) = (self.pane_area(), self.gap());
+                if self.ws.focus_toward(dir, area, gap) {
+                    self.focus_changed();
+                }
+            }
+            Action::ResizeLeft | Action::ResizeRight | Action::ResizeUp | Action::ResizeDown => {
+                let dir = match action {
+                    Action::ResizeLeft => Direction::Left,
+                    Action::ResizeRight => Direction::Right,
+                    Action::ResizeUp => Direction::Up,
+                    _ => Direction::Down,
+                };
+                if self.ws.resize(dir, 0.05) {
+                    self.apply_layout();
+                }
+            }
+            Action::ZoomPane => {
+                self.ws.toggle_zoom();
+                self.apply_layout();
+            }
+            Action::EqualizePanes => {
+                self.ws.equalize();
+                self.apply_layout();
+            }
         }
     }
 
-    /// Pixels at the top reserved for the pinned menu bar.
-    fn top_inset(&self) -> u32 {
+    /// Pixels at the top for the pinned menu bar.
+    fn menu_height(&self) -> u32 {
         if self.menu_pinned {
             self.renderer.cell_metrics().height.ceil() as u32
         } else {
             0
         }
+    }
+
+    fn tab_bar_visible(&self) -> bool {
+        if self.renaming.is_some() {
+            return true;
+        }
+        match self.tabs_cfg.bar.as_str() {
+            "always" => true,
+            "never" => false,
+            _ => self.ws.tabs.len() > 1,
+        }
+    }
+
+    fn tab_bar_height(&self) -> u32 {
+        if self.tab_bar_visible() {
+            self.overlay.cell_metrics().height.ceil() as u32
+        } else {
+            0
+        }
+    }
+
+    /// Pixels at the top reserved for the menu bar and the tab bar.
+    fn top_inset(&self) -> u32 {
+        self.menu_height() + self.tab_bar_height()
+    }
+
+    /// Where panes go.
+    fn pane_area(&self) -> Rect {
+        let s = self.window.inner_size();
+        let top = self.top_inset().min(s.height.saturating_sub(1));
+        Rect::new(0.0, top as f32, s.width as f32, (s.height - top) as f32)
+    }
+
+    /// Divider width in pixels.
+    fn gap(&self) -> f32 {
+        (self.panes_cfg.divider * self.scale as f32).round().max(1.0)
+    }
+
+    fn focus_id(&self) -> u64 {
+        self.ws.focus().unwrap_or(0)
+    }
+
+    /// Start a shell (or `command`) in a new pane; it isn't placed yet.
+    fn spawn_pane(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        command: Option<Command>,
+    ) -> Result<u64, String> {
+        self.next_pane += 1;
+        let id = self.next_pane;
+        let area = self.pane_area();
+        let (cols, rows) = self.renderer.grid_size(area.w as u32, area.h as u32, self.pad);
+        let mut command = command.unwrap_or_else(|| self.spawn.command.clone());
+        if let Some(d) = cwd.filter(|d| d.is_dir()) {
+            command = command.cwd(d);
+        }
+        let m = self.renderer.cell_metrics();
+        let session = Session::spawn(
+            id,
+            SessionConfig {
+                command,
+                cols,
+                rows,
+                notify: Some(self.notifier.clone()),
+                color_scheme: Some(self.renderer.theme().scheme()),
+                scrollback: self.spawn.scrollback,
+                grapheme_clustering: self.spawn.grapheme_clustering,
+                cell_pixels: Some((m.width, m.height)),
+            },
+            &self.bus,
+        )
+        .map_err(|e| format!("cannot start shell: {e}"))?;
+        self.panes.insert(
+            id,
+            Pane {
+                session,
+                last_generation: u64::MAX,
+                activity: false,
+                bell: false,
+                progress: None,
+                root: false,
+                rect: Rect::default(),
+            },
+        );
+        Ok(id)
+    }
+
+    /// The focused pane's working directory (OSC 7, else its process's).
+    fn focused_cwd(&self) -> Option<std::path::PathBuf> {
+        let p = self.panes.get(&self.focus_id())?;
+        let osc7 = p.session.terminal().cwd().map(std::path::PathBuf::from);
+        osc7.or_else(|| p.session.foreground_process().and_then(|i| i.cwd))
+    }
+
+    /// Size every visible pane's terminal to its rectangle.
+    fn apply_layout(&mut self) {
+        let (rects, _) = self.ws.layout(self.pane_area(), self.gap());
+        for (id, r) in rects {
+            let Some(p) = self.panes.get_mut(&id) else { continue };
+            p.rect = r;
+            let (cols, rows) =
+                self.renderer.grid_size(r.w.max(1.0) as u32, r.h.max(1.0) as u32, self.pad);
+            let same = {
+                let t = p.session.terminal();
+                (t.cols(), t.rows()) == (cols as usize, rows as usize)
+            };
+            if !same {
+                let _ = p.session.resize(cols, rows);
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// After anything that may move the focus: tell the panes, follow the
+    /// new session, switch to the tab's profile.
+    fn focus_changed(&mut self) {
+        let id = self.focus_id();
+        if id == self.last_focus || !self.panes.contains_key(&id) {
+            return;
+        }
+        if self.focused {
+            if let Some(old) = self.panes.get(&self.last_focus) {
+                let bytes = encode_focus(false, old.session.terminal().modes());
+                let _ = old.session.write(&bytes);
+            }
+            let new = &self.panes[&id];
+            let bytes = encode_focus(true, new.session.terminal().modes());
+            let _ = new.session.write(&bytes);
+        }
+        self.last_focus = id;
+        self.interactions.set_session(id, &mut self.visual);
+        self.bindings.set_session(id, &mut self.visual);
+        self.scripts.set_session(id);
+        if let Some(t) = self.ws.tab() {
+            for p in t.root.panes() {
+                if let Some(p) = self.panes.get_mut(&p) {
+                    p.activity = false;
+                    p.bell = false;
+                }
+            }
+        }
+        self.title.clear();
+        self.mouse.pending = None;
+        self.bus.publisher("interface").publish(
+            "interface.pane.focused",
+            Some(id),
+            seraphim_events::json!({ "pane": id, "tab": self.ws.active }),
+        );
+        let want =
+            self.ws.tab().and_then(|t| t.profile.clone()).unwrap_or(self.base_profile.clone());
+        if want != self.menu_src.2 {
+            self.pending = Some(Request::TabProfile(want));
+        }
+        self.window.request_redraw();
+    }
+
+    fn new_tab(&mut self) {
+        let cwd = self.focused_cwd();
+        match self.spawn_pane(cwd, None) {
+            Ok(id) => {
+                let before = self.ws.active;
+                self.ws.add_tab(Node::Pane(id), None);
+                self.bus.publisher("interface").publish(
+                    "interface.tab.changed",
+                    Some(id),
+                    seraphim_events::json!({ "tab": self.ws.active, "from": before, "tabs": self.ws.tabs.len() }),
+                );
+                self.apply_layout();
+                self.focus_changed();
+            }
+            Err(e) => self.notify(e),
+        }
+    }
+
+    fn split(&mut self, how: Split) {
+        let cwd = self.focused_cwd();
+        match self.spawn_pane(cwd, None) {
+            Ok(id) => {
+                self.ws.split(id, how);
+                self.apply_layout();
+                self.focus_changed();
+            }
+            Err(e) => self.notify(e),
+        }
+    }
+
+    /// Close a pane (hanging up its shell). Returns true when it was the
+    /// window's last.
+    fn close_pane(&mut self, id: u64) -> bool {
+        let closed = self.ws.close(id);
+        self.panes.remove(&id);
+        self.renderer.drop_slot(id);
+        if closed == Closed::Last {
+            return true;
+        }
+        self.apply_layout();
+        self.focus_changed();
+        false
+    }
+
+    fn close_tab(&mut self, i: usize) -> bool {
+        for id in self.ws.close_tab(i) {
+            self.panes.remove(&id);
+            self.renderer.drop_slot(id);
+        }
+        if self.ws.tabs.is_empty() {
+            return true;
+        }
+        self.apply_layout();
+        self.focus_changed();
+        false
+    }
+
+    fn switch_tab(&mut self, f: impl FnOnce(&mut Workspace)) {
+        let before = self.ws.active;
+        f(&mut self.ws);
+        if self.ws.active != before {
+            self.bus.publisher("interface").publish(
+                "interface.tab.changed",
+                Some(self.focus_id()),
+                seraphim_events::json!({ "tab": self.ws.active, "from": before, "tabs": self.ws.tabs.len() }),
+            );
+        }
+        self.apply_layout();
+        self.focus_changed();
+    }
+
+    fn in_tab_bar(&self, y: f64) -> bool {
+        if !self.tab_bar_visible() {
+            return false;
+        }
+        let top = self.menu_height() as f64;
+        y >= top && y < top + self.tab_bar_height() as f64
+    }
+
+    fn tab_bar_click(&mut self, button: WButton) {
+        use crate::tabbar::Hit;
+        let col = (self.mouse.pos.0 / self.overlay.cell_metrics().width as f64).max(0.0) as usize;
+        match (self.tab_hits.at(col), button) {
+            (Hit::Tab(i), WButton::Left) => {
+                self.tab_drag = Some(i);
+                self.switch_tab(|w| w.active = i);
+            }
+            (Hit::Tab(i) | Hit::Close(i), WButton::Middle) | (Hit::Close(i), WButton::Left) => {
+                if self.close_tab(i) {
+                    self.pending = Some(Request::Quit);
+                }
+            }
+            (Hit::NewTab, _) | (Hit::Bar, WButton::Middle) => self.new_tab(),
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
+    /// The pane under a pixel position.
+    fn pane_at(&self, x: f32, y: f32) -> Option<u64> {
+        self.drawn.iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| *id)
+    }
+
+    /// The divider under a pixel position (a little slack to grab it).
+    fn divider_at(&self, x: f32, y: f32) -> Option<Divider> {
+        let (_, divs) = self.ws.layout(self.pane_area(), self.gap());
+        divs.into_iter().find(|d| {
+            let r = d.rect;
+            let slack = 3.0;
+            x >= r.x - slack && x <= r.x + r.w + slack && y >= r.y - slack && y <= r.y + r.h + slack
+        })
+    }
+
+    /// Tab label from its focused pane and `[tabs] label`.
+    fn tab_label(&self, i: usize) -> String {
+        let t = &self.ws.tabs[i];
+        if let Some(l) = &t.label {
+            return l.clone();
+        }
+        let Some(p) = self.panes.get(&t.focus) else { return String::new() };
+        let program = p.session.foreground_process().map(|i| i.name).unwrap_or_default();
+        let (title, cwd) = {
+            let term = p.session.terminal();
+            (term.title().to_owned(), term.cwd().map(str::to_owned))
+        };
+        let dir = cwd
+            .as_deref()
+            .map(|c| {
+                std::path::Path::new(c)
+                    .file_name()
+                    .map_or(c.to_owned(), |n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let title = if title.is_empty() { program.clone() } else { title };
+        let label = self
+            .tabs_cfg
+            .label
+            .replace("{title}", &title)
+            .replace("{program}", &program)
+            .replace("{cwd}", &dir)
+            .replace("{index}", &(i + 1).to_string());
+        if label.trim().is_empty() {
+            "Shell".into()
+        } else {
+            label
+        }
+    }
+
+    fn tab_infos(&self) -> Vec<crate::tabbar::TabInfo> {
+        (0..self.ws.tabs.len())
+            .map(|i| {
+                let t = &self.ws.tabs[i];
+                let ids = t.root.panes();
+                let panes: Vec<&Pane> = ids.iter().filter_map(|id| self.panes.get(id)).collect();
+                let program = self
+                    .panes
+                    .get(&t.focus)
+                    .and_then(|p| p.session.foreground_process())
+                    .map(|i| i.name)
+                    .unwrap_or_default();
+                crate::tabbar::TabInfo {
+                    label: self.tab_label(i),
+                    icon: self.tabs_cfg.icons.then(|| crate::tabbar::icon_for(&program)),
+                    active: i == self.ws.active,
+                    activity: panes.iter().any(|p| p.activity),
+                    bell: panes.iter().any(|p| p.bell),
+                    root: panes.iter().any(|p| p.root),
+                    progress: panes.iter().find_map(|p| p.progress),
+                    panes: ids.len(),
+                    zoomed: t.zoomed,
+                }
+            })
+            .collect()
+    }
+
+    /// Bells, progress and privilege per pane (for the tab bar).
+    fn pump_pane_events(&mut self) -> bool {
+        let visible: Vec<u64> = self.ws.tab().map(|t| t.root.panes()).unwrap_or_default();
+        let mut changed = false;
+        for e in self.pane_events.drain() {
+            let Some(p) = e.session.and_then(|id| self.panes.get_mut(&id)) else { continue };
+            let id = e.session.unwrap_or(0);
+            match e.name.as_str() {
+                "terminal.bell" if !visible.contains(&id) => p.bell = true,
+                "terminal.progress" => {
+                    let n = |k: &str| e.data[k].as_u64().unwrap_or(0).min(255) as u8;
+                    p.progress = crate::tabbar::Progress::parse(n("state"), n("percent"));
+                }
+                "session.privileged" => p.root = e.data["root"].as_bool().unwrap_or(false),
+                _ => continue,
+            }
+            changed = true;
+        }
+        changed
     }
 
     fn bar_visible(&self) -> bool {
@@ -1091,7 +1596,7 @@ impl Active {
         }
         self.bus.publisher("interface").publish(
             "interface.menu.toggled",
-            Some(self.session.id()),
+            Some(focused!(self).id()),
             seraphim_events::json!({ "open": self.menu.engaged() }),
         );
         self.window.request_redraw();
@@ -1202,10 +1707,11 @@ impl Active {
 
     fn cell_at(&self, pad: f32) -> (usize, usize) {
         let m = self.renderer.cell_metrics();
-        let t = self.session.terminal();
+        let r = self.panes.get(&self.focus_id()).map(|p| p.rect).unwrap_or_default();
+        let t = focused!(self).terminal();
         actions::cell_at(
-            self.mouse.pos.0,
-            self.mouse.pos.1 - self.top_inset() as f64,
+            self.mouse.pos.0 - r.x as f64,
+            self.mouse.pos.1 - r.y as f64,
             pad,
             m.width,
             m.height,
@@ -1216,7 +1722,7 @@ impl Active {
 
     /// Should mouse events go to the application? Shift always selects.
     fn reporting(&self) -> bool {
-        mouse_reporting(self.session.terminal().modes()) && !self.modifiers.shift_key()
+        mouse_reporting(focused!(self).terminal().modes()) && !self.modifiers.shift_key()
     }
 
     fn update_pointer_icon(&mut self) {
@@ -1234,16 +1740,40 @@ impl Active {
             cell.1,
             cell.0,
             self.mods(),
-            self.session.terminal().modes(),
+            focused!(self).terminal().modes(),
         );
         if let Some(b) = bytes {
-            let _ = self.session.write(&b);
+            let _ = focused!(self).write(&b);
         }
     }
 
     fn on_cursor_moved(&mut self, x: f64, y: f64, pad: f32) {
         self.mouse.pos = (x, y);
         if self.menu_motion() {
+            return;
+        }
+        // Dragging a divider resizes the panes on either side.
+        if let Some(d) = &self.drag {
+            let ratio = match d.split {
+                Split::Right => (x as f32 - d.area.x) / d.area.w.max(1.0),
+                Split::Down => (y as f32 - d.area.y) / d.area.h.max(1.0),
+            };
+            let path = d.path.clone();
+            self.ws.set_ratio(&path, ratio);
+            self.apply_layout();
+            return;
+        }
+        if let Some(d) = self.divider_at(x as f32, y as f32) {
+            self.window.set_cursor(match d.split {
+                Split::Right => CursorIcon::ColResize,
+                Split::Down => CursorIcon::RowResize,
+            });
+            self.mouse.reporting = true; // the icon is re-evaluated on the way out
+            return;
+        }
+        if self.in_tab_bar(y) {
+            self.window.set_cursor(CursorIcon::Default);
+            self.mouse.reporting = true;
             return;
         }
         let cell = self.cell_at(pad);
@@ -1260,7 +1790,7 @@ impl Active {
         if !self.mouse.left {
             return;
         }
-        let mut t = self.session.terminal();
+        let mut t = focused!(self).terminal();
         let point = t.viewport_point(cell.0, cell.1);
         if let Some((anchor, block)) = self.mouse.pending.take() {
             if anchor != point {
@@ -1281,6 +1811,47 @@ impl Active {
         let terminal_drag = !pressed && button == WButton::Left && self.mouse.left;
         if !terminal_drag && self.menu_button(pressed, button) {
             return;
+        }
+        let (x, y) = (self.mouse.pos.0 as f32, self.mouse.pos.1 as f32);
+        if self.drag.is_some() {
+            if !pressed && button == WButton::Left {
+                self.drag = None;
+            }
+            return;
+        }
+        if let (Some(from), false, WButton::Left) = (self.tab_drag, pressed, button) {
+            self.tab_drag = None;
+            let col =
+                (self.mouse.pos.0 / self.overlay.cell_metrics().width as f64).max(0.0) as usize;
+            if let crate::tabbar::Hit::Tab(to) | crate::tabbar::Hit::Close(to) =
+                self.tab_hits.at(col)
+            {
+                if to != from {
+                    self.ws.reorder(from, to);
+                    self.window.request_redraw();
+                }
+            }
+            return;
+        }
+        if !terminal_drag && self.in_tab_bar(self.mouse.pos.1) {
+            if pressed {
+                self.tab_bar_click(button);
+            }
+            return;
+        }
+        if pressed && button == WButton::Left {
+            if let Some(d) = self.divider_at(x, y) {
+                self.drag = Some(d);
+                return;
+            }
+        }
+        // A press in another pane focuses it (and does nothing else).
+        if pressed && !terminal_drag {
+            if let Some(id) = self.pane_at(x, y).filter(|id| *id != self.focus_id()) {
+                self.ws.set_focus(id);
+                self.focus_changed();
+                return;
+            }
         }
         let cell = self.cell_at(pad);
         match button {
@@ -1303,7 +1874,7 @@ impl Active {
             (WButton::Left, true) => {
                 let clicks = self.mouse.clicks.press(Instant::now(), cell.0, cell.1);
                 let block = self.modifiers.control_key();
-                let mut t = self.session.terminal();
+                let mut t = focused!(self).terminal();
                 let point = t.viewport_point(cell.0, cell.1);
                 if self.modifiers.shift_key() && t.selection().is_some() && clicks == 1 {
                     t.update_selection(point); // Shift+click extends
@@ -1344,7 +1915,7 @@ impl Active {
         // taking the lock here (the mutex is not re-entrant).
         let reporting = self.reporting();
         let (alt_scroll, alt_screen) = {
-            let t = self.session.terminal();
+            let t = focused!(self).terminal();
             let m = t.modes();
             (m.alternate_scroll && m.mouse == MouseMode::Off, t.is_alternate_screen())
         };
@@ -1357,12 +1928,12 @@ impl Active {
             // Full-screen apps without mouse support (less, man): wheel
             // becomes cursor keys.
             let key = if notches > 0 { Key::Up } else { Key::Down };
-            let modes = self.session.terminal().modes().clone();
+            let modes = focused!(self).terminal().modes().clone();
             let one = encode_key(key, Mods::default(), &modes);
             let bytes = one.repeat((notches.unsigned_abs() as usize) * WHEEL_LINES as usize);
-            let _ = self.session.write(&bytes);
+            let _ = focused!(self).write(&bytes);
         } else {
-            self.session.terminal().scroll_display(notches * WHEEL_LINES);
+            focused!(self).terminal().scroll_display(notches * WHEEL_LINES);
             self.window.request_redraw();
         }
     }
@@ -1376,7 +1947,7 @@ impl Active {
             if pressed && !event.repeat {
                 self.alt_tap = true;
             } else if !pressed && std::mem::take(&mut self.alt_tap) {
-                let wants_all = self.session.terminal().modes().kitty_keyboard & 8 != 0;
+                let wants_all = focused!(self).terminal().modes().kitty_keyboard & 8 != 0;
                 if !wants_all {
                     self.toggle_menu();
                     return;
@@ -1384,6 +1955,32 @@ impl Active {
             }
         } else if pressed {
             self.alt_tap = false;
+        }
+        if let Some(label) = &mut self.renaming {
+            if pressed {
+                match &event.logical_key {
+                    WKey::Named(NamedKey::Enter) => {
+                        let l = label.trim().to_owned();
+                        if let Some(t) = self.ws.tab_mut() {
+                            t.label = (!l.is_empty()).then_some(l);
+                        }
+                        self.renaming = None;
+                        self.apply_layout();
+                    }
+                    WKey::Named(NamedKey::Escape) => {
+                        self.renaming = None;
+                        self.apply_layout();
+                    }
+                    WKey::Named(NamedKey::Backspace) => {
+                        label.pop();
+                    }
+                    WKey::Named(NamedKey::Space) => label.push(' '),
+                    WKey::Character(c) if label.chars().count() < 64 => label.push_str(c),
+                    _ => {}
+                }
+                self.window.request_redraw();
+            }
+            return;
         }
         if self.menu.engaged() {
             if pressed {
@@ -1408,11 +2005,11 @@ impl Active {
         if event.state != ElementState::Pressed {
             // Releases only matter to apps using the Kitty protocol with
             // event reporting.
-            if self.session.terminal().modes().kitty_keyboard & 2 != 0 {
+            if focused!(self).terminal().modes().kitty_keyboard & 2 != 0 {
                 if let Some(input) = key_input(event, self.mods()) {
-                    let bytes = encode_key_input(&input, self.session.terminal().modes());
+                    let bytes = encode_key_input(&input, focused!(self).terminal().modes());
                     if !bytes.is_empty() {
-                        let _ = self.session.write(&bytes);
+                        let _ = focused!(self).write(&bytes);
                     }
                 }
             }
@@ -1432,6 +2029,9 @@ impl Active {
             WKey::Named(NamedKey::End) => Some(ShortcutKey::End),
             WKey::Named(NamedKey::ArrowUp) => Some(ShortcutKey::Up),
             WKey::Named(NamedKey::ArrowDown) => Some(ShortcutKey::Down),
+            WKey::Named(NamedKey::ArrowLeft) => Some(ShortcutKey::Left),
+            WKey::Named(NamedKey::ArrowRight) => Some(ShortcutKey::Right),
+            WKey::Named(NamedKey::Tab) => Some(ShortcutKey::Tab),
             WKey::Named(NamedKey::F10) => Some(ShortcutKey::F(10)),
             WKey::Named(NamedKey::F11) => Some(ShortcutKey::F(11)),
             _ => None,
@@ -1443,13 +2043,17 @@ impl Active {
                 return;
             }
         }
-        let alt_screen = self.session.terminal().is_alternate_screen();
-        if let Some(action) = sk.and_then(|k| actions::shortcut(k, m, alt_screen)) {
+        let alt_screen = focused!(self).terminal().is_alternate_screen();
+        let ctx = actions::Workspace {
+            tabs: self.ws.tabs.len(),
+            panes: self.ws.tab().map_or(1, |t| t.root.panes().len()),
+        };
+        if let Some(action) = sk.and_then(|k| actions::shortcut_in(k, m, alt_screen, ctx)) {
             self.run_action(action);
             return;
         }
         if let Some(input) = key_input(event, self.mods()) {
-            let modes = self.session.terminal().modes().clone();
+            let modes = focused!(self).terminal().modes().clone();
             let bytes = encode_key_input(&input, &modes);
             if !bytes.is_empty() {
                 self.renderer.key_pressed();
@@ -1460,7 +2064,7 @@ impl Active {
 
     /// Apply the clipboard policy to OSC 52 requests from the application.
     fn handle_clipboard_requests(&mut self, allow_read: bool) {
-        for req in self.session.take_clipboard_requests() {
+        for req in focused!(self).take_clipboard_requests() {
             match req {
                 ClipboardRequest::Store { selection, data } => {
                     let board =
@@ -1477,7 +2081,7 @@ impl Active {
                         let text = self.clipboards.get(board).unwrap_or_default();
                         let reply =
                             format!("\x1b]52;{selection};{}\x07", encode_base64(text.as_bytes()));
-                        let _ = self.session.write(reply.as_bytes());
+                        let _ = focused!(self).write(reply.as_bytes());
                     } else if !self.warned_clipboard_read {
                         self.warned_clipboard_read = true;
                         eprintln!("seraphim: denied an application's request to read the clipboard (OSC 52)");
@@ -1577,16 +2181,52 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let allow_read = self.options.allow_clipboard_read;
         let Some(a) = &mut self.active else { return };
-        if let Some(exit) = a.session.exit_info() {
-            self.exit_code = exit.code.unwrap_or(1);
-            event_loop.exit();
-            return;
+        // Panes whose program ended close; the last one closes the window.
+        let exited: Vec<(u64, i32)> = a
+            .panes
+            .iter()
+            .filter_map(|(id, p)| p.session.exit_info().map(|e| (*id, e.code.unwrap_or(1))))
+            .collect();
+        for (id, code) in exited {
+            if a.close_pane(id) {
+                self.exit_code = code;
+                event_loop.exit();
+                return;
+            }
         }
+        if let Some(r) = a.pending.take() {
+            self.handle(r, event_loop);
+        }
+        let Some(a) = &mut self.active else { return };
         a.handle_clipboard_requests(allow_read);
-        if a.session.generation() != a.last_generation {
+        if a.pump_pane_events() && a.tab_bar_visible() {
+            a.window.request_redraw();
+        }
+        // Output in panes out of sight marks their tab; visible ones redraw.
+        let visible: Vec<u64> = a.drawn.iter().map(|(id, _)| *id).collect();
+        let focus = a.focus_id();
+        let mut other_changed = false;
+        for (id, p) in a.panes.iter_mut() {
+            if *id == focus || p.session.generation() == p.last_generation {
+                continue;
+            }
+            if visible.contains(id) {
+                other_changed = true;
+            } else if !p.activity {
+                p.activity = true;
+                p.last_generation = p.session.generation();
+                other_changed |= a.tabs_cfg.bar != "never";
+            }
+        }
+        if other_changed {
+            a.window.request_redraw();
+        }
+        let focused_changed =
+            a.panes.get(&focus).is_some_and(|p| p.session.generation() != p.last_generation);
+        if focused_changed {
             a.reset_blink();
             a.update_pointer_icon();
-            let synchronized = a.session.terminal().modes().synchronized_output;
+            let synchronized = focused!(a).terminal().modes().synchronized_output;
             if synchronized {
                 // Hold the frame until the app finishes (or the timeout,
                 // handled in about_to_wait).
@@ -1612,12 +2252,14 @@ impl ApplicationHandler<UserEvent> for App {
                 a.gpu.config.width = size.width.max(1);
                 a.gpu.config.height = size.height.max(1);
                 a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
-                let h = size.height.saturating_sub(a.top_inset()).max(1);
-                let (cols, rows) = a.renderer.grid_size(size.width, h, pad);
-                let _ = a.session.resize(cols, rows);
+                a.apply_layout();
+                let (cols, rows) = {
+                    let t = focused!(a).terminal();
+                    (t.cols(), t.rows())
+                };
                 a.bus.publisher("interface").publish(
                     "interface.resized",
-                    Some(a.session.id()),
+                    Some(focused!(a).id()),
                     seraphim_events::json!({
                         "cols": cols, "rows": rows, "width": size.width, "height": size.height,
                     }),
@@ -1634,9 +2276,12 @@ impl ApplicationHandler<UserEvent> for App {
                     a.renderer.set_fonts(f);
                     a.overlay.set_fonts(g);
                     let m = a.renderer.cell_metrics();
-                    let _ = a.session.set_cell_pixels(m.width, m.height);
+                    for p in a.panes.values() {
+                        let _ = p.session.set_cell_pixels(m.width, m.height);
+                    }
                 }
-                a.window.request_redraw();
+                a.pad = pad;
+                a.apply_layout();
             }
             WindowEvent::Occluded(occluded) => {
                 a.occluded = occluded;
@@ -1649,7 +2294,7 @@ impl ApplicationHandler<UserEvent> for App {
                 a.focused = focused;
                 a.bus.publisher("interface").publish(
                     "interface.focus.changed",
-                    Some(a.session.id()),
+                    Some(focused!(a).id()),
                     seraphim_events::json!({ "focused": focused }),
                 );
                 // Alt+Tab: the release happens in another window.
@@ -1659,9 +2304,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 a.update_pause();
                 a.reset_blink();
-                let bytes = encode_focus(focused, a.session.terminal().modes());
+                let bytes = encode_focus(focused, focused!(a).terminal().modes());
                 if !bytes.is_empty() {
-                    let _ = a.session.write(&bytes);
+                    let _ = focused!(a).write(&bytes);
                 }
                 a.window.request_redraw();
             }
@@ -1685,28 +2330,93 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::DroppedFile(path) => {
                 // Paste the path, quoted, like most terminals do.
                 let quoted = format!("'{}' ", path.display().to_string().replace('\'', "'\\''"));
-                let bytes = encode_paste(&quoted, a.session.terminal().modes());
+                let bytes = encode_paste(&quoted, focused!(a).terminal().modes());
                 a.write(&bytes);
             }
             WindowEvent::RedrawRequested => {
                 let size = a.window.inner_size();
-                let view = View {
-                    width: size.width,
-                    height: size.height.saturating_sub(a.top_inset()).max(1),
-                    padding: pad,
-                    focused: a.focused,
-                    cursor_on: a.blink_on,
-                };
-                {
-                    let term = a.session.terminal();
-                    a.last_generation = a.session.generation();
-                    if term.title() != a.title {
+                let (rects, dividers) = a.ws.layout(a.pane_area(), a.gap());
+                let focus = a.focus_id();
+                for (id, r) in &rects {
+                    let Some(p) = a.panes.get_mut(id) else { continue };
+                    let view = View {
+                        width: r.w.max(1.0) as u32,
+                        height: r.h.max(1.0) as u32,
+                        padding: pad,
+                        focused: a.focused && *id == focus,
+                        cursor_on: a.blink_on || *id != focus,
+                    };
+                    p.rect = *r;
+                    a.renderer.select(&a.gpu.device, *id);
+                    let term = p.session.terminal();
+                    p.last_generation = p.session.generation();
+                    if *id == focus && term.title() != a.title {
                         a.title = term.title().to_owned();
                         let t =
                             if a.title.is_empty() { "Seraphim".into() } else { a.title.clone() };
                         a.window.set_title(&t);
                     }
                     a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
+                }
+                // Dividers, and a veil over panes without focus.
+                let theme = a.renderer.theme().clone();
+                let mix = |k: f32| {
+                    let c = |i: usize| {
+                        (theme.background[i] as f32
+                            + (theme.foreground[i] as f32 - theme.background[i] as f32) * k)
+                            / 255.0
+                    };
+                    [c(0), c(1), c(2), 1.0]
+                };
+                let mut decor: Vec<([f32; 4], [f32; 4])> = dividers
+                    .iter()
+                    .map(|d| ([d.rect.x, d.rect.y, d.rect.w, d.rect.h], mix(0.3)))
+                    .collect();
+                let dim = a.panes_cfg.dim_inactive.clamp(0.0, 1.0);
+                if rects.len() > 1 && dim > 0.0 {
+                    let bg = theme.background.map(|c| c as f32 / 255.0 * dim);
+                    for (id, r) in rects.iter().filter(|(id, _)| *id != focus) {
+                        let _ = id;
+                        decor.push(([r.x, r.y, r.w, r.h], [bg[0], bg[1], bg[2], dim]));
+                    }
+                }
+                a.renderer.select(&a.gpu.device, DECOR_SLOT);
+                a.renderer.prepare_rects(
+                    &a.gpu.device,
+                    &a.gpu.queue,
+                    size.width,
+                    size.height,
+                    &decor,
+                );
+                a.renderer.select(&a.gpu.device, focus);
+                a.drawn = rects;
+                // The tab bar, below the menu bar.
+                if a.tab_bar_visible() {
+                    let m = a.overlay.cell_metrics();
+                    let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
+                    let palette = menu::Palette::from_theme(&theme);
+                    let alert = theme.ansi[9];
+                    let (bytes, hits) = crate::tabbar::paint(
+                        &a.tab_infos(),
+                        cols,
+                        &palette,
+                        alert,
+                        a.renaming.as_deref(),
+                    );
+                    let mut t = seraphim_terminal::Terminal::with_scrollback(cols, 1, 0);
+                    t.advance(&bytes);
+                    t.advance(b"\x1b[?25l");
+                    a.tab_hits = hits;
+                    let view = View {
+                        width: size.width,
+                        height: m.height.ceil() as u32,
+                        padding: 0.0,
+                        focused: true,
+                        cursor_on: false,
+                    };
+                    a.overlay.select(&a.gpu.device, TAB_BAR_SLOT);
+                    a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
+                    a.overlay.select(&a.gpu.device, 0);
                 }
                 if a.overlay_visible() {
                     let (cols, rows, _, _) = a.overlay_grid();
@@ -1758,7 +2468,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         // Extensions that read the terminal see it at most 50 ms late.
-        if let Some(t) = a.scripts.refresh_snapshot(&a.session, now) {
+        let focus = a.focus_id();
+        if let Some(t) =
+            a.panes.get(&focus).and_then(|p| a.scripts.refresh_snapshot(&p.session, now))
+        {
             wake = Some(wake.map_or(t, |w| w.min(t)));
         }
 
@@ -1806,7 +2519,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let blinking = {
-            let t = a.session.terminal();
+            let t = focused!(a).terminal();
             t.modes().cursor_blink && t.modes().cursor_visible && t.display_offset() == 0
         };
         if blinking && a.focused {
@@ -1871,13 +2584,30 @@ fn draw(a: &mut Active) {
             ..Default::default()
         });
         a.visual.render(&mut pass);
-        let top = a.top_inset().min(h.saturating_sub(1));
-        if top > 0 {
-            // The pinned menu bar takes the top row of pixels; the grid
-            // draws below it.
-            pass.set_viewport(0.0, top as f32, w as f32, (h - top) as f32, 0.0, 1.0);
+        // Each pane in its own rectangle (renderer slots share the atlas).
+        let focus = a.focus_id();
+        for (id, r) in &a.drawn {
+            if r.w < 1.0 || r.h < 1.0 {
+                continue;
+            }
+            a.renderer.select(&a.gpu.device, *id);
+            pass.set_viewport(r.x, r.y, r.w, r.h, 0.0, 1.0);
+            a.renderer.render(&mut pass);
         }
+        pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+        a.renderer.select(&a.gpu.device, DECOR_SLOT);
         a.renderer.render(&mut pass);
+        a.renderer.select(&a.gpu.device, focus);
+        if a.tab_bar_visible() {
+            let top = a.menu_height() as f32;
+            let th = a.tab_bar_height() as f32;
+            if top + th <= h as f32 {
+                pass.set_viewport(0.0, top, w as f32, th, 0.0, 1.0);
+                a.overlay.select(&a.gpu.device, TAB_BAR_SLOT);
+                a.overlay.render(&mut pass);
+                a.overlay.select(&a.gpu.device, 0);
+            }
+        }
         if a.overlay_visible() {
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             a.overlay.render(&mut pass);

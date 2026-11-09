@@ -1,4 +1,4 @@
--- A one-file script (scripts/clock.lua): Ctrl+Shift+T shows the time.
+-- A one-file script (scripts/clock.lua): Ctrl+Shift+Y shows the time.
 -- One-file scripts get the default permissions: visual, interface, metrics.
 
 ui.command("time", {
@@ -7,4 +7,4 @@ ui.command("time", {
     ui.notify(os.date("It is %H:%M"))
   end,
 })
-ui.key("ctrl+shift+t", "time")
+ui.key("ctrl+shift+y", "time")

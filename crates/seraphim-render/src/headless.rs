@@ -110,7 +110,51 @@ impl Headless {
         pre: &mut dyn FnMut(&mut wgpu::CommandEncoder),
         background: &mut dyn FnMut(&mut wgpu::RenderPass<'_>),
     ) -> Image {
-        let (width, height) = (view.width.max(1), view.height.max(1));
+        self.renderer.prepare(&self.device, &self.queue, term, view);
+        self.frame(view.width, view.height, pre, &mut |r, pass| {
+            background(pass);
+            r.render(pass);
+        })
+    }
+
+    /// Several terminals in one frame, each in its own renderer slot and
+    /// viewport `[x, y, w, h]` (pixels); `view` sizes are the panes'.
+    pub fn render_panes(
+        &mut self,
+        width: u32,
+        height: u32,
+        panes: &[(u64, &Terminal, View, [f32; 4])],
+    ) -> Image {
+        for (slot, term, view, _) in panes {
+            self.renderer.select(&self.device, *slot);
+            self.renderer.prepare(&self.device, &self.queue, term, *view);
+        }
+        let order: Vec<(u64, [f32; 4])> = panes.iter().map(|(s, _, _, r)| (*s, *r)).collect();
+        self.frame_multi(width, height, &order)
+    }
+
+    fn frame_multi(&mut self, width: u32, height: u32, panes: &[(u64, [f32; 4])]) -> Image {
+        // Renderer::render reads the selected slot only, so record each
+        // pane with its slot selected; selection between draws in one pass
+        // is fine because GPU resources live in the slots.
+        let device = self.device.clone();
+        self.frame(width, height, &mut |_| {}, &mut |r, pass| {
+            for (slot, [x, y, w, h]) in panes {
+                r.select(&device, *slot);
+                pass.set_viewport(*x, *y, *w, *h, 0.0, 1.0);
+                r.render(pass);
+            }
+        })
+    }
+
+    fn frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        pre: &mut dyn FnMut(&mut wgpu::CommandEncoder),
+        draw: &mut dyn FnMut(&mut Renderer, &mut wgpu::RenderPass<'_>),
+    ) -> Image {
+        let (width, height) = (width.max(1), height.max(1));
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -122,8 +166,6 @@ impl Headless {
             view_formats: &[],
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer.prepare(&self.device, &self.queue, term, view);
-
         let mut encoder = self.device.create_command_encoder(&Default::default());
         pre(&mut encoder);
         {
@@ -140,8 +182,7 @@ impl Headless {
                 })],
                 ..Default::default()
             });
-            background(&mut pass);
-            self.renderer.render(&mut pass);
+            draw(&mut self.renderer, &mut pass);
         }
 
         // Rows in a texture-to-buffer copy must be 256-byte aligned.

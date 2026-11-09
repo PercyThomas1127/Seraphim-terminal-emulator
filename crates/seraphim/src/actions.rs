@@ -39,6 +39,29 @@ pub enum Action {
     /// Open (or close) the menu bar from the keyboard: tap Alt (Option).
     /// Not F10: htop and mc use it.
     OpenMenu,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    MoveTabLeft,
+    MoveTabRight,
+    /// Go to tab n (1-9; 9 is the last).
+    GotoTab(u8),
+    RenameTab,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    /// The focused pane fills the tab (and back).
+    ZoomPane,
+    EqualizePanes,
 }
 
 impl Action {
@@ -66,6 +89,22 @@ impl Action {
             "open-config-folder" => OpenConfigFolder,
             "shortcuts" => Shortcuts,
             "about" => About,
+            "new-tab" => NewTab,
+            "close-tab" => CloseTab,
+            "next-tab" => NextTab,
+            "previous-tab" => PrevTab,
+            "move-tab-left" => MoveTabLeft,
+            "move-tab-right" => MoveTabRight,
+            "rename-tab" => RenameTab,
+            "split-right" => SplitRight,
+            "split-down" => SplitDown,
+            "close-pane" => ClosePane,
+            "focus-left" => FocusLeft,
+            "focus-right" => FocusRight,
+            "focus-up" => FocusUp,
+            "focus-down" => FocusDown,
+            "zoom-pane" => ZoomPane,
+            "equalize-panes" => EqualizePanes,
             _ => return None,
         })
     }
@@ -94,7 +133,22 @@ impl Action {
             ZoomOut => "Ctrl+Shift+-",
             ZoomReset => "Ctrl+Shift+0",
             OpenMenu => "Tap Alt",
-            OpenFileManager | ClearScrollback | OpenConfigFolder | Shortcuts | About => "",
+            NewTab => "Ctrl+Shift+T",
+            CloseTab => "Ctrl+Shift+W",
+            NextTab => "Ctrl+PgDown",
+            PrevTab => "Ctrl+PgUp",
+            MoveTabLeft => "Ctrl+Shift+PgUp",
+            MoveTabRight => "Ctrl+Shift+PgDown",
+            GotoTab(_) => "Alt+1…9",
+            RenameTab => "Ctrl+Alt+S",
+            SplitRight => "Ctrl+Shift+E",
+            SplitDown => "Ctrl+Shift+O",
+            ClosePane => "Ctrl+Shift+X",
+            FocusLeft | FocusRight | FocusUp | FocusDown => "Alt+Arrows",
+            ResizeLeft | ResizeRight | ResizeUp | ResizeDown => "Ctrl+Alt+Arrows",
+            ZoomPane => "Ctrl+Shift+Z",
+            OpenFileManager | ClearScrollback | OpenConfigFolder | Shortcuts | About
+            | EqualizePanes => "",
         }
     }
 
@@ -126,6 +180,21 @@ impl Action {
             Shortcuts => "Keyboard shortcuts",
             About => "About Seraphim",
             OpenMenu => "Open the menu bar",
+            NewTab => "New tab",
+            CloseTab => "Close tab",
+            NextTab => "Next tab",
+            PrevTab => "Previous tab",
+            MoveTabLeft => "Move tab left",
+            MoveTabRight => "Move tab right",
+            GotoTab(_) => "Go to tab 1-9",
+            RenameTab => "Rename tab",
+            SplitRight => "Split right",
+            SplitDown => "Split down",
+            ClosePane => "Close pane",
+            FocusLeft | FocusRight | FocusUp | FocusDown => "Move focus between panes",
+            ResizeLeft | ResizeRight | ResizeUp | ResizeDown => "Resize the pane",
+            ZoomPane => "Zoom the pane",
+            EqualizePanes => "Equal pane sizes",
         }
     }
 }
@@ -150,6 +219,20 @@ pub const SHORTCUT_HELP: &[Action] = &[
     Action::ScrollPageDown,
     Action::ScrollTop,
     Action::ScrollBottom,
+    Action::NewTab,
+    Action::CloseTab,
+    Action::NextTab,
+    Action::PrevTab,
+    Action::MoveTabLeft,
+    Action::MoveTabRight,
+    Action::GotoTab(1),
+    Action::RenameTab,
+    Action::SplitRight,
+    Action::SplitDown,
+    Action::ClosePane,
+    Action::FocusLeft,
+    Action::ResizeLeft,
+    Action::ZoomPane,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,7 +245,60 @@ pub enum ShortcutKey {
     End,
     Up,
     Down,
+    Left,
+    Right,
+    Tab,
     F(u8),
+}
+
+/// How many tabs, and panes in the active tab: some shortcuts only exist
+/// when they have something to act on, so a single pane keeps Alt+arrows
+/// and Alt+digits for the shell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Workspace {
+    pub tabs: usize,
+    pub panes: usize,
+}
+
+/// Tab and pane shortcuts, then [`shortcut`].
+pub fn shortcut_in(
+    key: ShortcutKey,
+    m: Modifiers,
+    alt_screen: bool,
+    ws: Workspace,
+) -> Option<Action> {
+    use ShortcutKey as K;
+    let ctrl_shift = m.ctrl && m.shift && !m.alt;
+    let ctrl_only = m.ctrl && !m.shift && !m.alt;
+    let alt_only = m.alt && !m.ctrl && !m.shift;
+    let ctrl_alt = m.ctrl && m.alt && !m.shift;
+    let letter = |c: char, l: char| c.eq_ignore_ascii_case(&l);
+    let a = match key {
+        K::Char(c) if ctrl_shift && letter(c, 't') => Some(Action::NewTab),
+        K::Char(c) if ctrl_shift && letter(c, 'w') => Some(Action::CloseTab),
+        K::Char(c) if ctrl_shift && letter(c, 'e') => Some(Action::SplitRight),
+        K::Char(c) if ctrl_shift && letter(c, 'o') => Some(Action::SplitDown),
+        K::Char(c) if ctrl_shift && letter(c, 'x') => Some(Action::ClosePane),
+        K::Char(c) if ctrl_shift && letter(c, 'z') => Some(Action::ZoomPane),
+        K::Char(c) if ctrl_alt && letter(c, 's') => Some(Action::RenameTab),
+        K::PageDown if ctrl_only => Some(Action::NextTab),
+        K::PageUp if ctrl_only => Some(Action::PrevTab),
+        K::Tab if ctrl_only => Some(Action::NextTab),
+        K::Tab if ctrl_shift => Some(Action::PrevTab),
+        K::PageUp if ctrl_shift => Some(Action::MoveTabLeft),
+        K::PageDown if ctrl_shift => Some(Action::MoveTabRight),
+        K::Char(c @ '1'..='9') if alt_only && ws.tabs > 1 => Some(Action::GotoTab(c as u8 - b'0')),
+        K::Left if alt_only && ws.panes > 1 => Some(Action::FocusLeft),
+        K::Right if alt_only && ws.panes > 1 => Some(Action::FocusRight),
+        K::Up if alt_only && ws.panes > 1 => Some(Action::FocusUp),
+        K::Down if alt_only && ws.panes > 1 => Some(Action::FocusDown),
+        K::Left if ctrl_alt && ws.panes > 1 => Some(Action::ResizeLeft),
+        K::Right if ctrl_alt && ws.panes > 1 => Some(Action::ResizeRight),
+        K::Up if ctrl_alt && ws.panes > 1 => Some(Action::ResizeUp),
+        K::Down if ctrl_alt && ws.panes > 1 => Some(Action::ResizeDown),
+        _ => None,
+    };
+    a.or_else(|| shortcut(key, m, alt_screen))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -342,5 +478,34 @@ mod tests {
         assert_eq!(decode_base64("4pyTIOWkqeS9vw==").unwrap(), "✓ 天使".as_bytes());
         assert_eq!(decode_base64("").unwrap(), b"");
         assert!(decode_base64("not base64!").is_none());
+    }
+
+    #[test]
+    fn workspace_shortcuts_need_something_to_act_on() {
+        let alt = Modifiers { alt: true, ..Default::default() };
+        let one = Workspace { tabs: 1, panes: 1 };
+        let many = Workspace { tabs: 3, panes: 2 };
+        assert_eq!(
+            shortcut_in(ShortcutKey::Char('T'), CTRL_SHIFT, false, one),
+            Some(Action::NewTab)
+        );
+        assert_eq!(
+            shortcut_in(ShortcutKey::Char('2'), alt, false, one),
+            None,
+            "Alt+2 stays the shell's"
+        );
+        assert_eq!(shortcut_in(ShortcutKey::Char('2'), alt, false, many), Some(Action::GotoTab(2)));
+        assert_eq!(shortcut_in(ShortcutKey::Left, alt, true, one), None);
+        assert_eq!(shortcut_in(ShortcutKey::Left, alt, true, many), Some(Action::FocusLeft));
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(shortcut_in(ShortcutKey::PageDown, ctrl, true, one), Some(Action::NextTab));
+        assert_eq!(
+            shortcut_in(ShortcutKey::Char('c'), CTRL_SHIFT, false, many),
+            Some(Action::Copy),
+            "falls through"
+        );
+        for a in SHORTCUT_HELP {
+            assert!(!a.description().is_empty());
+        }
     }
 }

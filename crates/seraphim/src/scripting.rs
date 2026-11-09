@@ -102,7 +102,9 @@ pub struct ScriptHost {
     pub commands: Vec<(String, String, String)>,
     keys: Vec<(String, Chord, String)>,
     privileged: Option<Subscription>,
-    root: bool,
+    /// Sessions running as root, and the focused one.
+    roots: HashSet<u64>,
+    session: u64,
     snapshot_at: Option<Instant>,
     snapshot_gen: u64,
     warned: HashSet<String>,
@@ -119,7 +121,8 @@ impl Default for ScriptHost {
             commands: Vec::new(),
             keys: Vec::new(),
             privileged: None,
-            root: false,
+            roots: HashSet::new(),
+            session: 1,
             snapshot_at: None,
             snapshot_gen: u64::MAX,
             warned: HashSet::new(),
@@ -271,6 +274,14 @@ impl ScriptHost {
         }
     }
 
+    /// The focused pane's session (snapshots, typing).
+    pub fn set_session(&mut self, id: u64) {
+        if id != self.session {
+            self.session = id;
+            self.snapshot_gen = u64::MAX;
+        }
+    }
+
     /// The registered command for a shortcut.
     pub fn key(&self, chord: &Chord) -> Option<(String, String)> {
         self.keys.iter().find(|(_, c, _)| c == chord).map(|(e, _, id)| (e.clone(), id.clone()))
@@ -341,7 +352,7 @@ impl ScriptHost {
             title: t.title().to_owned(),
             alt_screen: t.is_alternate_screen(),
             selection: t.selection_text(),
-            root: self.root,
+            root: self.roots.contains(&self.session),
             foreground: foreground.map(proc),
             shell: shell.map(proc),
         };
@@ -354,7 +365,12 @@ impl ScriptHost {
     pub fn apply(&mut self, visual: &mut VisualEngine, theme: &Theme) -> Vec<Effect> {
         if let Some(sub) = &self.privileged {
             for e in sub.drain() {
-                self.root = e.data["root"].as_bool().unwrap_or(false);
+                let id = e.session.unwrap_or(0);
+                if e.data["root"].as_bool().unwrap_or(false) {
+                    self.roots.insert(id);
+                } else {
+                    self.roots.remove(&id);
+                }
             }
         }
         let Some(rt) = &self.runtime else { return Vec::new() };
@@ -498,7 +514,7 @@ impl ScriptHost {
             Sc::Notify { ext, text, .. } => fx.push(Effect::Notify(format!("{ext}: {text}"))),
             Sc::Send { text, .. } => {
                 // Checked in the runtime too; this is the authoritative one.
-                if self.root {
+                if self.roots.contains(&self.session) {
                     return Err("terminal.send refused: the session runs as root".into());
                 }
                 fx.push(Effect::Send(text));

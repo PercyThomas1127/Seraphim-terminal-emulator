@@ -153,6 +153,8 @@ pub struct Bindings {
     subs: Vec<(Pattern, Subscription)>,
     sampler: Sampler,
     session: u64,
+    /// Latest event value per (binding, session), to switch sessions.
+    latest: std::collections::HashMap<(usize, u64), f32>,
 }
 
 impl Bindings {
@@ -175,6 +177,7 @@ impl Bindings {
             subs,
             sampler: Sampler::default(),
             session,
+            latest: Default::default(),
         }
     }
 
@@ -216,7 +219,7 @@ impl Bindings {
         let events: Vec<_> = self.subs.iter().flat_map(|(_, s)| s.drain()).collect();
         let session = self.session;
         let mut updates = Vec::new();
-        for e in events.iter().filter(|e| e.session.is_none_or(|s| s == session)) {
+        for e in &events {
             for (i, b) in self.binds.iter().enumerate() {
                 if let Input::Event { pattern, field, .. } = &b.input {
                     if !pattern.matches(&e.name) {
@@ -224,7 +227,10 @@ impl Bindings {
                     }
                     let v = field.iter().try_fold(&e.data, |v, k| v.get(k));
                     if let Some(x) = v.and_then(|v| b.map_value(v)) {
-                        updates.push((i, x));
+                        self.latest.insert((i, e.session.unwrap_or(0)), x);
+                        if e.session.is_none_or(|s| s == session) {
+                            updates.push((i, x));
+                        }
                     }
                 }
             }
@@ -247,6 +253,20 @@ impl Bindings {
             next = Some(next.map_or(self.next_sample[i], |n| n.min(self.next_sample[i])));
         }
         (next, changed)
+    }
+
+    /// Follow another session's events (the focused pane changed).
+    pub fn set_session(&mut self, session: u64, visual: &mut VisualEngine) {
+        if session == self.session {
+            return;
+        }
+        self.tick(std::time::Instant::now(), visual);
+        self.session = session;
+        for i in 0..self.binds.len() {
+            if let Some(x) = self.latest.get(&(i, session)).copied() {
+                self.set(i, x, visual);
+            }
+        }
     }
 
     fn set(&mut self, i: usize, x: f32, visual: &mut VisualEngine) -> bool {

@@ -2199,8 +2199,10 @@ dependencies = [
  "seraphim-session",
  "seraphim-terminal",
  "seraphim-visual",
+ "serde",
  "serde_json",
  "toml",
+ "unicode-width",
  "wgpu",
  "winit",
 ]

@@ -46,6 +46,12 @@ pub enum TerminalEvent {
     },
     AlternateScreen(bool),
     ModeChanged,
+    /// OSC 9;4 progress (ConEmu / Windows Terminal): state 0 clears,
+    /// 1 normal, 2 error, 3 indeterminate, 4 paused; percent 0-100.
+    Progress {
+        state: u8,
+        percent: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1129,6 +1135,12 @@ impl State {
             params.get(i).map(|p| String::from_utf8_lossy(p).into_owned()).unwrap_or_default()
         };
         match *cmd {
+            b"9" if params.get(1).is_some_and(|p| *p == b"4") => {
+                let num = |i: usize| text(i).trim().parse::<u32>().unwrap_or(0);
+                let state = num(2).min(4) as u8;
+                let percent = num(3).min(100) as u8;
+                self.events.push(TerminalEvent::Progress { state, percent });
+            }
             b"0" | b"2" => {
                 // Titles may legitimately contain ';', which vte splits on.
                 let title = params[1..]

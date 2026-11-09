@@ -32,8 +32,10 @@ mod interaction;
 mod menu;
 mod profile;
 mod scripting;
+mod tabbar;
 mod watch;
 mod window;
+mod workspace;
 
 use seraphim_events::EventBus;
 use seraphim_session::{Command, Session, SessionConfig};

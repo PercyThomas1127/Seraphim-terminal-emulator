@@ -93,6 +93,8 @@ pub fn options_from_config(
         scripting: c.scripting.clone(),
         extensions: c.extensions.clone(),
         cli_extensions: Vec::new(),
+        tabs: c.tabs.clone(),
+        panes: c.panes.clone(),
     };
     (o, warnings)
 }

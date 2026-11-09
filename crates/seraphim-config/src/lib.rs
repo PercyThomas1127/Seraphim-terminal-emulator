@@ -62,10 +62,49 @@ pub struct Config {
     pub bind: Vec<Bind>,
     /// Menu bar additions ([`BUILTIN_MENU`] is the base).
     pub menu: Vec<Menu>,
+    /// The tab bar and tab labels.
+    pub tabs: Tabs,
+    /// Split panes.
+    pub panes: Panes,
     /// The Lua scripting runtime.
     pub scripting: Scripting,
     /// Per-extension switches and permissions, by extension name.
     pub extensions: std::collections::BTreeMap<String, ExtensionConfig>,
+}
+
+/// `[tabs]`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tabs {
+    /// `auto` (with two or more tabs), `always` or `never`.
+    pub bar: String,
+    /// An icon for the program in each tab (needs a Nerd Font).
+    pub icons: bool,
+    /// Tab label: `{title}`, `{program}`, `{cwd}` (last part of the
+    /// working directory) and `{index}` are filled in.
+    pub label: String,
+}
+
+impl Default for Tabs {
+    fn default() -> Self {
+        Tabs { bar: "auto".into(), icons: true, label: "{title}".into() }
+    }
+}
+
+/// `[panes]`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Panes {
+    /// Width of the divider between panes, in logical pixels.
+    pub divider: f32,
+    /// Darken panes without focus by this much (0-1).
+    pub dim_inactive: f32,
+}
+
+impl Default for Panes {
+    fn default() -> Self {
+        Panes { divider: 2.0, dim_inactive: 0.25 }
+    }
 }
 
 /// `[scripting]`.
@@ -219,6 +258,8 @@ impl Default for Config {
             background: Vec::new(),
             on: Vec::new(),
             bind: Vec::new(),
+            tabs: Tabs::default(),
+            panes: Panes::default(),
             scripting: Scripting::default(),
             extensions: Default::default(),
             menu: Vec::new(),
@@ -853,6 +894,18 @@ impl Config {
         }
         if f.family.as_deref().is_some_and(|s| s.trim().is_empty()) {
             return Err("font.family must not be empty (remove it to use the default)".into());
+        }
+        if !["auto", "always", "never"].contains(&self.tabs.bar.as_str()) {
+            return Err(format!(
+                "tabs.bar must be auto, always or never (got {:?})",
+                self.tabs.bar
+            ));
+        }
+        if !(0.0..=20.0).contains(&self.panes.divider) {
+            return Err("panes.divider must be 0-20".into());
+        }
+        if !(0.0..=1.0).contains(&self.panes.dim_inactive) {
+            return Err("panes.dim_inactive must be 0-1".into());
         }
         let w = &self.window;
         if !(10..=1000).contains(&w.columns) || !(3..=1000).contains(&w.rows) {

@@ -113,7 +113,8 @@ pub struct Interactions {
     subs: Vec<seraphim_events::Subscription>,
     session: u64,
     warned: std::collections::HashSet<usize>,
-    state: Vec<std::sync::Arc<Event>>,
+    /// Latest state events, per session (0: no session).
+    state: std::collections::HashMap<u64, Vec<std::sync::Arc<Event>>>,
 }
 
 impl Interactions {
@@ -126,7 +127,7 @@ impl Interactions {
         let mut subs: Vec<_> = patterns.iter().map(|p| bus.subscribe(*p, 256)).collect();
         // State events are tracked even when no rule listens yet.
         subs.extend(STATE_EVENTS.iter().map(|p| bus.subscribe(*p, 16)));
-        Interactions { rules, subs, session, warned: Default::default(), state: Vec::new() }
+        Interactions { rules, subs, session, warned: Default::default(), state: Default::default() }
     }
 
     /// New rules (after a profile switch), brought up to date with the
@@ -141,13 +142,29 @@ impl Interactions {
         self.pump(visual);
         let state = std::mem::take(&mut self.state);
         *self = Interactions::new(rules, bus, self.session);
-        for e in &state {
+        self.state = state;
+        self.replay(visual);
+    }
+
+    /// Follow another session (the focused pane changed): its state
+    /// applies at once.
+    pub fn set_session(&mut self, session: u64, visual: &mut VisualEngine) {
+        if session == self.session {
+            return;
+        }
+        self.pump(visual);
+        self.session = session;
+        self.replay(visual);
+    }
+
+    fn replay(&self, visual: &mut VisualEngine) {
+        let events = self.state.get(&self.session).into_iter().chain(self.state.get(&0)).flatten();
+        for e in events {
             for r in self.rules.iter().filter(|r| r.matches(&e.name, &e.data)) {
                 let instant = Rule { transition: Transition::Instant, from: None, ..r.clone() };
                 instant.apply(visual);
             }
         }
-        self.state = state;
     }
 
     /// Apply rules for every pending event. Returns whether anything
@@ -163,12 +180,13 @@ impl Interactions {
         let mut acted = false;
         let mut warnings = Vec::new();
         for e in events {
+            if STATE_EVENTS.contains(&e.name.as_str()) {
+                let list = self.state.entry(e.session.unwrap_or(0)).or_default();
+                list.retain(|s| s.name != e.name);
+                list.push(e.clone());
+            }
             if e.session.is_some_and(|s| s != self.session) {
                 continue;
-            }
-            if STATE_EVENTS.contains(&e.name.as_str()) {
-                self.state.retain(|s| s.name != e.name);
-                self.state.push(e.clone());
             }
             for (i, r) in self.rules.iter().enumerate() {
                 if r.matches(&e.name, &e.data) {
