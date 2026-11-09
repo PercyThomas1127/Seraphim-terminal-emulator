@@ -13,9 +13,9 @@ decisions that settle spec §18.
 
 ## Status
 
-Phases I (functional terminal), II (visual identity) and III
-(programmability) of the specification are complete; Phase IV (tabs,
-splits, panels, settings UI) is next. See
+Phases I (functional terminal), II (visual identity), III
+(programmability) and IV (full interface) of the specification are
+complete; Phase V (Divinity integration) is next. See
 [docs/progress.md](docs/progress.md) for where every part of the spec
 stands.
 
@@ -225,6 +225,48 @@ items = [
 A `[[menu]]` titled like a built-in one appends to it (`replace = true`
 replaces it).
 
+### Tabs, splits, panels and layouts
+
+![Two split terminals and an extension's git panel](docs/images/workspace.png)
+
+* **Tabs:** Ctrl+Shift+T opens one and Ctrl+Shift+W closes it.
+  Ctrl+PgUp/PgDown (or Ctrl+Tab) switch tabs, Alt+1…9 jump to one,
+  Ctrl+Shift+PgUp/PgDown move it, and Ctrl+Alt+S renames it.
+  * The tab bar appears with a second tab (`[tabs] bar`). Click to switch,
+    middle-click or × to close, drag to reorder.
+  * Each tab shows the program's icon. A dot marks output in a tab out of
+    sight, `!` a bell, and OSC 9;4 progress fills the tab. Root tabs are
+    red.
+  * Choosing a profile in a tab makes it that tab's, with its own theme
+    and background.
+* **Splits:** Ctrl+Shift+E splits right and Ctrl+Shift+O down. Alt+arrows
+  move between panes, Ctrl+Alt+arrows resize them, Ctrl+Shift+Z zooms
+  one, and Ctrl+Shift+X closes it. Drag dividers; click a pane to focus
+  it. New panes start in the current directory, and panes without focus
+  are dimmed (`[panes]`).
+* **Panels** (View menu): System Monitor, Sessions, Command History
+  (Enter types a command again) and Package Activity, plus panels from
+  extensions (`ui.panel`, see the scripting guide).
+* **Settings** (Ctrl+Shift+, or Settings → Configure Seraphim): change
+  the theme, preset, font, transitions, bars, effects and extensions. Each
+  change is written into your config file, keeping its comments, and
+  applies at once.
+* **Layouts:** `[[layout]]` names an arrangement of tabs and panes:
+  commands, directories and panels. Open one from the Settings menu, with
+  `--layout NAME`, or at startup (`startup_layout`).
+* **Restoration:** with `restore_session = true`, closing the window saves
+  your tabs, splits, directories and recent screen text, and the next
+  start brings them back.
+
+```toml
+[[layout]]
+name = "dev"
+
+[[layout.tab]]
+label = "code"
+pane = { split = "right", ratio = 0.6, first = { cwd = "~/src" }, second = { split = "down", first = { panel = "system" }, second = { panel = "history" } } }
+```
+
 ### Extensions (Lua)
 
 ![An extension flashing the window on ERROR, another one's notice](docs/images/scripting.png)
@@ -253,7 +295,8 @@ only change what Seraphim shows. A root shell never gives an extension more
 rights, and nothing can type into a root session. See
 **[docs/scripting.md](docs/scripting.md)** for the guide and API reference,
 and [`examples/`](examples/) for complete extensions: an error flash,
-Gabriel install effects, exit-code colors, CPU-driven intensity, a clock.
+Gabriel install effects, exit-code colors, CPU-driven intensity, a git
+status panel, and a clock.
 
 ### Images
 

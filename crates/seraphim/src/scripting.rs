@@ -85,6 +85,7 @@ pub enum Effect {
     },
     /// An extension stopped: close its panels.
     ClosePanels(String),
+    OpenLayout(String),
 }
 
 /// A panel an extension registered, with its latest widgets.
@@ -594,6 +595,7 @@ impl ScriptHost {
                     fx.push(Effect::Redraw);
                 }
             }
+            Sc::OpenLayout { name, .. } => fx.push(Effect::OpenLayout(name)),
             Sc::OpenPanel { ext, id, place } => {
                 fx.push(Effect::OpenPanel { name: format!("{ext}:{id}"), place })
             }

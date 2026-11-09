@@ -25,7 +25,10 @@ fn examples_start_cleanly() {
     let (found, errors) = discover(&root, &[]);
     assert!(errors.is_empty(), "{errors:?}");
     let names: Vec<_> = found.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, ["cpu-glow", "error-flash", "exit-color", "gabriel-glow", "clock"]);
+    assert_eq!(
+        names,
+        ["cpu-glow", "error-flash", "exit-color", "gabriel-glow", "git-panel", "clock"]
+    );
     let bus = EventBus::new();
     let data = std::env::temp_dir().join(format!("seraphim-examples-{}", std::process::id()));
     let list = found

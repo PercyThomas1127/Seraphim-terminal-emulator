@@ -1,5 +1,8 @@
 # Phase IV plan — Full Interface
 
+**Status: complete** except the stretch item (detachable tabs). As
+built: [ADR 0010](adr/0010-interface.md).
+
 **Goal (spec §15):** build the complete terminal application.
 **Milestone:** a complete terminal application.
 
@@ -29,51 +32,51 @@ configuration), §18.3 (interface extensibility; ADR 0006 reserves
 ## Checklist
 
 ### 1. Multi-pane rendering
-- [ ] Renderer slots: per-pane draw state, shared atlas and pipeline
-- [ ] Draw each pane in its viewport; dividers and a focus accent
+- [x] Renderer slots: per-pane draw state, shared atlas and pipeline
+- [x] Draw each pane in its viewport; dividers and a focus accent
 
 ### 2. Workspace model
-- [ ] Tabs → split tree → panes; split, close, focus by direction, resize, swap, zoom
-- [ ] Pixel and cell rectangles for a window size (padding, dividers, tab bar)
-- [ ] Serializable (layouts, restoration)
+- [x] Tabs → split tree → panes; split, close, focus by direction, resize, swap, zoom
+- [x] Pixel and cell rectangles for a window size (padding, dividers, tab bar)
+- [x] Serializable (layouts, restoration)
 
 ### 3. Window on the workspace
-- [ ] Many sessions per window; input, mouse, selection, scrolling, IME and clipboard go to the focused pane
-- [ ] Rules, bindings and scripts follow the focused pane's session; events carry their session id
-- [ ] A pane whose shell exits closes; the last one closes the window
+- [x] Many sessions per window; input, mouse, selection, scrolling, IME and clipboard go to the focused pane
+- [x] Rules, bindings and scripts follow the focused pane's session; events carry their session id
+- [x] A pane whose shell exits closes; the last one closes the window
 
 ### 4. Tabs (§9.2)
-- [ ] Tab bar (shown with two or more tabs, or always/never by config), click, middle-click to close, drag to reorder
-- [ ] New, close, next/previous, move, Ctrl+Shift+1…9 (Konsole-style shortcuts)
-- [ ] Labels: title, working directory or program, with custom labels (rename) and a format string
-- [ ] Activity and bell indicators for background tabs; a progress indicator (OSC 9;4); root tabs in the alert color
-- [ ] Icons by foreground program (Nerd Font glyphs, with fallbacks)
-- [ ] Per-tab profiles: switching tabs switches theme and background, with the scene transition
+- [x] Tab bar (shown with two or more tabs, or always/never by config), click, middle-click to close, drag to reorder
+- [x] New, close, next/previous, move, Ctrl+Shift+1…9 (Konsole-style shortcuts)
+- [x] Labels: title, working directory or program, with custom labels (rename) and a format string
+- [x] Activity and bell indicators for background tabs; a progress indicator (OSC 9;4); root tabs in the alert color
+- [x] Icons by foreground program (Nerd Font glyphs, with fallbacks)
+- [x] Per-tab profiles: switching tabs switches theme and background, with the scene transition
 
 ### 5. Split panes (§9.1)
-- [ ] Split right/down, close pane, focus with Alt+arrows, resize with Ctrl+Alt+arrows, zoom a pane
-- [ ] Click to focus; drag dividers to resize
-- [ ] New panes start in the focused pane's directory
+- [x] Split right/down, close pane, focus with Alt+arrows, resize with Ctrl+Alt+arrows, zoom a pane
+- [x] Click to focus; drag dividers to resize
+- [x] New panes start in the focused pane's directory
 
 ### 6. Panels (§9.3, §9.4)
-- [ ] Widget tree and painter (text, list, gauge, sparkline, key-value, separator; styles from the theme)
-- [ ] Built-in panels: system monitor, sessions, command history, package activity (Gabriel events)
-- [ ] Panels as panes (open, close, keyboard and mouse)
-- [ ] Extensions: `ui.panel(id, {title, render})`, `ui.refresh(id)`, `ui.open_panel(id)`, keys and clicks back to the extension
+- [x] Widget tree and painter (text, list, gauge, sparkline, key-value, separator; styles from the theme)
+- [x] Built-in panels: system monitor, sessions, command history, package activity (Gabriel events)
+- [x] Panels as panes (open, close, keyboard and mouse)
+- [x] Extensions: `ui.panel(id, {title, render})`, `ui.refresh(id)`, `ui.open_panel(id)`, keys and clicks back to the extension
 
 ### 7. Layouts (§9.5)
-- [ ] `[[layout]]` in configuration: named trees of terminals (command, directory, profile) and panels
-- [ ] `--layout NAME`, `startup_layout`, a Layouts menu, `ui.open_layout` for extensions
+- [x] `[[layout]]` in configuration: named trees of terminals (command, directory, profile) and panels
+- [x] `--layout NAME`, `startup_layout`, a Layouts menu, `ui.open_layout` for extensions
 
 ### 8. Session restoration (§9.1)
-- [ ] Save tabs, splits, directories, profiles, labels and recent screen text on exit (and periodically)
-- [ ] Restore on start (`restore_session`), with the old screen text shown above the new prompt
+- [x] Save tabs, splits, directories, profiles, labels and recent screen text on exit (and periodically)
+- [x] Restore on start (`restore_session`), with the old screen text shown above the new prompt
 
 ### 9. GUI configuration (§7.3)
-- [ ] Settings panel: theme, font, size, opacity, preset, transition, reduced motion, menu and tab bars, profiles, with live preview through the config file
-- [ ] Extensions manager: enable or disable, permissions requested and granted
-- [ ] Edits keep the file's comments and layout (`toml_edit`)
+- [x] Settings panel: theme, font, size, opacity, preset, transition, reduced motion, menu and tab bars, profiles, with live preview through the config file
+- [x] Extensions manager: enable or disable, permissions requested and granted
+- [x] Edits keep the file's comments and layout (`toml_edit`)
 
 ### 10. Close-out
-- [ ] Detachable tabs: move a tab to a new window (the PTY is handed over) — stretch
-- [ ] ADR 0010, README, docs, tests, real-window checks, `docs/progress.md`
+- [ ] Detachable tabs: move a tab to a new window (the PTY is handed over) — stretch, not done (ADR 0010)
+- [x] ADR 0010, README, docs, tests, real-window checks, `docs/progress.md`

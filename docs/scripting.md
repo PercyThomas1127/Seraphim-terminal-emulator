@@ -155,6 +155,9 @@ end, { priority = 10, throttle = 100 })
 | `interface.focus.changed` | `{focused}` |
 | `interface.resized` | `{cols, rows, width, height}` |
 | `interface.menu.toggled` | `{open}` |
+| `interface.tab.changed` | `{tab, from, tabs}`: 0-based |
+| `interface.pane.focused` | `{pane, tab}` |
+| `terminal.progress` | `{state, percent}`: OSC 9;4 (0 clear, 1 normal, 2 error, 3 indeterminate, 4 paused) |
 | `visual.profile.changed` | `{profile}` |
 | `animation.completed` | `{name, extension}` |
 | `gabriel.install.*` | From the Gabriel package manager integration |
@@ -249,7 +252,51 @@ The screen is a snapshot, at most 50 ms old, never the live grid.
 | `ui.notify(text)` | A notice in the corner of the window. |
 | `ui.command(id, {title, run})` or `ui.command(id, fn)` | A command. It appears in the menu bar's **Extensions** menu. |
 | `ui.key(chord, command_id or fn)` | A shortcut such as `ctrl+shift+e`, `alt+enter` or `f5`. Extension shortcuts take precedence over the built-in ones; a bare letter is refused. |
-| `ui.action(name)` | A built-in action: `copy`, `paste`, `zoom-in`, `toggle-menu-bar`, `next-profile`, … (the menu actions). |
+| `ui.action(name)` | A built-in action: `copy`, `paste`, `zoom-in`, `new-tab`, `split-right`, `close-pane`, `panel-system`, `settings`, … (the menu actions). |
+| `ui.panel(id, {title, render, on_select, on_key, interval})` | A panel (below). It appears in the Extensions menu. |
+| `ui.open_panel(id, {place})` | Show it: `place` is `right` (default), `down` or `tab`. |
+| `ui.refresh(id)` | Render an open panel again now. |
+| `ui.open_layout(name)` | Open a `[[layout]]`. |
+
+#### Panels
+
+A panel is a pane that shows widgets your `render` function returns.
+Seraphim lays them out and draws them with the terminal's fonts and theme;
+extensions describe what to show and never draw. `render` is called when
+the panel opens, after `on_select` and `on_key`, on `ui.refresh`, and every
+`interval` ms (at least 100) while the panel is open.
+
+```lua
+ui.panel("builds", {
+  title = "Builds",
+  interval = 2000,
+  render = function()
+    return {
+      { type = "heading", text = "CI" },
+      { type = "gauge", label = "Progress", value = 0.4 },
+      { type = "sparkline", label = "Load", values = { 1, 3, 2, 5 } },
+      { type = "kv", items = { { "Branch", "main" }, { "Commit", "590c0fb" } } },
+      { type = "separator" },
+      { type = "list", items = {
+          { text = "build", detail = "ok", style = "good" },
+          { text = "test", detail = "failed", style = "alert" },
+      } },
+      { type = "text", text = "Enter re-runs the selected job.", style = "dim" },
+    }
+  end,
+  on_select = function(n) --[[ n-th list item, 1-based ]] end,
+  on_key = function(key, selected) --[[ "r", "left", "enter"… ]] end,
+})
+ui.open_panel("builds", { place = "down" })
+```
+
+Widgets: `heading {text}`, `text {text, style}`, `kv {items}`,
+`gauge {label, value 0-1, text, style}`, `sparkline {label, values, max}`,
+`list {items = {{text, detail, style}}}`, `separator`. Styles: `normal`,
+`dim`, `bold`, `accent`, `good`, `warn`, `alert`. In a panel, Up and Down
+move the selection, Enter and clicks choose, and Escape closes it.
+[`examples/extensions/git-panel`](../examples/extensions/git-panel) is a
+complete one.
 
 ### `system` (`metrics`, `system`)
 

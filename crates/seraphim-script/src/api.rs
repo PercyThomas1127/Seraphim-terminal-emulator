@@ -957,6 +957,15 @@ fn ui(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
 
     let c = ctx.clone();
     t.set(
+        "open_layout",
+        lua.create_function(move |_, name: String| {
+            c.send(Command::OpenLayout { ext: c.name.clone(), name });
+            Ok(())
+        })?,
+    )?;
+
+    let c = ctx.clone();
+    t.set(
         "action",
         lua.create_function(move |_, name: String| {
             c.send(Command::Action { ext: c.name.clone(), name });

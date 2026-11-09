@@ -1,0 +1,9 @@
+name = "git-panel"
+version = "1.0.0"
+description = "A panel with the git status of the focused terminal's directory (spec §9.4)."
+api = 1
+permissions = ["interface", "terminal.read", "process.exec"]
+# Grant in seraphim.toml:
+#   [extensions.git-panel]
+#   grant = ["interface", "terminal.read", "process.exec"]
+#   commands = ["git"]

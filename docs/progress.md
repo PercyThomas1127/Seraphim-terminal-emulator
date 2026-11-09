@@ -1,6 +1,6 @@
 # Seraphim: progress against the specification (v0.1)
 
-As of the end of Phase III. Percentages are rough: the share of each
+As of the end of Phase IV. Percentages are rough: the share of each
 phase's listed tasks that is done, not a measure of effort.
 
 | Phase (spec §15) | Status | Done |
@@ -8,12 +8,12 @@ phase's listed tasks that is done, not a measure of effort.
 | I. Functional Foundation | Complete | ~100 % |
 | II. Visual Identity | Complete (real-GPU measurements pending) | ~100 % |
 | III. Programmability | Complete: Lua extensions, API, permissions | ~100 % |
-| IV. Full Interface | Menu bar and overlay only | ~10 % |
+| IV. Full Interface | Complete (detachable tabs not done) | ~95 % |
 | V. Divinity Integration | System metrics and Gabriel-event hooks only | ~10 % |
-| **Overall** | Three of five phases done | **~65 %** |
+| **Overall** | Four of five phases done | **~80 %** |
 
-The code: 10 crates, ~27,000 lines of Rust, ~600 lines of WGSL and five
-example extensions, 302 automated tests (unit, pixel tests through the
+The code: 10 crates, ~32,000 lines of Rust, ~600 lines of WGSL and six
+example extensions, 325 automated tests (unit, pixel tests through the
 real wgpu pipeline, xterm conformance, fuzzing, Lua runtime end to end),
 all passing; clippy clean.
 
@@ -66,28 +66,33 @@ See `docs/phase-3-plan.md`, ADR 0009 and `docs/scripting.md`.
 | Extension permissions | `seraphim-script/src/perm.rs` | requested ∩ granted; absent tables; allow-lists for commands, paths and hosts; no input into root sessions |
 | Custom visual layers | `visual.add_layer` | any `[[background]]` layer, validated like TOML, kept across profile switches |
 
-Events (spec §11.2) now include `terminal.output` (parsed text),
+Events (spec §11.2) now include `interface.tab.changed`,
+`interface.pane.focused`, `terminal.progress`, `terminal.output` (parsed text),
 `terminal.output.raw`, `command.output`, `terminal.text.changed`,
 `terminal.cursor.moved`, `animation.completed`, `interface.focus.changed`,
 `interface.resized` and `interface.menu.toggled`, on top of the session,
-shell, command and visual events. Still missing: `interface.tab.changed`
-(no tabs yet), `audio.*`, `network.*` (Phase V integrations).
+shell, command and visual events. Still missing: `audio.*`, `network.*` (Phase V integrations).
 
 Event management (§11.3): subscriptions, filtering, metadata, custom
 events, priorities, cancellation (between scripts), asynchronous handling
 (callbacks for processes and HTTP), rate limiting (per-handler throttle,
 bounded queues).
 
-## Phase IV — Full Interface: ~10 %
+## Phase IV — Full Interface: complete
 
-| Task | Status |
-|---|---|
-| Tabs | Not started (sessions are already independent of windows) |
-| Split panes | Not started |
-| Custom panels | Overlay renderer, panels and notices exist (menu bar); extensions add menu commands and shortcuts; no panel or widget API |
-| GUI configuration | Menu bar only; no settings UI |
-| Layout management | Not started |
-| Session restoration | Not started |
+See `docs/phase-4-plan.md` and ADR 0010.
+
+| Task | Where | Notes |
+|---|---|---|
+| Tabs | `workspace.rs`, `tabbar.rs`, `window.rs` | bar (auto/always/never), labels and rename, icons, activity/bell marks, OSC 9;4 progress, root color, drag to reorder, per-tab profiles |
+| Split panes | `workspace.rs` | split right/down, focus by direction, resize, zoom, drag dividers, click to focus, dimmed inactive panes; one renderer with per-pane slots |
+| Custom panels | `panel.rs`, `panels.rs` | widget trees painted by Seraphim; system monitor, sessions, history, package activity; extension panels via `ui.panel` |
+| GUI configuration | `settings.rs` | settings panel editing the config file in place (comments kept), applied live; extension switches |
+| Layout management | `[[layout]]` | named trees of commands, directories and panels; `--layout`, `startup_layout`, Settings menu, `ui.open_layout` |
+| Session restoration | `restore.rs` | tabs, splits, directories, labels, profiles, panels, last 200 lines per terminal |
+
+Still open from spec §9: detachable tabs, floating panels, custom window
+decorations, custom tab designs beyond the label format.
 
 ## Phase V — Divinity Integration: ~10 %
 
@@ -116,8 +121,8 @@ bounded queues).
 
 ## Known gaps worth scheduling
 
-1. Tabs and split panes (Phase IV), then panels and widgets extensions
-   can draw.
+1. Phase V: a real Gabriel connection, audio, desktop integration, the
+   Gallery and an SDK.
 2. Dirty-region rendering (spec §4.4).
 3. Measurements on real GPUs (everything so far ran on llvmpipe).
 4. Testing with real image tools (`kitten icat`, `chafa`, `img2sixel`,

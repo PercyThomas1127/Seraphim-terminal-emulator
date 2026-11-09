@@ -150,6 +150,11 @@ pub enum Command {
         id: String,
         place: String,
     },
+    /// Open a `[[layout]]` by name.
+    OpenLayout {
+        ext: String,
+        name: String,
+    },
 }
 
 impl Command {
@@ -171,7 +176,8 @@ impl Command {
             | Command::Reset { ext }
             | Command::RegisterPanel { ext, .. }
             | Command::PanelContent { ext, .. }
-            | Command::OpenPanel { ext, .. } => ext,
+            | Command::OpenPanel { ext, .. }
+            | Command::OpenLayout { ext, .. } => ext,
         }
     }
 }

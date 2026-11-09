@@ -2119,6 +2119,7 @@ impl Active {
                         }
                     }
                 }
+                Effect::OpenLayout(name) => self.open_layout(&name),
                 Effect::ClosePanels(ext) => {
                     let ids: Vec<u64> = self
                         .panels
