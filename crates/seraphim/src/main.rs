@@ -231,9 +231,36 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
     Ok(o)
 }
 
+/// Compile Seraphim's terminfo entry into ~/.terminfo with `tic`.
+fn install_terminfo() -> Result<(), String> {
+    const SOURCE: &str = include_str!("../../../extra/terminfo/xterm-seraphim.terminfo");
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let out = std::path::PathBuf::from(home).join(".terminfo");
+    let src = std::env::temp_dir().join(format!("xterm-seraphim-{}.terminfo", std::process::id()));
+    std::fs::write(&src, SOURCE).map_err(|e| e.to_string())?;
+    let status = std::process::Command::new("tic")
+        .arg("-x")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .map_err(|e| format!("tic (from ncurses) is needed: {e}"));
+    let _ = std::fs::remove_file(&src);
+    match status? {
+        s if s.success() => {
+            println!(
+                "Installed xterm-seraphim into {}; new sessions use TERM=xterm-seraphim.",
+                out.display()
+            );
+            Ok(())
+        }
+        s => Err(format!("tic failed ({s})")),
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim --install-terminfo\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),
@@ -241,6 +268,7 @@ fn main() -> ExitCode {
             println!("seraphim {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
+        Some("--install-terminfo") => install_terminfo().map(|_| ExitCode::SUCCESS),
         Some("--print-default-config") => {
             print!("{}", seraphim_config::DEFAULT_TOML);
             Ok(ExitCode::SUCCESS)

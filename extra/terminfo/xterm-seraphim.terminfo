@@ -1,0 +1,23 @@
+# Terminfo for Seraphim: xterm-256color plus what Seraphim also does.
+# Install with `seraphim --install-terminfo` (or `tic -x -o ~/.terminfo
+# xterm-seraphim.terminfo`); Seraphim then sets TERM=xterm-seraphim.
+#
+#   Tc, RGB         24-bit color (tmux, vim and others use it)
+#   Smulx, Su       curly/dotted/dashed underlines
+#   Setulc          underline color
+#   Ss, Se          cursor shape (DECSCUSR)
+#   Ms              set the clipboard (OSC 52)
+#   Sync            synchronized output (mode 2026)
+#   fullkbd         the Kitty keyboard protocol
+xterm-seraphim|Seraphim terminal,
+	Tc,
+	RGB,
+	Su,
+	fullkbd,
+	Smulx=\E[4:%p1%dm,
+	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m,
+	Ss=\E[%p1%d q,
+	Se=\E[2 q,
+	Ms=\E]52;%p1%s;%p2%s\007,
+	Sync=\E[?2026%?%p1%{1}%-%tl%eh%;,
+	use=xterm-256color,

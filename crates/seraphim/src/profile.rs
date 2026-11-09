@@ -94,6 +94,7 @@ pub fn options_from_config(
         extensions: c.extensions.clone(),
         cli_extensions: Vec::new(),
         tabs: c.tabs.clone(),
+        term: c.terminal.term.clone(),
         panes: c.panes.clone(),
         layouts: c.layout.clone(),
         startup_layout: c.startup_layout.clone(),

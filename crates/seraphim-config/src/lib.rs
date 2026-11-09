@@ -739,6 +739,9 @@ pub struct Window {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TerminalConfig {
+    /// `TERM` for new sessions: `auto` (xterm-seraphim when its terminfo
+    /// is installed, else xterm-256color) or a name.
+    pub term: String,
     pub scrollback: usize,
     /// Group emoji sequences and combining marks into single cells.
     pub grapheme_clustering: bool,
@@ -793,7 +796,7 @@ impl Default for Window {
 
 impl Default for TerminalConfig {
     fn default() -> Self {
-        TerminalConfig { scrollback: 10_000, grapheme_clustering: true }
+        TerminalConfig { term: "auto".into(), scrollback: 10_000, grapheme_clustering: true }
     }
 }
 

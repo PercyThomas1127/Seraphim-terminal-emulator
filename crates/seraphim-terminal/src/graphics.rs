@@ -712,8 +712,14 @@ impl Graphics {
         };
 
         // Continuation of a chunked transmission: only m (and q) matter.
+        // Clients such as `kitten icat` repeat `a=T` on every chunk, so (as
+        // in kitty) a transmit naming no other image continues the load.
         if let Some(mut l) = self.loading.take() {
-            if !cmd.explicit_action {
+            let continues = !cmd.explicit_action
+                || (matches!(cmd.action, b't' | b'T')
+                    && (cmd.id == 0 || cmd.id == l.cmd.id)
+                    && (cmd.number == 0 || cmd.number == l.cmd.number));
+            if continues {
                 l.feed(payload);
                 if cmd.more {
                     self.loading = Some(l);

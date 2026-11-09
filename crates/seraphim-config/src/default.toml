@@ -43,6 +43,11 @@ padding = 6.0
 menu_bar = false
 
 [terminal]
+# TERM for new sessions. "auto" uses xterm-seraphim (24-bit color in tmux,
+# undercurl, cursor shapes) once `seraphim --install-terminfo` has installed
+# it, else xterm-256color. Hosts you ssh into need the entry too (or use
+# term = "xterm-256color").
+term = "auto"
 # Lines of history kept per session.
 scrollback = 10000
 # Treat emoji sequences (flags, skin tones, ZWJ sequences like 👩‍💻, keycaps,

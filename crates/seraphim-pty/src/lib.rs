@@ -97,6 +97,46 @@ impl PtyCommand {
     }
 }
 
+/// Seraphim's own terminfo entry (see `extra/terminfo`).
+pub const TERMINFO_NAME: &str = "xterm-seraphim";
+
+/// Whether terminfo entry `name` is installed where ncurses looks.
+pub fn terminfo_installed(name: &str) -> bool {
+    let Some(first) = name.chars().next() else { return false };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(d) = std::env::var_os("TERMINFO") {
+        dirs.push(d.into());
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(h).join(".terminfo"));
+    }
+    if let Some(list) = std::env::var_os("TERMINFO_DIRS") {
+        dirs.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
+    }
+    for d in [
+        "/etc/terminfo",
+        "/lib/terminfo",
+        "/usr/share/terminfo",
+        "/usr/lib/terminfo",
+        "/usr/local/share/terminfo",
+    ] {
+        dirs.push(d.into());
+    }
+    // Linux uses the first letter as the subdirectory, macOS its hex code.
+    let subs = [first.to_string(), format!("{:x}", first as u32)];
+    dirs.iter().any(|d| subs.iter().any(|s| d.join(s).join(name).is_file()))
+}
+
+/// `TERM` for new sessions: Seraphim's entry when it is installed (24-bit
+/// color, undercurl, …), else the universally known `xterm-256color`.
+pub fn default_term() -> &'static str {
+    if terminfo_installed(TERMINFO_NAME) {
+        TERMINFO_NAME
+    } else {
+        "xterm-256color"
+    }
+}
+
 pub fn default_shell_path() -> OsString {
     if let Some(s) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) {
         return s;
@@ -147,7 +187,7 @@ impl Pty {
             command.env_remove(k);
         }
         command
-            .env("TERM", "xterm-256color")
+            .env("TERM", default_term())
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "seraphim")
             .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));

@@ -90,3 +90,17 @@ fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn finds_terminfo_entries() {
+    let d = std::env::temp_dir().join(format!("seraphim-ti-{}", std::process::id()));
+    std::fs::create_dir_all(d.join("x")).unwrap();
+    std::fs::create_dir_all(d.join("79")).unwrap();
+    std::fs::write(d.join("x/xterm-seraphim-test"), b"").unwrap();
+    std::fs::write(d.join("79/ylinux-hex"), b"").unwrap();
+    std::env::set_var("TERMINFO", &d);
+    assert!(seraphim_pty::terminfo_installed("xterm-seraphim-test"));
+    assert!(seraphim_pty::terminfo_installed("ylinux-hex"), "macOS-style hex directories");
+    assert!(!seraphim_pty::terminfo_installed("no-such-terminal"));
+    assert!(!seraphim_pty::terminfo_installed(""));
+}

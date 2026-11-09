@@ -392,3 +392,49 @@ fn images_follow_their_text_through_reflow() {
     t.resize(20, 6);
     assert_eq!(t.visible_images()[0].row, 1, "and back");
 }
+
+/// `kitten icat` (kitty 0.32) output for two images, recorded in
+/// Seraphim. It repeats `a=T,q=2` on every continuation chunk.
+#[test]
+fn kitten_icat_recording_shows_both_images() {
+    let bytes = include_bytes!("fixtures/kitten-icat-two-images.bin");
+    let mut t = Terminal::new(100, 34);
+    t.set_cell_pixel_size(9.0, 20.0);
+    t.advance(bytes);
+    let images: Vec<_> = t.graphics().images().collect();
+    let mut sizes: Vec<(u32, u32)> = images.iter().map(|i| (i.width, i.height)).collect();
+    sizes.sort();
+    assert_eq!(sizes, [(120, 120), (240, 160)], "the chunked PNG and the small one");
+    assert_eq!(t.visible_images().len(), 2);
+    let rows: Vec<i64> = t.visible_images().iter().map(|v| v.row).collect();
+    assert!(rows[0] != rows[1], "one below the other: {rows:?}");
+}
+
+/// chafa 1.14's Sixel output, decoded the same as ImageMagick does (the
+/// reference values below are from `convert sixel:chafa-sixel.six`).
+#[test]
+fn chafa_sixel_matches_imagemagick() {
+    let mut t = Terminal::new(100, 34);
+    t.set_cell_pixel_size(9.0, 20.0);
+    t.advance(include_bytes!("fixtures/chafa-sixel.six"));
+    let img = t.graphics().images().next().expect("an image");
+    assert_eq!((img.width, img.height), (243, 156));
+    let px = |x: u32, y: u32| {
+        let i = ((y * img.width + x) * 4) as usize;
+        [img.rgba[i], img.rgba[i + 1], img.rgba[i + 2]]
+    };
+    for (x, y, want) in [
+        (0, 0, [252, 51, 102]),
+        (120, 10, [240, 54, 110]),
+        (120, 80, [148, 77, 179]),
+        (60, 150, [56, 99, 250]),
+        (242, 80, [148, 77, 179]),
+        (10, 140, [69, 97, 240]),
+    ] {
+        let got = px(x, y);
+        assert!(
+            got.iter().zip(want).all(|(a, b)| (*a as i32 - b).abs() <= 2),
+            "({x},{y}): {got:?} vs {want:?}"
+        );
+    }
+}

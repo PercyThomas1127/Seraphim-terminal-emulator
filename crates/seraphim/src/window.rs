@@ -59,6 +59,8 @@ struct Pane {
 #[derive(Clone)]
 struct SpawnConfig {
     command: Command,
+    /// `terminal.term`.
+    term: String,
     scrollback: usize,
     grapheme_clustering: bool,
 }
@@ -120,6 +122,8 @@ pub struct WindowOptions {
     pub cli_extensions: Vec<std::path::PathBuf>,
     pub tabs: seraphim_config::Tabs,
     pub panes: seraphim_config::Panes,
+    /// `terminal.term`.
+    pub term: String,
     pub layouts: Vec<seraphim_config::Layout>,
     pub startup_layout: Option<String>,
     pub restore_session: bool,
@@ -198,6 +202,7 @@ impl Default for WindowOptions {
             cli_extensions: Vec::new(),
             tabs: Default::default(),
             panes: Default::default(),
+            term: "auto".into(),
             layouts: Vec::new(),
             startup_layout: None,
             restore_session: false,
@@ -574,6 +579,7 @@ impl App {
             last_focus: FIRST_PANE,
             spawn: SpawnConfig {
                 command,
+                term: o.term.clone(),
                 scrollback: o.scrollback,
                 grapheme_clustering: o.grapheme_clustering,
             },
@@ -835,6 +841,7 @@ impl App {
                 t.set_grapheme_clustering(o.grapheme_clustering);
             }
             a.spawn.scrollback = o.scrollback;
+            a.spawn.term = o.term.clone();
             a.spawn.grapheme_clustering = o.grapheme_clustering;
             a.tabs_cfg = o.tabs.clone();
             a.panes_cfg = o.panes.clone();
@@ -1258,6 +1265,9 @@ impl Active {
         let area = self.pane_area();
         let (cols, rows) = self.renderer.grid_size(area.w as u32, area.h as u32, self.pad);
         let mut command = command.unwrap_or_else(|| self.spawn.command.clone());
+        if self.spawn.term != "auto" && !self.spawn.term.is_empty() {
+            command = command.env("TERM", self.spawn.term.clone());
+        }
         if let Some(d) = cwd.filter(|d| d.is_dir()) {
             command = command.cwd(d);
         }
