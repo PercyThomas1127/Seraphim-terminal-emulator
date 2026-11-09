@@ -327,10 +327,16 @@ entry too, or set `terminal.term = "xterm-256color"`.
 Seraphim draws a frame only when something changed, and then rebuilds only
 the rows that changed and uploads only the bytes that differ. `seraphim
 bench` measures parser throughput, frame preparation and GPU frame times on
-your machine. `SERAPHIM_TIMING=1 seraphim` logs time to first frame and
-key-to-echo latency. Numbers so far, all from software rendering, are in
-[docs/benchmarks.md](docs/benchmarks.md); results from real GPUs are
-welcome there.
+your machine, and `seraphim bench --window` does the same in a real
+window, including time to first frame and key-to-echo latency.
+`SERAPHIM_TIMING=1 seraphim` logs those during normal use. Results
+(RTX 2060 Super, Radeon Pro WX 7100, software rendering) are in
+[docs/benchmarks.md](docs/benchmarks.md).
+
+With more than one GPU, pick one with `SERAPHIM_GPU`, giving any part of
+its name (`SERAPHIM_GPU=2060 seraphim`); `seraphim bench --list-gpus`
+shows the names. Seraphim uses Vulkan, and falls back to OpenGL only when
+no Vulkan GPU can draw to the window (`WGPU_BACKEND=gl` forces it).
 
 ### Configuration
 

@@ -48,7 +48,45 @@ struct Row {
     detail: String,
 }
 
-pub fn run(json: bool, frames: usize) -> Result<(), String> {
+/// `seraphim bench --list-gpus`.
+pub fn list_gpus() {
+    let all = seraphim_render::gpu::list();
+    if all.is_empty() {
+        println!("No GPU adapters found.");
+    }
+    for a in &all {
+        println!("{}", seraphim_render::gpu::describe(a));
+    }
+    println!();
+    println!("Choose one with SERAPHIM_GPU=<part of its name> (or bench --gpu). OpenGL");
+    println!("adapters are used only when no Vulkan one fits (or with WGPU_BACKEND=gl).");
+}
+
+/// `seraphim bench --window`: open a window with the built-in defaults
+/// (and an optional preset), running `cat`, and let the probe type into it.
+pub fn window(gpu: Option<String>, preset: Option<String>, keys: usize) -> Result<i32, String> {
+    if let Some(g) = &gpu {
+        // Read by the window's GPU setup; nothing else runs yet.
+        std::env::set_var(seraphim_render::gpu::ENV, g);
+    }
+    let (mut o, warnings) = crate::profile::load(None, None, preset.as_deref())?;
+    if let Some(w) = warnings.first() {
+        return Err(w.clone());
+    }
+    // `cat` in a fresh PTY: the kernel echoes each key, so this measures
+    // the terminal, not a shell's line editor.
+    o.command = Some(seraphim_session::Command::new("cat"));
+    o.probe = Some(keys.max(1));
+    // Animations keep running even if the window isn't focused.
+    o.visual.animate_unfocused = true;
+    o.restore_session = false;
+    o.startup_layout = None;
+    o.live_reload = false;
+    eprintln!("seraphim: bench --window: typing {keys} keys into `cat`, then closing");
+    crate::window::run(o)
+}
+
+pub fn run(json: bool, frames: usize, gpu: Option<&str>) -> Result<(), String> {
     let mut rows: Vec<Row> = Vec::new();
     let mut push = |name: &str, value: f64, unit: &'static str, detail: String| {
         rows.push(Row { name: name.into(), value, unit, detail });
@@ -71,7 +109,7 @@ pub fn run(json: bool, frames: usize) -> Result<(), String> {
 
     let fonts =
         Fonts::new(&FontConfig { family: None, size_px: 16.0 }).map_err(|e| e.to_string())?;
-    let mut h = Headless::new(fonts, Theme::default()).map_err(|e| e.to_string())?;
+    let mut h = Headless::with_gpu(fonts, Theme::default(), gpu).map_err(|e| e.to_string())?;
     let info = h.adapter_info.clone();
 
     // CPU: preparing frames.

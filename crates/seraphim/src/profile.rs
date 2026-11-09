@@ -100,6 +100,7 @@ pub fn options_from_config(
         startup_layout: c.startup_layout.clone(),
         restore_session: c.restore_session,
         cli_layout: None,
+        probe: None,
     };
     (o, warnings)
 }

@@ -163,6 +163,8 @@ pub struct Fonts {
     primary: [u16; 4],
     fallback: HashMap<(char, FontStyle), Option<GlyphKey>>,
     cluster_faces: HashMap<(String, FontStyle, bool), Option<u16>>,
+    /// Whether a system face has color glyphs (read once per face).
+    color_faces: HashMap<ID, bool>,
     shaper: ShapeContext,
     scale: ScaleContext,
     size_px: f32,
@@ -195,6 +197,7 @@ impl Fonts {
             primary: [0; 4],
             fallback: HashMap::new(),
             cluster_faces: HashMap::new(),
+            color_faces: HashMap::new(),
             shaper: ShapeContext::new(),
             scale: ScaleContext::new(),
             size_px: config.size_px.max(4.0),
@@ -353,24 +356,50 @@ impl Fonts {
         (glyph != 0).then_some(GlyphKey { face, glyph, bold, size: 0 })
     }
 
+    /// Whether face `id` has color glyphs: COLR, CBDT, sbix or SVG
+    /// tables. "Noto Emoji" is monochrome and often installed next to
+    /// "Noto Color Emoji"; the names alone don't tell them apart.
+    fn is_color(&mut self, id: ID) -> bool {
+        if let Some(c) = self.color_faces.get(&id) {
+            return *c;
+        }
+        const TABLES: [&[u8; 4]; 4] = [b"COLR", b"CBDT", b"sbix", b"SVG "];
+        let color = self
+            .db
+            .with_face_data(id, |data, index| {
+                FontRef::from_index(data, index as usize)
+                    .map(|f| TABLES.iter().any(|t| f.table(swash::tag_from_bytes(t)).is_some()))
+            })
+            .flatten()
+            .unwrap_or(false);
+        self.color_faces.insert(id, color);
+        color
+    }
+
     /// System faces in the order to try for `pref`.
-    fn candidates(&self, pref: Preference) -> Vec<ID> {
-        let family = |f: &fontdb::FaceInfo| {
-            f.families.first().map(|(n, _)| n.to_ascii_lowercase()).unwrap_or_default()
-        };
-        let mut c: Vec<(u8, ID)> = self
+    fn candidates(&mut self, pref: Preference) -> Vec<ID> {
+        let faces: Vec<(String, bool, ID)> = self
             .db
             .faces()
             .map(|f| {
-                let name = family(f);
+                let name =
+                    f.families.first().map(|(n, _)| n.to_ascii_lowercase()).unwrap_or_default();
+                (name, f.monospaced, f.id)
+            })
+            .collect();
+        let mut c: Vec<(u8, ID)> = faces
+            .into_iter()
+            .map(|(name, monospaced, id)| {
                 let rank = match pref {
                     Preference::Symbol if name.contains("nerd") && name.contains("mono") => 0,
                     Preference::Symbol if name.contains("nerd") => 1,
-                    Preference::Emoji if name.contains("emoji") => 0,
-                    _ if f.monospaced => 2,
+                    // Color emoji fonts first, then monochrome ones.
+                    Preference::Emoji if name.contains("emoji") && self.is_color(id) => 0,
+                    Preference::Emoji if name.contains("emoji") => 1,
+                    _ if monospaced => 2,
                     _ => 3,
                 };
-                (rank, f.id)
+                (rank, id)
             })
             .collect();
         c.sort_by_key(|x| x.0);

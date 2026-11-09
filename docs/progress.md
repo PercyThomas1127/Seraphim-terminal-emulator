@@ -110,7 +110,7 @@ decorations, custom tab designs beyond the label format.
 | Area | Status |
 |---|---|
 | Reliability | Shader, image and video failures are contained and reported |
-| Performance | Parity with alacritty's parser; frames drawn only when something changes; frame pacing for animations; partial redraws (only changed rows are rebuilt, only changed bytes uploaded; `docs/benchmarks.md`). **Gap:** no real-GPU measurements yet |
+| Performance | Parity with alacritty's parser; frames drawn only when something changes; frame pacing for animations; partial redraws (only changed rows are rebuilt, only changed bytes uploaded; `docs/benchmarks.md`). **Gap:** measured on two desktop GPUs under X11 only |
 | Isolation, responsiveness | Scripts on their own thread, sandboxed, budgeted; they send commands and never block rendering or I/O |
 | Accessibility | Reduced motion everywhere, font zoom; no contrast checks yet |
 | Compatibility | xterm conformance suite, vttest, golden screens |
@@ -123,8 +123,8 @@ decorations, custom tab designs beyond the label format.
 
 1. Phase V: a real Gabriel connection, audio, desktop integration, the
    Gallery and an SDK.
-2. Measurements on real GPUs: `seraphim bench --json` and
-   `SERAPHIM_TIMING=1` are ready; the development container has no GPU
-   (`docs/benchmarks.md`).
+2. More hardware: measured so far on an RTX 2060 Super and a Radeon Pro
+   WX 7100 under X11 (`docs/benchmarks.md`). Not yet: Wayland, Intel
+   GPUs, laptops (integrated + discrete), high-refresh displays.
 3. WebAssembly extensions for untrusted Gallery code (ADR 0005), with the
    Gallery itself (Phase V).

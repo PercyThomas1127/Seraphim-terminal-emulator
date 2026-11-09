@@ -75,28 +75,67 @@ struct Timing {
     echoed: bool,
     /// Key → frame showing the response, in milliseconds.
     samples: Vec<f64>,
+    /// Time spent drawing and presenting each frame, in milliseconds.
+    draw_ms: Vec<f64>,
+    /// When the first and the latest frame were presented.
+    span: Option<(Instant, Instant)>,
+}
+
+fn quantile(sorted: &[f64], q: f64) -> f64 {
+    sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)]
 }
 
 impl Timing {
     fn report(&self) {
         let mut v = self.samples.clone();
-        if v.is_empty() {
-            return;
+        if !v.is_empty() {
+            v.sort_by(|a, b| a.total_cmp(b));
+            eprintln!(
+                "seraphim: timing: key press to the frame with its echo presented, over {} keys: median {:.1} ms, p95 {:.1} ms, max {:.1} ms (includes the program's echo; waiting for vsync and the compositor come on top)",
+                v.len(),
+                quantile(&v, 0.5),
+                quantile(&v, 0.95),
+                v[v.len() - 1]
+            );
         }
-        v.sort_by(|a, b| a.total_cmp(b));
-        let at = |q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
-        eprintln!(
-            "seraphim: timing: key press to echo on screen over {} keys: median {:.1} ms, p95 {:.1} ms, max {:.1} ms (includes the shell's echo)",
-            v.len(),
-            at(0.5),
-            at(0.95),
-            v[v.len() - 1]
-        );
+        let mut d = self.draw_ms.clone();
+        if let (false, Some((first, last))) = (d.is_empty(), self.span) {
+            d.sort_by(|a, b| a.total_cmp(b));
+            let secs = (last - first).as_secs_f64();
+            let rate = if secs > 0.0 { (d.len() - 1) as f64 / secs } else { 0.0 };
+            eprintln!(
+                "seraphim: timing: {} frames over {:.1} s ({:.0} per second); drawing and presenting a frame: median {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+                d.len(),
+                secs,
+                rate,
+                quantile(&d, 0.5),
+                quantile(&d, 0.95),
+                d[d.len() - 1]
+            );
+        }
     }
+}
+
+/// `seraphim bench --window`: Seraphim types into its own terminal, as a
+/// key press would, and measures how long the echo takes to reach the
+/// screen. No input is synthesized for the desktop, so nothing outside the
+/// window can receive it.
+struct Probe {
+    /// Keys still to send.
+    left: usize,
+    sent: usize,
+    next: Option<Instant>,
 }
 
 /// When the process started (set by `main`).
 pub static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// With timing on, log how far startup has got (`SERAPHIM_TIMING`).
+fn phase(on: bool, what: &str) {
+    if let (true, Some(s)) = (on, STARTED.get()) {
+        eprintln!("seraphim: timing: {what} at {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
+    }
+}
 
 /// Renderer slot for pane dividers and dimming.
 const DECOR_SLOT: u64 = u64::MAX;
@@ -162,6 +201,8 @@ pub struct WindowOptions {
     pub restore_session: bool,
     /// `--layout`: open this instead of the startup layout or session.
     pub cli_layout: Option<String>,
+    /// `seraphim bench --window`: type this many keys, then close.
+    pub probe: Option<usize>,
 }
 
 impl WindowOptions {
@@ -240,6 +281,7 @@ impl Default for WindowOptions {
             startup_layout: None,
             restore_session: false,
             cli_layout: None,
+            probe: None,
         }
     }
 }
@@ -399,6 +441,7 @@ struct Active {
     /// Pane rectangles drawn this frame.
     drawn: Vec<(u64, Rect)>,
     timing: Option<Timing>,
+    probe: Option<Probe>,
     /// Click targets in the tab bar.
     tab_hits: crate::tabbar::Hits,
     /// A divider being dragged.
@@ -521,6 +564,8 @@ fn font_px(points: f32, scale: f64) -> f32 {
 impl App {
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<Active, String> {
         let o = &self.options;
+        let timed = o.probe.is_some() || std::env::var_os("SERAPHIM_TIMING").is_some();
+        phase(timed, "event loop running");
         let scale = event_loop.primary_monitor().map(|m| m.scale_factor()).unwrap_or(1.0);
         let fonts = Fonts::new(&FontConfig {
             family: o.font_family.clone(),
@@ -543,12 +588,15 @@ impl App {
                 (m.width * 10.0) as u32,
                 (m.height * 3.0) as u32,
             ));
+        phase(timed, "fonts loaded");
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
+        phase(timed, "window created");
         window.set_ime_allowed(true);
         window.set_cursor(CursorIcon::Text);
         let scale = window.scale_factor();
 
         let gpu = init_gpu(event_loop, window.clone(), o.visual.window_opacity < 1.0)?;
+        phase(timed, "GPU device ready");
         let mut renderer = Renderer::new(&gpu.device, gpu.config.format, fonts, o.theme.clone());
         if (font_px(o.font_size, scale) - renderer.fonts().size_px()).abs() > 0.1 {
             renderer.set_fonts(self.fonts_for(scale)?);
@@ -562,6 +610,7 @@ impl App {
         let (cols, rows) =
             renderer.grid_size(inner.width, inner.height.saturating_sub(bar).max(1), pad);
 
+        phase(timed, "renderers built");
         let bus = EventBus::new();
         let proxy = self.proxy.clone();
         let notify = Notifier(Arc::new(move || {
@@ -623,7 +672,9 @@ impl App {
             panes_cfg: o.panes.clone(),
             base_profile: o.profile.clone(),
             drawn: Vec::new(),
-            timing: std::env::var_os("SERAPHIM_TIMING").is_some().then(Timing::default),
+            timing: (std::env::var_os("SERAPHIM_TIMING").is_some() || o.probe.is_some())
+                .then(Timing::default),
+            probe: o.probe.map(|left| Probe { left, sent: 0, next: None }),
             tab_hits: Default::default(),
             drag: None,
             tab_drag: None,
@@ -701,6 +752,7 @@ impl App {
         }
         active.extension_list = active.scripts.installed.clone();
         active.rebuild_menu();
+        phase(timed, "shell started, scene built");
         Ok(active)
     }
 
@@ -994,16 +1046,31 @@ fn init_gpu(
     window: Arc<Window>,
     transparent: bool,
 ) -> Result<Gpu, String> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
-        Box::new(event_loop.owned_display_handle()),
-    ));
-    let surface = instance.create_surface(window.clone()).map_err(|e| e.to_string())?;
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::LowPower,
-        compatible_surface: Some(&surface),
-        ..Default::default()
-    }))
-    .map_err(|e| format!("no usable GPU adapter: {e}"))?;
+    use seraphim_render::gpu;
+    // Native APIs first, OpenGL only if none fits (gpu::tiers).
+    let open = |wanted: Option<&str>| {
+        gpu::first_tier(|backends| {
+            let mut desc = wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
+                event_loop.owned_display_handle(),
+            ));
+            desc.backends = backends;
+            let instance = wgpu::Instance::new(desc);
+            let surface = instance.create_surface(window.clone()).map_err(|e| e.to_string())?;
+            let adapter = gpu::choose(&instance, Some(&surface), wanted)?;
+            Ok((surface, adapter))
+        })
+    };
+    // SERAPHIM_GPU picks a GPU on machines with several; if it names one
+    // that can't draw here, say so and let wgpu choose.
+    let wanted = gpu::from_env();
+    let (surface, adapter) = match open(wanted.as_deref()) {
+        Ok(r) => r,
+        Err(e) if wanted.is_some() => {
+            eprintln!("seraphim: {e}; using the default GPU");
+            open(None)?
+        }
+        Err(e) => return Err(e),
+    };
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("seraphim"),
         required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
@@ -3146,6 +3213,37 @@ impl ApplicationHandler<UserEvent> for App {
         let now = Instant::now();
         let mut wake: Option<Instant> = None;
 
+        // bench --window: one key at a time, the next once its echo is on
+        // screen, at uneven intervals so samples fall at different points
+        // of the display's refresh cycle.
+        if let (Some(p), Some(t)) = (&mut a.probe, &mut a.timing) {
+            if t.first_frame {
+                // Let the program start first.
+                let due = *p.next.get_or_insert(now + Duration::from_millis(800));
+                // An echo that never came (shouldn't happen) doesn't stall it.
+                if t.key_at.is_some_and(|k| now - k > Duration::from_secs(1)) {
+                    t.key_at = None;
+                }
+                if now >= due && t.key_at.is_none() {
+                    if p.left == 0 {
+                        event_loop.exit();
+                        return;
+                    }
+                    p.left -= 1;
+                    p.sent += 1;
+                    p.next = Some(now + Duration::from_millis(40 + (p.sent as u64 * 7) % 23));
+                    t.key_at = Some(now);
+                    t.echoed = false;
+                    let key = [b'a' + (p.sent % 26) as u8];
+                    a.renderer.key_pressed();
+                    a.write(&key);
+                }
+                if let Some(n) = a.probe.as_ref().and_then(|p| p.next) {
+                    wake = Some(wake.map_or(n, |w| w.min(n)));
+                }
+            }
+        }
+
         if let Some(since) = a.sync_since {
             if now >= since + SYNC_TIMEOUT {
                 a.sync_since = None;
@@ -3264,6 +3362,7 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn draw(a: &mut Active) {
+    let started = Instant::now();
     let (w, h) = (a.gpu.config.width, a.gpu.config.height);
     a.visual.prepare(w, h);
     // Premultiplied background at the window opacity (1 = opaque).
@@ -3337,6 +3436,8 @@ fn draw(a: &mut Active) {
     a.gpu.queue.present(frame);
     if let Some(t) = &mut a.timing {
         let now = Instant::now();
+        t.draw_ms.push((now - started).as_secs_f64() * 1e3);
+        t.span = Some((t.span.map_or(now, |s| s.0), now));
         if !t.first_frame {
             t.first_frame = true;
             if let Some(s) = STARTED.get() {

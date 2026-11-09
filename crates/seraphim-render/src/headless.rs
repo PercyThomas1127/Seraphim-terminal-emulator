@@ -54,17 +54,20 @@ pub struct Headless {
 }
 
 impl Headless {
-    /// Acquire any adapter (hardware or software, e.g. lavapipe).
+    /// Acquire any adapter (hardware or software, e.g. lavapipe), or the
+    /// one `SERAPHIM_GPU` names.
     pub fn new(fonts: Fonts, theme: Theme) -> Result<Headless, HeadlessError> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            ..Default::default()
-        }))
-        .map_err(|e| HeadlessError(format!("no GPU adapter: {e}")))?;
+        Headless::with_gpu(fonts, theme, crate::gpu::from_env().as_deref())
+    }
+
+    /// Like [`Headless::new`], on the GPU `wanted` names (see
+    /// [`crate::gpu::choose`]).
+    pub fn with_gpu(
+        fonts: Fonts,
+        theme: Theme,
+        wanted: Option<&str>,
+    ) -> Result<Headless, HeadlessError> {
+        let (_instance, adapter) = crate::gpu::choose_headless(wanted).map_err(HeadlessError)?;
         let adapter_info = adapter.get_info();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("seraphim headless"),

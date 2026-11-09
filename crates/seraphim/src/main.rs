@@ -10,9 +10,16 @@
 //!     --extension also loads an extension folder or .lua file (with the
 //!     grants of its [extensions.NAME] entry). --layout opens a [[layout]].
 //!
-//! seraphim bench [--json] [--frames N]
+//! seraphim bench [--json] [--frames N] [--gpu NAME]
 //!     Measure parser throughput, frame preparation and GPU frame times on
 //!     this machine (no window needed).
+//!
+//! seraphim bench --window [--keys N] [--preset NAME] [--gpu NAME]
+//!     Open a window, type N keys into it (as key presses would) and report
+//!     time to first frame, key-to-echo latency and frame times.
+//!
+//! seraphim bench --list-gpus
+//!     List GPUs; SERAPHIM_GPU=NAME (any part of a name) picks one.
 //!
 //! seraphim --print-default-config
 //!     Print the documented default configuration file.
@@ -266,7 +273,7 @@ fn install_terminfo() -> Result<(), String> {
 fn main() -> ExitCode {
     let _ = window::STARTED.set(std::time::Instant::now());
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim --install-terminfo\n       seraphim bench [--json] [--frames N]\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
+    let usage = "usage: seraphim [--config PATH] [--profile NAME] [--preset NAME] [--font FAMILY] [--font-size PT] [--cols N] [--rows N] [--allow-clipboard-read] [--extension PATH]... [--layout NAME] [-e PROGRAM [ARGS...]]\n       seraphim --print-default-config\n       seraphim --install-terminfo\n       seraphim bench [--json] [--frames N] [--gpu NAME] | --window [--keys N] [--preset NAME] | --list-gpus\n       seraphim run [--cols N] [--rows N] [--timeout S] [--events] -- PROGRAM [ARGS...]\n       seraphim replay [--cols N] [--rows N] FILE";
     let result = match args.first().map(String::as_str) {
         Some("run") => parse(&args[1..]).and_then(run),
         Some("replay") => parse(&args[1..]).and_then(replay),
@@ -275,13 +282,22 @@ fn main() -> ExitCode {
             Ok(ExitCode::SUCCESS)
         }
         Some("bench") => {
+            let value = |name: &str| {
+                args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+            };
             let json = args.iter().any(|a| a == "--json");
-            let frames = args
-                .iter()
-                .position(|a| a == "--frames")
-                .and_then(|i| args.get(i + 1)?.parse().ok())
-                .unwrap_or(120);
-            bench::run(json, frames).map(|_| ExitCode::SUCCESS)
+            let frames = value("--frames").and_then(|v| v.parse().ok()).unwrap_or(120);
+            let gpu = value("--gpu").or_else(seraphim_render::gpu::from_env);
+            if args.iter().any(|a| a == "--list-gpus") {
+                bench::list_gpus();
+                Ok(ExitCode::SUCCESS)
+            } else if args.iter().any(|a| a == "--window") {
+                let keys = value("--keys").and_then(|v| v.parse().ok()).unwrap_or(200);
+                bench::window(gpu, value("--preset"), keys)
+                    .map(|code| ExitCode::from(code.clamp(0, 255) as u8))
+            } else {
+                bench::run(json, frames, gpu.as_deref()).map(|_| ExitCode::SUCCESS)
+            }
         }
         Some("--install-terminfo") => install_terminfo().map(|_| ExitCode::SUCCESS),
         Some("--print-default-config") => {

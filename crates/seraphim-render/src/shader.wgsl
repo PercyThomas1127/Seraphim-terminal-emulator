@@ -12,6 +12,9 @@ struct Globals {
 @group(0) @binding(1) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;        // nearest: 1:1 text
 @group(0) @binding(3) var atlas_sampler_linear: sampler; // scaled emoji
+// The atlas again, for the linear sampler: OpenGL pairs each texture
+// binding with one sampler, so one texture can't be read through two.
+@group(0) @binding(4) var atlas_tex_linear: texture_2d<f32>;
 
 struct Instance {
     @location(0) rect: vec4<f32>,   // x, y, w, h in pixels
@@ -47,7 +50,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Sample unconditionally (uniform control flow), then select.
     let texel = textureSample(atlas_tex, atlas_sampler, in.uv);
-    let smooth_texel = textureSample(atlas_tex, atlas_sampler_linear, in.uv);
+    let smooth_texel = textureSample(atlas_tex_linear, atlas_sampler_linear, in.uv);
     if in.kind == 1u {
         let a = texel.a * in.color.a;
         return vec4<f32>(in.color.rgb * a, a);

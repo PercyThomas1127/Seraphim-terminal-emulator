@@ -4,10 +4,17 @@
 
 ```bash
 cargo build --release
-./target/release/seraphim bench          # report
-./target/release/seraphim bench --json   # the same, to save or compare
-SERAPHIM_TIMING=1 ./target/release/seraphim   # startup and input latency (on exit)
+./target/release/seraphim bench --list-gpus        # which GPUs Seraphim sees
+./target/release/seraphim bench --gpu 2060         # report, on that GPU
+./target/release/seraphim bench --gpu 2060 --json  # the same, to save or compare
+./target/release/seraphim bench --window --gpu 2060  # a real window (below)
+SERAPHIM_TIMING=1 ./target/release/seraphim        # timings of normal use (on exit)
 ```
+
+On a machine with more than one GPU, say which to measure: `--gpu` (or
+`SERAPHIM_GPU`, which Seraphim itself also reads) takes any part of the
+GPU's name. Without it, wgpu picks the low-power adapter, which on a
+desktop with two cards may not be the one you meant.
 
 `seraphim bench` needs no window. It measures:
 
@@ -21,12 +28,23 @@ SERAPHIM_TIMING=1 ./target/release/seraphim   # startup and input latency (on ex
   blur. This is wall time from recording to the GPU finishing, so it
   includes the driver.
 
-`SERAPHIM_TIMING=1` logs, in a real window:
+`seraphim bench --window [--keys N] [--preset NAME]` opens a window with
+the built-in defaults, running `cat`. It types N keys (200 by default)
+into it through the same path a key press takes, one at a time, at uneven
+intervals so the samples land at different points of the display's
+refresh. Then it closes and reports:
 
-* the time from process start to the first frame presented;
-* when Seraphim exits, key-press-to-echo latency: from Seraphim receiving
-  a key to presenting the frame with the shell's response, so it includes
-  the shell. Keyboard, compositor and display latency come on top.
+* startup phases and the time from process start to the first frame;
+* key to echo: from Seraphim handling the key to presenting the frame
+  that shows the echo. With `cat`, the kernel does the echo, so this is
+  the terminal's own share. **Waiting for vsync (up to one refresh) and
+  the compositor (usually about one more) come on top**, and so do the
+  keyboard and the display;
+* frames presented, and the time to draw and present one.
+
+No input is synthesized for the desktop, so nothing outside the window
+can receive it. `SERAPHIM_TIMING=1` logs the same timings during normal
+use (key to echo then includes your shell).
 
 ## Results
 
@@ -55,16 +73,97 @@ nothing.
 
 On software rendering, text stays fast. Full-window animated shaders are
 expensive, because each pixel runs on the CPU. `visual.max_fps`, pausing
-when unfocused, and `reduced_motion` keep them in check. A GPU is expected
-to run the shader scenes orders of magnitude faster, but **no GPU numbers
-have been measured yet**.
+when unfocused, and `reduced_motion` keep them in check. A GPU runs them 25 to 50 times faster (below).
 
-### Real GPUs
+### RTX 2060 Super and Radeon Pro WX 7100, KDE Plasma on X11
 
-Not measured yet. To add a row, run `seraphim bench --json` on the machine
-and note the GPU, the driver, the display server, and the
-`SERAPHIM_TIMING` startup and latency lines.
+Measured November 2026, release build.
 
-| GPU | Driver | Text frame | Aurora | Heavens | Blur | First frame | Key → echo |
-|---|---|---|---|---|---|---|---|
-| — | — | — | — | — | — | — | — |
+* **Machine:** Ryzen 5 3600X, 32 GB, Gentoo, Linux 6.18.
+* **GPUs:** a GeForce RTX 2060 Super (NVIDIA 595.104.02) and a Radeon Pro
+  WX 7100 (Mesa 26.1.8, RADV).
+* **Display:** one 1920×1080 monitor at 75 Hz, on the Radeon. The 2060
+  Super has no monitor attached, so its windows reach the screen through
+  PRIME render offload.
+
+The frame size is 2008×1148 here, rather than 1268 high as above, because
+this machine's default font has a shorter line height.
+
+| Measurement | RTX 2060 Super | Radeon Pro WX 7100 |
+|---|---|---|
+| Frame 2008×1148, text only | 0.05 ms | 0.11 ms |
+| … over a gradient | 0.10 ms | 0.19 ms |
+| … over the aurora shader | 1.05 ms (~950 fps) | 1.70 ms (p95 5.1) |
+| … over the heavens shader | 1.37 ms (~730 fps) | 2.67 ms (p95 5.8) |
+| … aurora with backdrop blur | 1.37 ms (~730 fps) | 2.70 ms (p95 7.6) |
+| First frame after start | 329 ms | 205 ms |
+| Key to echo frame presented, median / p95 | 0.3 / 0.4 ms | 0.3 / 0.5 ms |
+| Drawing and presenting a frame (window) | 0.18 ms; 0.25 with heavens | 0.22 ms |
+
+* **Repeatability:** three 300-frame runs on the 2060 Super agreed within
+  1 %. Its frame p95 is within 3 % of the median; the Radeon's is 2–3×
+  its median.
+* **CPU-side numbers** are the same on both GPUs. The parser does
+  55 MiB/s on this CPU (87 on the development container's). Preparing a
+  frame takes 10/15/18 µs at 80×24 and 36/44/46 µs at 200×60 (unchanged
+  frame, one line changed, scroll).
+* **Rates in the window:** 64 frames a second while typing (each echo,
+  plus the cursor gliding to its new place). With `heavens`, 39: the
+  preset caps animation at 30 fps, and each echo is drawn at once, outside
+  that cap.
+* **What a key costs on screen:** Seraphim's share is under half a
+  millisecond on either GPU. At 75 Hz, vsync adds up to 13.3 ms, and
+  KWin's compositing adds about one more refresh.
+
+**Startup** to the first frame, by phase (medians of 5 runs):
+
+| Phase | 2060 Super | Radeon |
+|---|---|---|
+| Event loop running | 12 ms | 13 ms |
+| Fonts loaded (scanning system fonts) | +54 ms | +55 ms |
+| Window created | +0.4 ms | +0.8 ms |
+| GPU ready (Vulkan, adapter, device) | +187 ms | +71 ms |
+| Renderers and shaders built | +56 ms | +55 ms |
+| Shell started, scene built | +8 ms | +4 ms |
+| First frame presented | +11 ms, **329 ms in all** | +7 ms, **205 ms in all** |
+
+Most of the 2060 Super's extra startup time is NVIDIA's driver creating
+the device, about 150 ms, which Seraphim can't change. Scanning system
+fonts (about 55 ms) and building shader pipelines (about 55 ms) are the
+next largest costs, and both could be cached between runs.
+
+Found while measuring here, and fixed:
+
+* **Seraphim used the Radeon by default.** wgpu's low-power choice between
+  two discrete cards is the first one, so the 2060 Super was never used.
+  `SERAPHIM_GPU` (any part of a GPU's name) now chooses, for both windows
+  and the benchmark, and `--list-gpus` shows the names.
+* **OpenGL was started on every launch**, as well as Vulkan, and listing
+  GPUs brought it up on both cards. Vulkan is now tried first and OpenGL
+  only when no Vulkan GPU fits. The first frame comes about 100 ms sooner
+  on the 2060 Super (424 → 329 ms) and 30 ms sooner on the Radeon
+  (235 → 205 ms).
+* **Seraphim crashed in an OpenGL window.** The text shader read the glyph
+  atlas through two samplers, which OpenGL can't do. It now has a binding
+  per sampler, and the pixel tests pass under OpenGL (Mesa, Radeon).
+* **Color emoji could come out black and white.** With "Noto Emoji"
+  (monochrome) installed next to "Noto Color Emoji", either could be
+  chosen. Fonts with color glyph tables (COLR, CBDT, sbix, SVG) now come
+  first.
+
+Known: windowless OpenGL on the 2060 Super fails ("parent device is lost"
+from NVIDIA's EGL). Windows are unaffected: an OpenGL window draws on the
+screen's GPU, and Vulkan is the default anyway. To run the benchmark under
+OpenGL on Mesa: `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json WGPU_BACKEND=gl`.
+
+### Adding a machine
+
+Run `seraphim bench --json --gpu NAME` and `seraphim bench --window --gpu
+NAME`, and note the GPU, driver, display server, monitor refresh rate and
+the CPU.
+
+| GPU | Driver | Display | Text frame | Aurora | Heavens | Blur | First frame | Key → echo frame |
+|---|---|---|---|---|---|---|---|---|
+| RTX 2060 Super | NVIDIA 595.104.02 | X11 (KWin), PRIME, 75 Hz | 0.05 ms | 1.05 ms | 1.37 ms | 1.37 ms | 329 ms | 0.3 ms |
+| Radeon Pro WX 7100 | Mesa 26.1.8 RADV | X11 (KWin), 75 Hz | 0.11 ms | 1.70 ms | 2.67 ms | 2.70 ms | 205 ms | 0.3 ms |
+| llvmpipe (software) | Mesa 25.2.8 | Xvfb | 2.3 ms | 34 ms | 51 ms | 72 ms | 136 ms | 1.2 ms (bash) |
