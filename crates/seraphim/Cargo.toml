@@ -25,3 +25,8 @@ serde_json.workspace = true
 serde.workspace = true
 unicode-width.workspace = true
 toml_edit = "0.25"
+
+# X11: the window's background color (what X shows in a newly uncovered
+# area before Seraphim's next frame). winit already loads libX11.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+x11-dl = "2.21"

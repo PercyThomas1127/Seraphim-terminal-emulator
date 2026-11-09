@@ -2208,6 +2208,7 @@ dependencies = [
  "unicode-width",
  "wgpu",
  "winit",
+ "x11-dl",
 ]
 
 [[package]]

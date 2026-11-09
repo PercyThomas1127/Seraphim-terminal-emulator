@@ -599,6 +599,7 @@ impl App {
         );
         phase(timed, "fonts loaded");
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
+        set_window_background(&window, o.theme.background, o.visual.window_opacity < 1.0);
         phase(timed, "window created");
         window.set_ime_allowed(true);
         window.set_cursor(CursorIcon::Text);
@@ -921,6 +922,11 @@ impl App {
         };
         let a = self.active.as_mut().unwrap();
         a.renderer.set_theme(o.theme.clone());
+        set_window_background(
+            &a.window,
+            o.theme.background,
+            self.options.visual.window_opacity < 1.0,
+        );
         a.renderer.set_cursor_effects(o.cursor_effects());
         a.overlay.set_theme(o.theme.clone());
         a.menu.close();
@@ -1050,6 +1056,39 @@ impl App {
     }
 }
 
+/// On X11, give the window a background color: X paints it into any part
+/// of the window that has nothing drawn yet, such as the area a resize
+/// uncovers before Seraphim's next frame. Without one (winit sets none),
+/// that area shows leftover memory: random noise while resizing. Skipped
+/// for transparent windows, whose 32-bit visual takes pixels differently.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+fn set_window_background(window: &Window, rgb: [u8; 3], transparent: bool) {
+    use winit::raw_window_handle::{
+        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    };
+    if transparent {
+        return;
+    }
+    let (Ok(w), Ok(d)) = (window.window_handle(), window.display_handle()) else { return };
+    let (RawWindowHandle::Xlib(w), RawDisplayHandle::Xlib(d)) = (w.as_raw(), d.as_raw()) else {
+        return; // Wayland: the compositor never shows undrawn areas.
+    };
+    let Some(display) = d.display else { return };
+    let Ok(xlib) = x11_dl::xlib::Xlib::open() else { return };
+    // A 24-bit TrueColor visual: the pixel is 0xRRGGBB.
+    let pixel = (rgb[0] as u64) << 16 | (rgb[1] as u64) << 8 | rgb[2] as u64;
+    // SAFETY: winit's live Xlib display and window, on the event loop's
+    // thread; Xlib copies the values.
+    unsafe {
+        let dpy = display.as_ptr() as *mut x11_dl::xlib::Display;
+        (xlib.XSetWindowBackground)(dpy, w.window, pixel as _);
+        (xlib.XFlush)(dpy);
+    }
+}
+
+#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))))]
+fn set_window_background(_window: &Window, _rgb: [u8; 3], _transparent: bool) {}
+
 fn init_gpu(
     event_loop: &ActiveEventLoop,
     window: Arc<Window>,
@@ -1086,6 +1125,25 @@ fn init_gpu(
         ..Default::default()
     }))
     .map_err(|e| e.to_string())?;
+    // A GPU error must not take the shells down with it (spec §13: visual
+    // crashes must not crash terminal sessions). wgpu's default panics;
+    // log instead. The frame it happened in may look wrong; the next one
+    // starts afresh.
+    device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The first few in full, then a reminder now and then.
+        if n < 5 || n.is_power_of_two() {
+            let first = e
+                .to_string()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" / ");
+            eprintln!("seraphim: GPU error #{} (ignored, Seraphim keeps running): {first}", n + 1);
+        }
+    }));
     let size = window.inner_size();
     let mut config = surface
         .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -3378,10 +3436,15 @@ fn draw(a: &mut Active) {
     let mut clear = a.renderer.clear_color();
     let alpha = a.visual_cfg.window_opacity.clamp(0.0, 1.0) as f64;
     clear = wgpu::Color { r: clear.r * alpha, g: clear.g * alpha, b: clear.b * alpha, a: alpha };
+    // A suboptimal frame (the window is being resized and the surface no
+    // longer matches it) is still drawn and presented; the surface is
+    // reconfigured afterwards. Reconfiguring while holding the frame is an
+    // error, which used to crash Seraphim mid-resize.
+    let mut reconfigure = false;
     let frame = match a.gpu.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(f) => f,
         wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-            a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
+            reconfigure = true;
             f
         }
         wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -3443,6 +3506,9 @@ fn draw(a: &mut Active) {
     a.gpu.queue.submit([encoder.finish()]);
     a.window.pre_present_notify();
     a.gpu.queue.present(frame);
+    if reconfigure {
+        a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
+    }
     if let Some(t) = &mut a.timing {
         let now = Instant::now();
         t.draw_ms.push((now - started).as_secs_f64() * 1e3);
