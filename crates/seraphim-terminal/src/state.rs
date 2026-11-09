@@ -363,6 +363,44 @@ impl State {
 
     // ---- resize --------------------------------------------------------
 
+    /// Erase the line the cursor is on (every row of it, if it wrapped),
+    /// keeping its rows and the cursor's row. Used before a resize while a
+    /// shell waits at its prompt. The shell then redraws its prompt line:
+    /// readline (and zle, fish) moves up as many rows as the line took at
+    /// the old width, clears them and redraws. Reflowing the old copy to
+    /// the new width would change that number of rows and leave pieces of
+    /// prompts behind; blank rows keep their count through the reflow.
+    /// Primary screen only.
+    pub fn clear_prompt_line(&mut self) {
+        if self.alt_active {
+            return;
+        }
+        let cur = self.cursor.row.min(self.rows - 1);
+        let mut start = cur;
+        while start > 0 && self.primary.row(start - 1).wrapped {
+            start -= 1;
+        }
+        let mut end = cur;
+        while end + 1 < self.rows && self.primary.row(end).wrapped {
+            end += 1;
+        }
+        if start == 0 {
+            // The line began in history: it ends there now.
+            if let Some(last) = self.scrollback.back_mut() {
+                last.wrapped = false;
+            }
+        }
+        let cols = self.cols;
+        for r in start..=end {
+            *self.primary.row_mut(r) = Row::new(cols, &Attrs::default());
+            self.content_changed(r);
+        }
+        // Column 0: the shell returns there first anyway, and a column past
+        // the new width would make the blank row wrap into two.
+        self.cursor.col = 0;
+        self.cursor.pending_wrap = false;
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         if cols == self.cols && rows == self.rows {
             return;
@@ -381,6 +419,10 @@ impl State {
         } else {
             (self.cursor.row, self.cursor.col, self.cursor.pending_wrap)
         };
+        // Nothing on the old screen below the cursor (a shell at its prompt
+        // at the bottom, typically): the cursor then keeps its screen row.
+        let nothing_below = (pcur_row + 1..old_rows.min(self.primary.rows()))
+            .all(|r| self.primary.row(r).cells.iter().all(|c| *c == Cell::default()));
         let history = self.scrollback.len();
         let mut all: Vec<Row> = self.scrollback.drain(..).collect();
         all.extend(self.primary.take_lines());
@@ -405,6 +447,12 @@ impl State {
         }
         let total = lines.len();
         let mut top = old_top.min(total.saturating_sub(1));
+        if nothing_below {
+            // Widening rejoins lines above the cursor, so it would move up
+            // and leave blank rows at the bottom: bring back from history
+            // what an earlier narrowing pushed there.
+            top = top.min(crow.saturating_sub(pcur_row));
+        }
         if crow >= top + rows {
             top = crow + 1 - rows; // keep the cursor visible
         }

@@ -300,6 +300,22 @@ impl Pty {
         (pg > 0).then_some(pg as u32)
     }
 
+    /// The shell is waiting at its prompt: it is the foreground process
+    /// group, and its line editor (readline, zle, fish) has the terminal in
+    /// raw mode (`ICANON` off), as they do while reading a command line
+    /// and not while a command or script runs. On resize, such shells
+    /// redraw their prompt line.
+    pub fn shell_at_prompt(&self) -> bool {
+        if self.foreground_pgid() != Some(self.pid()) {
+            return false;
+        }
+        // SAFETY: valid fd; tcgetattr on the master reports the line
+        // discipline's settings on Linux and the BSDs.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut t) };
+        r == 0 && t.c_lflag & libc::ICANON == 0
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }

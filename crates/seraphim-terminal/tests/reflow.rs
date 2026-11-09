@@ -222,3 +222,37 @@ fn explicitly_colored_lines_keep_their_color_after_a_scroll_fill() {
         assert_eq!(row.cells[col].attrs.bg, seraphim_terminal::Color::Indexed(5), "col {col}");
     }
 }
+
+/// Narrowing pushes the lines above a bottom-row cursor into history;
+/// widening again brings them back, so the cursor (a shell prompt) stays
+/// on the bottom row instead of rising with blank rows under it.
+#[test]
+fn narrowing_and_widening_keep_a_bottom_cursor_at_the_bottom() {
+    let mut t = Terminal::with_scrollback(60, 10, 1000);
+    for i in 0..30 {
+        t.advance(format!("line {i:02} {}\r\n", "word ".repeat(9)).as_bytes());
+    }
+    t.advance(b"$ ");
+    assert_eq!(t.cursor().row, 9);
+    let before = t.screen_text();
+    t.resize(30, 10);
+    assert_eq!(t.cursor().row, 9);
+    t.resize(60, 10);
+    assert_eq!(t.cursor().row, 9, "still on the bottom row");
+    assert_eq!(t.screen_text(), before, "the same lines are back on screen");
+}
+
+/// After `clear`, the prompt is at the top; resizing must not pull old
+/// output back onto the screen.
+#[test]
+fn widening_after_clear_does_not_bring_history_back() {
+    let mut t = Terminal::with_scrollback(60, 10, 1000);
+    for i in 0..30 {
+        t.advance(format!("old output {i:02}\r\n").as_bytes());
+    }
+    t.advance(b"\x1b[H\x1b[2J$ ");
+    t.resize(30, 10);
+    t.resize(60, 10);
+    assert_eq!(t.cursor().row, 0);
+    assert_eq!(t.screen_text(), "$");
+}

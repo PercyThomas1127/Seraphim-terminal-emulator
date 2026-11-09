@@ -231,8 +231,21 @@ impl Session {
         self.writer.lock().unwrap().write_all(bytes)
     }
 
+    /// Resize the terminal (reflowing its lines) and the PTY.
+    ///
+    /// A shell waiting at its prompt redraws the prompt line when the width
+    /// changes. Its old copy is erased first: reflowed to the new width it
+    /// would no longer be where the shell redraws, and each step of a drag
+    /// would leave pieces of prompts stacked together.
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
-        self.terminal.lock().unwrap().resize(cols as usize, rows as usize);
+        let at_prompt = self.pty.lock().unwrap().shell_at_prompt();
+        {
+            let mut t = self.terminal.lock().unwrap();
+            if at_prompt && t.cols() != cols as usize {
+                t.clear_prompt_line();
+            }
+            t.resize(cols as usize, rows as usize);
+        }
         self.shared.generation.fetch_add(1, Ordering::Release);
         let cell = *self.cell_pixels.lock().unwrap();
         self.pty.lock().unwrap().resize(pty_size(cols, rows, cell))

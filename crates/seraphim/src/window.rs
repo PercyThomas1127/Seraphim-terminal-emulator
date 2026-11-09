@@ -137,6 +137,13 @@ fn phase(on: bool, what: &str) {
     }
 }
 
+/// How long a live resize must pause before the terminals are resized.
+/// Each terminal resize rewraps lines and tells the shell, which redraws
+/// its prompt; while the window edge is dragged, resizes arrive faster
+/// than a shell redraws, and redraws overlapping later resizes leave
+/// pieces of prompts behind. The window itself repaints at once.
+const RESIZE_SETTLE: Duration = Duration::from_millis(80);
+
 /// Renderer slot for pane dividers and dimming.
 const DECOR_SLOT: u64 = u64::MAX;
 /// Overlay slot for the tab bar (slot 0 is the menu bar).
@@ -495,6 +502,9 @@ struct Active {
     /// When the background next changes (animated images); cleared by
     /// each redraw.
     visual_due: Option<Instant>,
+    /// A live resize is under way: the grids and shells get the new size
+    /// once no resize has arrived for [`RESIZE_SETTLE`].
+    resize_due: Option<Instant>,
     /// Lua extensions and what they registered.
     scripts: crate::scripting::ScriptHost,
     /// `[[bind]]` from the configuration (script bindings are added).
@@ -721,6 +731,7 @@ impl App {
             bindings,
             occluded: false,
             visual_due: None,
+            resize_due: None,
             scripts: crate::scripting::ScriptHost::default(),
             config_binds: o.binds.clone(),
         };
@@ -3082,18 +3093,8 @@ impl ApplicationHandler<UserEvent> for App {
                 a.gpu.config.width = size.width.max(1);
                 a.gpu.config.height = size.height.max(1);
                 a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
-                a.apply_layout();
-                let (cols, rows) = {
-                    let t = focused!(a).terminal();
-                    (t.cols(), t.rows())
-                };
-                a.bus.publisher("interface").publish(
-                    "interface.resized",
-                    Some(focused!(a).id()),
-                    seraphim_events::json!({
-                        "cols": cols, "rows": rows, "width": size.width, "height": size.height,
-                    }),
-                );
+                // The terminals follow once the resize pauses (about_to_wait).
+                a.resize_due = Some(Instant::now() + RESIZE_SETTLE);
                 a.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -3326,6 +3327,29 @@ impl ApplicationHandler<UserEvent> for App {
                 a.window.request_redraw();
             } else {
                 wake = Some(wake.map_or(until, |w| w.min(until)));
+            }
+        }
+
+        // A live resize has paused: resize the terminals (one reflow and
+        // one prompt redraw instead of one per step of the drag).
+        if let Some(due) = a.resize_due {
+            if now >= due {
+                a.resize_due = None;
+                a.apply_layout();
+                let size = a.window.inner_size();
+                let (cols, rows) = {
+                    let t = focused!(a).terminal();
+                    (t.cols(), t.rows())
+                };
+                a.bus.publisher("interface").publish(
+                    "interface.resized",
+                    Some(focused!(a).id()),
+                    seraphim_events::json!({
+                        "cols": cols, "rows": rows, "width": size.width, "height": size.height,
+                    }),
+                );
+            } else {
+                wake = Some(wake.map_or(due, |w| w.min(due)));
             }
         }
 

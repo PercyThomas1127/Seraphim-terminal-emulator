@@ -155,6 +155,12 @@ impl Terminal {
         std::mem::take(&mut self.state.events)
     }
 
+    /// Erase the cursor's line before a resize, for a shell at its prompt
+    /// that redraws it (a session does this when resizing).
+    pub fn clear_prompt_line(&mut self) {
+        self.state.clear_prompt_line();
+    }
+
     /// Start or stop collecting printed text for [`Terminal::take_text`].
     pub fn set_capture_text(&mut self, on: bool) {
         match (on, self.state.text.is_some()) {
