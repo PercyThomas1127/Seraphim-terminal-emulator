@@ -256,10 +256,29 @@ selection_fade_ms = 90
 # Tabs (Ctrl+Shift+T new, Ctrl+Shift+W close, Ctrl+PgUp/PgDown switch,
 # Alt+1..9 jump). bar: auto (shown with two or more tabs), always, never.
 # label: {title}, {program}, {cwd} (last part of the directory), {index}.
+# style: classic, powerline, rounded, slanted (these three draw their ends
+# with Nerd Font glyphs) or minimal (no backgrounds; the active tab is
+# underlined). Drag a tab out of the window (or Ctrl+Shift+L) to give it
+# a window of its own.
 [tabs]
 bar = "auto"
 icons = true
 label = "{title}"
+style = "classic"
+position = "top"
+min_width = 6
+max_width = 32
+close_button = true
+new_tab_button = true
+
+# Tab colors, "#rrggbb"; unset ones follow the theme.
+# [tabs.colors]
+# bar = "#100e1a"
+# active_fg = "#14121f"
+# active_bg = "#f5a6d0"
+# inactive_fg = "#d8d3e6"
+# inactive_bg = "#2a273a"
+# accent = "#c89bff"
 
 # Split panes (Ctrl+Shift+E right, Ctrl+Shift+O down, Ctrl+Shift+X close,
 # Alt+arrows focus, Ctrl+Alt+arrows resize, Ctrl+Shift+Z zoom).

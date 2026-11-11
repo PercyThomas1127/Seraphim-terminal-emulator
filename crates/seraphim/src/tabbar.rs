@@ -103,6 +103,102 @@ pub fn icon_for(program: &str) -> char {
     }
 }
 
+/// How tabs are drawn (`[tabs]`): a style, sizes, buttons and colors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Style {
+    /// Flat tabs with a thin gap.
+    Classic,
+    /// Arrow-shaped ends (Nerd Font / Powerline glyphs).
+    Powerline,
+    /// Round ends.
+    Rounded,
+    /// Slanted ends.
+    Slanted,
+    /// No backgrounds: the active tab is underlined in the accent color.
+    Minimal,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Design {
+    pub style: Style,
+    pub min_width: usize,
+    pub max_width: usize,
+    pub close_button: bool,
+    pub new_tab_button: bool,
+    pub bar: [u8; 3],
+    pub active_fg: [u8; 3],
+    pub active_bg: [u8; 3],
+    pub inactive_fg: [u8; 3],
+    pub inactive_bg: [u8; 3],
+    pub accent: [u8; 3],
+    pub dim: [u8; 3],
+    pub border: [u8; 3],
+}
+
+fn mix(a: [u8; 3], b: [u8; 3], k: f32) -> [u8; 3] {
+    [0, 1, 2].map(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * k).round() as u8)
+}
+
+impl Design {
+    /// The configured design, with colors from the theme's palette where
+    /// none are set.
+    pub fn new(c: &seraphim_config::Tabs, p: &Palette) -> Design {
+        let style = match c.style.as_str() {
+            "powerline" => Style::Powerline,
+            "rounded" => Style::Rounded,
+            "slanted" => Style::Slanted,
+            "minimal" => Style::Minimal,
+            _ => Style::Classic,
+        };
+        let bar = c.colors.bar.unwrap_or(p.bar_bg);
+        // Shaped tabs need a background of their own to show their shape.
+        let inactive_bg = match style {
+            Style::Classic | Style::Minimal => bar,
+            _ => mix(bar, p.bar_fg, 0.14),
+        };
+        let accent = c.colors.accent.unwrap_or(p.accent);
+        Design {
+            style,
+            min_width: c.min_width as usize,
+            max_width: c.max_width.max(c.min_width) as usize,
+            close_button: c.close_button,
+            new_tab_button: c.new_tab_button,
+            bar,
+            active_fg: c.colors.active_fg.unwrap_or(match style {
+                Style::Minimal => accent,
+                _ => p.hi_fg,
+            }),
+            active_bg: c.colors.active_bg.unwrap_or(match style {
+                Style::Minimal => bar,
+                _ => p.hi_bg,
+            }),
+            inactive_fg: c.colors.inactive_fg.unwrap_or(match style {
+                Style::Minimal => p.dim,
+                _ => p.bar_fg,
+            }),
+            inactive_bg: c.colors.inactive_bg.unwrap_or(inactive_bg),
+            accent,
+            dim: p.dim,
+            border: p.border,
+        }
+    }
+
+    /// Columns before and after each tab's text.
+    fn caps(&self) -> (usize, usize) {
+        match self.style {
+            Style::Rounded => (1, 1),
+            _ => (0, 1),
+        }
+    }
+}
+
+impl Default for Design {
+    fn default() -> Self {
+        let p = Palette::from_theme(&seraphim_render::Theme::default());
+        Design::new(&seraphim_config::Tabs::default(), &p)
+    }
+}
+
 fn sgr(out: &mut String, fg: [u8; 3], bg: [u8; 3], bold: bool) {
     let b = if bold { "1;" } else { "" };
     out.push_str(&format!(
@@ -133,27 +229,31 @@ fn fit(s: &str, w: usize) -> String {
 pub fn paint(
     tabs: &[TabInfo],
     cols: usize,
-    p: &Palette,
     alert: [u8; 3],
     editing: Option<&str>,
+    d: &Design,
 ) -> (Vec<u8>, Hits) {
     let mut out = String::from("\x1b[H\x1b[?7l");
     let mut hits = Hits::default();
-    let reserve = 3; // " + "
+    let reserve = if d.new_tab_button { 3 } else { 0 }; // " + "
+    let (left, right) = d.caps();
     let n = tabs.len().max(1);
-    // Each tab is followed by a one-column gap.
-    let width = (cols.saturating_sub(reserve + n) / n).clamp(6, 32);
+    let width =
+        (cols.saturating_sub(reserve + n * (left + right)) / n).clamp(d.min_width, d.max_width);
+    // The last columns of a tab's text: "× " or a space.
+    let tail = if d.close_button { 2 } else { 1 };
     let mut col = 0;
     for (i, t) in tabs.iter().enumerate() {
-        if col + width + 1 > cols.saturating_sub(reserve) && i > 0 {
+        if col + width + left + right > cols.saturating_sub(reserve) && i > 0 {
             // No room: the rest are summarized.
-            sgr(&mut out, p.dim, p.bar_bg, false);
+            sgr(&mut out, d.dim, d.bar, false);
             let more = format!(" +{} ", tabs.len() - i);
             out.push_str(&more);
             col += more.width();
             break;
         }
-        let (fg, bg) = if t.active { (p.hi_fg, p.hi_bg) } else { (p.bar_fg, p.bar_bg) };
+        let (fg, bg) =
+            if t.active { (d.active_fg, d.active_bg) } else { (d.inactive_fg, d.inactive_bg) };
         let fg = if t.root { alert } else { fg };
         // Marks: bell, activity, zoom, pane count.
         let mut marks = String::new();
@@ -172,48 +272,87 @@ pub fn paint(
             _ => t.label.clone(),
         };
         let icon = t.icon.map(|c| format!("{c} ")).unwrap_or_default();
-        // " icon label marks ×"
-        let room =
-            width.saturating_sub(4 + icon.width() + marks.width() + usize::from(!marks.is_empty()));
+        // " icon label marks" then the tail.
+        let room = width.saturating_sub(
+            2 + tail + icon.width() + marks.width() + usize::from(!marks.is_empty()),
+        );
         let mut text = format!(" {icon}{}", fit(&label, room));
         if !marks.is_empty() {
             text.push(' ');
             text.push_str(&marks);
         }
-        let pad = width.saturating_sub(text.width() + 2);
+        let pad = width.saturating_sub(text.width() + tail);
         text.push_str(&" ".repeat(pad));
+        let start = col;
+        if left > 0 {
+            sgr(&mut out, bg, d.bar, false);
+            out.push('\u{e0b6}');
+            col += left;
+        }
         // Progress fills the tab's background from the left.
         let filled =
             t.progress.map_or(0, |pr| ((width - 1) as f32 * pr.fraction()).round() as usize);
         let fill_bg = match t.progress {
             Some(Progress::Error(_)) => alert,
-            Some(Progress::Paused(_)) => p.dim,
-            _ => p.accent,
+            Some(Progress::Paused(_)) => d.dim,
+            _ => d.accent,
         };
+        let underline = t.active && d.style == Style::Minimal;
         for (k, ch) in text.chars().enumerate() {
             let in_fill = k < filled;
-            let (f, b) = if in_fill { (p.bar_bg, fill_bg) } else { (fg, bg) };
+            let (f, b) = if in_fill { (d.bar, fill_bg) } else { (fg, bg) };
             sgr(&mut out, f, b, t.active);
+            if underline && k > 0 && ch != ' ' {
+                let a = d.accent;
+                out.push_str(&format!("\x1b[4;58;2;{};{};{}m", a[0], a[1], a[2]));
+            }
             out.push(ch);
         }
-        sgr(&mut out, if t.active { fg } else { p.dim }, bg, false);
-        out.push('×');
-        out.push(' ');
-        let start = col;
-        col += text.width() + 2;
-        hits.tabs.push((start, col, col - 2));
-        // A thin gap between tabs.
-        sgr(&mut out, p.border, p.bar_bg, false);
-        out.push('▏');
-        col += 1;
+        col += text.width();
+        if d.close_button {
+            sgr(&mut out, if t.active { fg } else { d.dim }, bg, false);
+            out.push('×');
+            out.push(' ');
+            col += 2;
+        } else {
+            sgr(&mut out, fg, bg, false);
+            out.push(' ');
+            col += 1;
+        }
+        let close = if d.close_button { col - 2 } else { usize::MAX };
+        // The tab's end: a gap or a shape.
+        match d.style {
+            Style::Classic => {
+                sgr(&mut out, d.border, d.bar, false);
+                out.push('▏');
+            }
+            Style::Minimal => {
+                sgr(&mut out, d.border, d.bar, false);
+                out.push(' ');
+            }
+            Style::Powerline => {
+                sgr(&mut out, bg, d.bar, false);
+                out.push('\u{e0b0}');
+            }
+            Style::Rounded => {
+                sgr(&mut out, bg, d.bar, false);
+                out.push('\u{e0b4}');
+            }
+            Style::Slanted => {
+                sgr(&mut out, bg, d.bar, false);
+                out.push('\u{e0bc}');
+            }
+        }
+        col += right;
+        hits.tabs.push((start, col - right, close));
     }
-    sgr(&mut out, p.bar_fg, p.bar_bg, true);
-    if col + 3 <= cols {
+    sgr(&mut out, d.inactive_fg, d.bar, true);
+    if d.new_tab_button && col + 3 <= cols {
         out.push_str(" + ");
         hits.new_tab = Some(col + 1);
         col += 3;
     }
-    sgr(&mut out, p.bar_fg, p.bar_bg, false);
+    sgr(&mut out, d.inactive_fg, d.bar, false);
     out.push_str(&" ".repeat(cols.saturating_sub(col)));
     out.push_str("\x1b[0m");
     (out.into_bytes(), hits)
@@ -244,7 +383,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (bytes, hits) = paint(&tabs, 60, &palette(), [255, 0, 0], None);
+        let (bytes, hits) = paint(&tabs, 60, [255, 0, 0], None, &Design::default());
         let s = screen(&bytes, 60);
         assert!(s.starts_with(" bash"), "{s:?}");
         assert!(s.contains("…"), "long labels are cut: {s:?}");
@@ -265,12 +404,52 @@ mod tests {
         let tabs: Vec<_> = (0..20)
             .map(|i| TabInfo { label: format!("t{i}"), active: i == 0, ..Default::default() })
             .collect();
-        let (bytes, hits) = paint(&tabs, 40, &palette(), [255, 0, 0], None);
+        let (bytes, hits) = paint(&tabs, 40, [255, 0, 0], None, &Design::default());
         let s = screen(&bytes, 40);
         assert!(hits.tabs.len() < 20);
         assert!(s.contains(&format!("+{}", 20 - hits.tabs.len())), "{s:?}");
-        let (bytes, _) = paint(&tabs[..2], 40, &palette(), [255, 0, 0], Some("new nam"));
+        let (bytes, _) = paint(&tabs[..2], 40, [255, 0, 0], Some("new nam"), &Design::default());
         assert!(screen(&bytes, 40).contains("new nam▏"));
+    }
+
+    #[test]
+    fn styles_shapes_and_buttons() {
+        let tabs = vec![
+            TabInfo { label: "one".into(), active: true, ..Default::default() },
+            TabInfo { label: "two".into(), ..Default::default() },
+        ];
+        let p = palette();
+        let design = |style: &str, close: bool, new_tab: bool| {
+            let c = seraphim_config::Tabs {
+                style: style.into(),
+                close_button: close,
+                new_tab_button: new_tab,
+                ..Default::default()
+            };
+            Design::new(&c, &p)
+        };
+        let (b, _) = paint(&tabs, 60, [255, 0, 0], None, &design("powerline", true, true));
+        assert_eq!(screen(&b, 60).matches('\u{e0b0}').count(), 2);
+        let (b, h) = paint(&tabs, 60, [255, 0, 0], None, &design("rounded", true, true));
+        let s = screen(&b, 60);
+        assert!(s.starts_with('\u{e0b6}') && s.contains('\u{e0b4}'), "{s:?}");
+        // The cap is part of the tab.
+        assert_eq!(h.at(0), Hit::Tab(0));
+        let (b, h) = paint(&tabs, 60, [255, 0, 0], None, &design("minimal", false, false));
+        let s = screen(&b, 60);
+        assert!(!s.contains('×') && !s.contains('+'), "{s:?}");
+        assert!(String::from_utf8(b).unwrap().contains("\x1b[4;58;2;"), "underlined");
+        assert!(h.new_tab.is_none());
+        assert!((0..60).all(|c| !matches!(h.at(c), Hit::Close(_))));
+        // Sizes.
+        let c = seraphim_config::Tabs { min_width: 10, max_width: 12, ..Default::default() };
+        let (_, h) = paint(&tabs, 200, [255, 0, 0], None, &Design::new(&c, &p));
+        assert_eq!(h.tabs[0].1 - h.tabs[0].0, 12);
+        // Colors from the configuration.
+        let mut c = seraphim_config::Tabs::default();
+        c.colors.active_bg = Some([1, 2, 3]);
+        let (b, _) = paint(&tabs, 60, [255, 0, 0], None, &Design::new(&c, &p));
+        assert!(String::from_utf8(b).unwrap().contains("48;2;1;2;3m"));
     }
 
     #[test]
@@ -284,7 +463,7 @@ mod tests {
             progress: Some(Progress::Normal(50)),
             ..Default::default()
         }];
-        let (bytes, _) = paint(&tabs, 40, &palette(), [255, 0, 0], None);
+        let (bytes, _) = paint(&tabs, 40, [255, 0, 0], None, &Design::default());
         assert!(String::from_utf8(bytes).unwrap().contains(&format!(
             "{};{};{}m",
             palette().accent[0],

@@ -177,12 +177,59 @@ pub struct Tabs {
     /// Tab label: `{title}`, `{program}`, `{cwd}` (last part of the
     /// working directory) and `{index}` are filled in.
     pub label: String,
+    /// How tabs look: `classic`, `powerline`, `rounded`, `slanted` (these
+    /// three need a Nerd Font) or `minimal`.
+    pub style: String,
+    /// `top` or `bottom` of the window.
+    pub position: String,
+    /// Width of a tab in columns, at least and at most.
+    pub min_width: u16,
+    pub max_width: u16,
+    /// A × on each tab.
+    pub close_button: bool,
+    /// A + after the tabs.
+    pub new_tab_button: bool,
+    /// Colors (default: from the theme).
+    pub colors: TabColors,
 }
 
 impl Default for Tabs {
     fn default() -> Self {
-        Tabs { bar: "auto".into(), icons: true, label: "{title}".into() }
+        Tabs {
+            bar: "auto".into(),
+            icons: true,
+            label: "{title}".into(),
+            style: "classic".into(),
+            position: "top".into(),
+            min_width: 6,
+            max_width: 32,
+            close_button: true,
+            new_tab_button: true,
+            colors: TabColors::default(),
+        }
     }
+}
+
+/// Tab styles for `tabs.style`.
+pub const TAB_STYLES: &[&str] = &["classic", "powerline", "rounded", "slanted", "minimal"];
+
+/// `[tabs.colors]`: each is `#rrggbb`; unset ones follow the theme.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TabColors {
+    #[serde(deserialize_with = "opt_color")]
+    pub bar: Option<Rgb>,
+    #[serde(deserialize_with = "opt_color")]
+    pub active_fg: Option<Rgb>,
+    #[serde(deserialize_with = "opt_color")]
+    pub active_bg: Option<Rgb>,
+    #[serde(deserialize_with = "opt_color")]
+    pub inactive_fg: Option<Rgb>,
+    #[serde(deserialize_with = "opt_color")]
+    pub inactive_bg: Option<Rgb>,
+    /// Progress, the minimal style's active tab.
+    #[serde(deserialize_with = "opt_color")]
+    pub accent: Option<Rgb>,
 }
 
 /// `[panes]`.
@@ -1044,6 +1091,22 @@ impl Config {
                 "tabs.bar must be auto, always or never (got {:?})",
                 self.tabs.bar
             ));
+        }
+        if !TAB_STYLES.contains(&self.tabs.style.as_str()) {
+            return Err(format!(
+                "tabs.style must be one of {} (got {:?})",
+                TAB_STYLES.join(", "),
+                self.tabs.style
+            ));
+        }
+        if !["top", "bottom"].contains(&self.tabs.position.as_str()) {
+            return Err(format!(
+                "tabs.position must be top or bottom (got {:?})",
+                self.tabs.position
+            ));
+        }
+        if self.tabs.min_width < 4 || self.tabs.min_width > self.tabs.max_width {
+            return Err("tabs.min_width must be at least 4 and at most tabs.max_width".into());
         }
         if !(0.0..=20.0).contains(&self.panes.divider) {
             return Err("panes.divider must be 0-20".into());

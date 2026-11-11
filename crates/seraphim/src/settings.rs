@@ -82,7 +82,10 @@ pub fn all(dir: &Path, extensions: &[(String, String)]) -> Vec<Setting> {
         s("Reduced motion", "visual.reduced_motion", Kind::Toggle),
         s("Show the menu bar", "window.menu_bar", Kind::Toggle),
         s("Tab bar", "tabs.bar", choice(&["auto", "always", "never"])),
+        s("Tab style", "tabs.style", choice(seraphim_config::TAB_STYLES)),
+        s("Tab bar position", "tabs.position", choice(&["top", "bottom"])),
         s("Tab icons", "tabs.icons", Kind::Toggle),
+        s("Close buttons on tabs", "tabs.close_button", Kind::Toggle),
         s(
             "Dim panes without focus",
             "panes.dim_inactive",

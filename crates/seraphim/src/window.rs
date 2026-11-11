@@ -1718,16 +1718,27 @@ impl Active {
         }
     }
 
-    /// Pixels at the top reserved for the menu bar and the tab bar.
-    fn top_inset(&self) -> u32 {
-        self.menu_height() + self.tab_bar_height()
+    fn tabs_at_bottom(&self) -> bool {
+        self.tabs_cfg.position == "bottom"
     }
 
-    /// Where panes go.
+    /// Where the tab bar starts (pixels from the top).
+    fn tab_bar_top(&self) -> u32 {
+        if self.tabs_at_bottom() {
+            self.window.inner_size().height.saturating_sub(self.tab_bar_height())
+        } else {
+            self.menu_height()
+        }
+    }
+
+    /// Where panes go: below the menu bar, and above or below the tab bar.
     fn pane_area(&self) -> Rect {
         let s = self.window.inner_size();
-        let top = self.top_inset().min(s.height.saturating_sub(1));
-        Rect::new(0.0, top as f32, s.width as f32, (s.height - top) as f32)
+        let tabs = self.tab_bar_height();
+        let top = self.menu_height() + if self.tabs_at_bottom() { 0 } else { tabs };
+        let top = top.min(s.height.saturating_sub(1));
+        let h = s.height.saturating_sub(top + if self.tabs_at_bottom() { tabs } else { 0 }).max(1);
+        Rect::new(0.0, top as f32, s.width as f32, h as f32)
     }
 
     /// Divider width in pixels.
@@ -2228,7 +2239,7 @@ impl Active {
         if !self.tab_bar_visible() {
             return false;
         }
-        let top = self.menu_height() as f64;
+        let top = self.tab_bar_top() as f64;
         y >= top && y < top + self.tab_bar_height() as f64
     }
 
@@ -3576,13 +3587,14 @@ impl Win {
                     let m = a.overlay.cell_metrics();
                     let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
                     let palette = menu::Palette::from_theme(&theme);
+                    let design = crate::tabbar::Design::new(&a.tabs_cfg, &palette);
                     let alert = theme.ansi[9];
                     let (bytes, hits) = crate::tabbar::paint(
                         &a.tab_infos(),
                         cols,
-                        &palette,
                         alert,
                         a.renaming.as_deref(),
+                        &design,
                     );
                     let mut t = seraphim_terminal::Terminal::with_scrollback(cols, 1, 0);
                     t.advance(&bytes);
@@ -3853,7 +3865,7 @@ fn draw(a: &mut Active) {
         a.renderer.render(&mut pass);
         a.renderer.select(&a.gpu.device, focus);
         if a.tab_bar_visible() {
-            let top = a.menu_height() as f32;
+            let top = a.tab_bar_top() as f32;
             let th = a.tab_bar_height() as f32;
             if top + th <= h as f32 {
                 pass.set_viewport(0.0, top, w as f32, th, 0.0, 1.0);

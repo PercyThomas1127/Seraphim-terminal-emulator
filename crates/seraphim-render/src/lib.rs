@@ -1242,7 +1242,15 @@ impl Renderer {
         // seamlessly with the rows of a segmented prompt.
         let powerline = matches!(ch as u32, 0xE0A0..=0xE0D7);
         let margin = if powerline { 0.0 } else { 1.0 };
-        let s = ((box_w - margin) / w).min((m.height - margin) / h).clamp(0.25, 4.0);
+        // The separators (arrows, half circles, slants: U+E0B0-E0BF) are
+        // shapes, stretched to fill the cell exactly as other terminals
+        // draw them; otherwise their aspect ratio leaves a gap.
+        let separator = matches!(ch as u32, 0xE0B0..=0xE0BF);
+        let s = if separator {
+            (m.height / h).clamp(0.25, 4.0)
+        } else {
+            ((box_w - margin) / w).min((m.height - margin) / h).clamp(0.25, 4.0)
+        };
         let key = if (s - 1.0).abs() > 0.05 {
             let size = (self.fonts.size_px() * s * 4.0).round().clamp(4.0, u16::MAX as f32) as u16;
             GlyphKey { size, ..key }
@@ -1252,8 +1260,13 @@ impl Renderer {
         let Ok(glyph) = self.cached(queue, key) else { return false };
         let Some(g) = glyph else { return true };
         let (w, h) = (g.rect.w as f32, g.rect.h as f32);
+        let rect = if separator {
+            [x, y, box_w, m.height]
+        } else {
+            [x + ((box_w - w) / 2.0).round(), y + ((m.height - h) / 2.0).round(), w, h]
+        };
         self.instances.push(Instance {
-            rect: [x + ((box_w - w) / 2.0).round(), y + ((m.height - h) / 2.0).round(), w, h],
+            rect,
             uv: [g.rect.x as f32, g.rect.y as f32, w, h],
             color: to_f32(fg, 1.0),
             kind: if g.color { KIND_COLOR } else { KIND_MASK },
