@@ -238,7 +238,9 @@ fn parse_window(args: &[String]) -> Result<window::WindowOptions, String> {
             "-e" | "--" => {
                 let rest: Vec<&String> = it.by_ref().collect();
                 let (prog, args) = rest.split_first().ok_or("-e needs a PROGRAM")?;
+                o.config_command = o.command.take();
                 o.command = Some(Command::new(prog.as_str()).args(args.iter().map(|s| s.as_str())));
+                o.cli_command = true;
             }
             other => return Err(format!("unknown option {other}")),
         }

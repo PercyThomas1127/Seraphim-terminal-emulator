@@ -1,6 +1,7 @@
-//! Session restoration (spec §9.1): what a window saves when it closes
-//! (tabs, splits, directories, labels, profiles, panels, and the last
-//! screenful of each terminal), and reading it back. Programs are not
+//! Session restoration (spec §9.1): what Seraphim saves while its windows
+//! are open (every half minute, so it survives a crash) and when the last
+//! one closes: each window's tabs, splits, directories, labels, profiles,
+//! panels, and the last screenful of each terminal. And reading it back. Programs are not
 //! restarted; each terminal pane gets a new shell in its old directory,
 //! with its old text shown dimmed above the new prompt.
 
@@ -44,6 +45,13 @@ pub struct Saved {
     pub tabs: Vec<SavedTab>,
 }
 
+/// Every window (version 2; version 1 files hold one [`Saved`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedSession {
+    pub version: u32,
+    pub windows: Vec<Saved>,
+}
+
 /// `$XDG_STATE_HOME/seraphim/session.json` (or `~/.local/state/...`).
 pub fn path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
@@ -52,12 +60,18 @@ pub fn path() -> Option<PathBuf> {
     Some(base.join("seraphim/session.json"))
 }
 
-pub fn save(s: &Saved) -> Result<(), String> {
+/// Save these windows. Windows without tabs are left out; with none
+/// left, the next start opens fresh.
+pub fn save(windows: &[Saved]) -> Result<(), String> {
+    let s = SavedSession {
+        version: 2,
+        windows: windows.iter().filter(|w| !w.tabs.is_empty()).cloned().collect(),
+    };
     let p = path().ok_or("no home directory")?;
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
-    let text = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string(&s).map_err(|e| e.to_string())?;
     let tmp = p.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
     // Screen text can be private: only the user reads it.
@@ -69,10 +83,17 @@ pub fn save(s: &Saved) -> Result<(), String> {
     std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
 }
 
-pub fn load() -> Option<Saved> {
+/// The saved windows (none: start fresh).
+pub fn load() -> Option<Vec<Saved>> {
     let text = std::fs::read_to_string(path()?).ok()?;
-    let s: Saved = serde_json::from_str(&text).ok()?;
-    (s.version == 1 && !s.tabs.is_empty()).then_some(s)
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let windows = match v.get("version")?.as_u64()? {
+        1 => vec![serde_json::from_value::<Saved>(v).ok()?],
+        2 => serde_json::from_value::<SavedSession>(v).ok()?.windows,
+        _ => return None,
+    };
+    let windows: Vec<Saved> = windows.into_iter().filter(|w| !w.tabs.is_empty()).collect();
+    (!windows.is_empty()).then_some(windows)
 }
 
 /// Old text as terminal output: dimmed, then a marker line.
@@ -117,8 +138,14 @@ mod tests {
                 panes,
             }],
         };
-        save(&s).unwrap();
-        assert_eq!(load(), Some(s));
+        save(&[s.clone(), Saved { tabs: vec![], ..s.clone() }]).unwrap();
+        // Windows without tabs are dropped.
+        assert_eq!(load(), Some(vec![s.clone()]));
+        // Version 1: one window.
+        std::fs::write(path().unwrap(), serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(load(), Some(vec![s.clone()]));
+        save(&[Saved { tabs: vec![], ..s.clone() }]).unwrap();
+        assert_eq!(load(), None);
         let r = String::from_utf8(replay(&["a\x1b]52;c;evil\x07b".into()], "today")).unwrap();
         assert!(r.contains("a]52;c;evilb"), "escapes dropped: {r:?}");
         assert!(r.ends_with("── restored today ──\x1b[0m\r\n"));

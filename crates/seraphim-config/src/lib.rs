@@ -271,6 +271,7 @@ pub const MENU_ACTIONS: &[&str] = &[
     "move-tab-left",
     "move-tab-right",
     "rename-tab",
+    "detach-tab",
     "split-right",
     "split-down",
     "close-pane",

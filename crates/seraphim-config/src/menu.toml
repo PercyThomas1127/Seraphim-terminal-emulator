@@ -50,6 +50,7 @@ items = [
     { label = "E&qual Pane Sizes", action = "equalize-panes" },
     { separator = true },
     { label = "Rename T&ab", action = "rename-tab" },
+    { label = "De&tach Tab", action = "detach-tab" },
     { label = "Move Tab &Left", action = "move-tab-left" },
     { label = "Move Tab Ri&ght", action = "move-tab-right" },
     { separator = true },

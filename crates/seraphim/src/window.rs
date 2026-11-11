@@ -199,6 +199,11 @@ pub struct WindowOptions {
     pub extensions: std::collections::BTreeMap<String, seraphim_config::ExtensionConfig>,
     /// `--extension` paths.
     pub cli_extensions: Vec<std::path::PathBuf>,
+    /// `-e PROGRAM`: a one-off window that neither restores nor saves the
+    /// session.
+    pub cli_command: bool,
+    /// With `-e`: the configured shell, for New Window.
+    pub config_command: Option<Command>,
     pub tabs: seraphim_config::Tabs,
     pub panes: seraphim_config::Panes,
     /// `terminal.term`.
@@ -281,6 +286,8 @@ impl Default for WindowOptions {
             scripting: Default::default(),
             extensions: Default::default(),
             cli_extensions: Vec::new(),
+            cli_command: false,
+            config_command: None,
             tabs: Default::default(),
             panes: Default::default(),
             term: "auto".into(),
@@ -304,10 +311,41 @@ const WHEEL_LINES: i64 = 3;
 enum UserEvent {
     /// Terminal state changed (output, exit, clipboard request).
     Wake,
-    /// A watched configuration file changed on disk.
-    ConfigChanged(Vec<std::path::PathBuf>),
-    /// Scripts queued commands.
-    Script,
+    /// A watched configuration file changed on disk (window key).
+    ConfigChanged(u64, Vec<std::path::PathBuf>),
+    /// A window's scripts queued commands.
+    Script(u64),
+}
+
+/// Pane ids are unique in the process, so a pane keeps its id (and its
+/// session id) when its tab moves to another window.
+static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_pane_id() -> u64 {
+    NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// What a new window opens with.
+enum Seed {
+    /// The first window: `--layout`, a restored window, the startup
+    /// layout, or one shell.
+    First(Option<crate::restore::Saved>),
+    /// Another restored window.
+    Restore(crate::restore::Saved),
+    /// New Window: one shell, in this directory.
+    Shell(Option<std::path::PathBuf>),
+    /// A tab detached from another window, with its running sessions.
+    Tab(Detached),
+}
+
+/// A tab on its way to a new window: its arrangement and its panes,
+/// sessions still running.
+struct Detached {
+    tab: crate::workspace::Tab,
+    panes: Vec<(u64, Pane)>,
+    panels: Vec<(u64, crate::panels::PanelState)>,
+    size: PhysicalSize<u32>,
+    position: Option<winit::dpi::PhysicalPosition<i32>>,
 }
 
 /// How long a notice stays in the corner of the window.
@@ -435,7 +473,6 @@ struct Active {
     /// Extensions installed (name, permissions asked), for settings.
     extension_list: Vec<(String, String)>,
     ws: Workspace,
-    next_pane: u64,
     /// The pane that had focus last (to notice changes).
     last_focus: u64,
     spawn: SpawnConfig,
@@ -533,11 +570,14 @@ enum Request {
     Zoom(i8),
     ToggleMenuBar,
     NewWindow,
+    /// Move the active tab to a new window (at this screen position).
+    DetachTab(Option<winit::dpi::PhysicalPosition<i32>>),
     OpenConfigFolder,
     Quit,
 }
 
-struct App {
+/// One window: its configuration and its state.
+struct Win {
     options: WindowOptions,
     proxy: EventLoopProxy<UserEvent>,
     active: Option<Active>,
@@ -545,19 +585,47 @@ struct App {
     exit_code: i32,
     /// Points added to the configured font size (View → Enlarge Font).
     zoom: f32,
+    /// Tells this window's events apart from other windows'.
+    key: u64,
+    /// What it opens with (taken by `start`).
+    seed: Option<Seed>,
+    /// The window asked to close.
+    closed: bool,
+    /// A window this one asked for (New Window, a detached tab).
+    outgoing: Option<Seed>,
 }
+
+/// The windows of this process. A tab can move between them with its
+/// sessions running, which separate processes couldn't do.
+struct App {
+    proxy: EventLoopProxy<UserEvent>,
+    options: WindowOptions,
+    wins: Vec<Win>,
+    next_key: u64,
+    started: bool,
+    error: Option<String>,
+    exit_code: i32,
+    /// When the session was last saved (restore_session).
+    saved_at: Instant,
+}
+
+/// How often the session is saved while windows are open, so that it
+/// survives a crash.
+const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn run(options: WindowOptions) -> Result<i32, String> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|e| format!("cannot open a window: {e}"))?;
     let mut app = App {
-        options,
         proxy: event_loop.create_proxy(),
-        active: None,
+        options,
+        wins: Vec::new(),
+        next_key: 0,
+        started: false,
         error: None,
         exit_code: 0,
-        zoom: 0.0,
+        saved_at: Instant::now(),
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     match app.error {
@@ -566,13 +634,195 @@ pub fn run(options: WindowOptions) -> Result<i32, String> {
     }
 }
 
+impl App {
+    /// Open a window. Its configuration and font zoom come from the window
+    /// that asked for it (or the command line).
+    fn open(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        options: WindowOptions,
+        zoom: f32,
+        seed: Seed,
+    ) {
+        self.next_key += 1;
+        let mut w = Win {
+            options,
+            proxy: self.proxy.clone(),
+            active: None,
+            error: None,
+            exit_code: 0,
+            zoom,
+            key: self.next_key,
+            seed: Some(seed),
+            closed: false,
+            outgoing: None,
+        };
+        w.resumed(event_loop);
+        if let Some(r) = w.active.as_mut().and_then(|a| a.pending.take()) {
+            w.handle(r, event_loop);
+        }
+        match w.error.take() {
+            Some(e) if self.wins.is_empty() => self.error = Some(e),
+            Some(e) => eprintln!("seraphim: new window: {e}"),
+            None => self.wins.push(w),
+        }
+    }
+
+    fn win(&mut self, id: WindowId) -> Option<&mut Win> {
+        self.wins.iter_mut().find(|w| w.active.as_ref().is_some_and(|a| a.window.id() == id))
+    }
+
+    /// After each event: open the windows asked for, close the ones that
+    /// are done, save the session now and then, and quit with the last
+    /// window.
+    fn settle(&mut self, event_loop: &ActiveEventLoop) {
+        let wanted: Vec<_> = self
+            .wins
+            .iter_mut()
+            .filter_map(|w| w.outgoing.take().map(|s| (w.options.clone(), w.zoom, s)))
+            .collect();
+        for (mut options, zoom, seed) in wanted {
+            if matches!(seed, Seed::Shell(_)) && options.cli_command {
+                // New Window from `seraphim -e PROGRAM` opens a shell.
+                options.command = options.config_command.take();
+                options.cli_command = false;
+            }
+            self.open(event_loop, options, zoom, seed);
+        }
+        if self.wins.iter().any(|w| w.closed) {
+            // Closing the last window saves what it had (nothing, if its
+            // last shell ended); closing another one forgets it.
+            let last = self.wins.iter().all(|w| w.closed);
+            if last {
+                self.save();
+            }
+            let (closed, open): (Vec<Win>, Vec<Win>) =
+                std::mem::take(&mut self.wins).into_iter().partition(|w| w.closed);
+            self.wins = open;
+            for mut w in closed {
+                self.exit_code = w.exit_code;
+                if let Some(e) = w.error.take() {
+                    eprintln!("seraphim: {e}");
+                }
+                w.exiting();
+            }
+        }
+        if self.wins.is_empty() && self.started {
+            event_loop.exit();
+        }
+    }
+
+    fn save(&mut self) {
+        self.saved_at = Instant::now();
+        // `seraphim -e PROGRAM` is a one-off: it never replaces the
+        // session you'd come back to.
+        if !self.options.restore_session {
+            return;
+        }
+        let windows: Vec<_> = self
+            .wins
+            .iter()
+            .filter(|w| !w.options.cli_command)
+            .filter_map(|w| w.active.as_ref().map(|a| a.saved_session()))
+            .collect();
+        if windows.is_empty() {
+            return;
+        }
+        if let Err(e) = crate::restore::save(&windows) {
+            eprintln!("seraphim: saving the session: {e}");
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.started {
+            return;
+        }
+        let o = &self.options;
+        let mut saved = (o.restore_session && !o.cli_command && o.cli_layout.is_none())
+            .then(crate::restore::load)
+            .flatten()
+            .unwrap_or_default()
+            .into_iter();
+        let first = saved.next();
+        self.open(event_loop, self.options.clone(), 0.0, Seed::First(first));
+        self.started = true;
+        if self.error.is_some() {
+            event_loop.exit();
+            return;
+        }
+        for s in saved {
+            self.open(event_loop, self.options.clone(), 0.0, Seed::Restore(s));
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match &event {
+            UserEvent::ConfigChanged(key, _) | UserEvent::Script(key) => {
+                let key = *key;
+                if let Some(w) = self.wins.iter_mut().find(|w| w.key == key) {
+                    w.user_event(event_loop, event);
+                }
+            }
+            // Session output: any window may own the session.
+            UserEvent::Wake => {
+                for w in &mut self.wins {
+                    w.user_event(event_loop, UserEvent::Wake);
+                }
+            }
+        }
+        self.settle(event_loop);
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let Some(w) = self.win(id) {
+            w.window_event(event_loop, id, event);
+        }
+        self.settle(event_loop);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let mut wake: Option<Instant> = None;
+        for w in &mut self.wins {
+            if let Some(t) = w.about_to_wait() {
+                wake = Some(wake.map_or(t, |w| w.min(t)));
+            }
+        }
+        if self.options.restore_session {
+            let due = self.saved_at + SAVE_INTERVAL;
+            if Instant::now() >= due {
+                self.save();
+            }
+            let due = self.saved_at + SAVE_INTERVAL;
+            wake = Some(wake.map_or(due, |w| w.min(due)));
+        }
+        self.settle(event_loop);
+        event_loop.set_control_flow(match wake {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if !self.wins.is_empty() {
+            self.save();
+        }
+        for w in &mut self.wins {
+            w.exiting();
+        }
+        self.wins.clear();
+    }
+}
+
 fn font_px(points: f32, scale: f64) -> f32 {
     // 1pt = 1/72in at 96 dpi logical.
     (points * 96.0 / 72.0 * scale as f32).round()
 }
 
-impl App {
+impl Win {
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<Active, String> {
+        let seed = self.seed.take().unwrap_or(Seed::Shell(None));
         let o = &self.options;
         let timed = o.probe.is_some() || std::env::var_os("SERAPHIM_TIMING").is_some();
         phase(timed, "event loop running");
@@ -585,10 +835,16 @@ impl App {
         let m = fonts.metrics();
         let pad = (o.padding as f64 * scale).round() as f32;
         let bar = if o.menu_bar { m.height.ceil() } else { 0.0 };
-        let size = PhysicalSize::new(
+        let mut size = PhysicalSize::new(
             (o.cols as f32 * m.width + 2.0 * pad) as u32,
             (o.rows as f32 * m.height + 2.0 * pad + bar) as u32,
         );
+        let mut position = None;
+        if let Seed::Tab(d) = &seed {
+            // A detached tab keeps its size, and opens where it was dropped.
+            size = d.size;
+            position = d.position;
+        }
         let attrs = Window::default_attributes()
             .with_title("Seraphim")
             // Transparency must be requested when the window is created.
@@ -607,6 +863,10 @@ impl App {
             crate::desktop::APP_ID,
             crate::desktop::APP_ID,
         );
+        let attrs = match position {
+            Some(p) => attrs.with_position(p),
+            None => attrs,
+        };
         phase(timed, "fonts loaded");
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
         set_window_background(&window, o.theme.background, o.visual.window_opacity < 1.0);
@@ -639,9 +899,14 @@ impl App {
         let command = o.command.clone().unwrap_or_else(Command::default_shell);
         // Subscribe before the first session starts: it reports privilege
         // at once.
-        const FIRST_PANE: u64 = 1;
-        let interactions = Interactions::new(o.rules.clone(), &bus, FIRST_PANE);
-        let bindings = crate::bindings::Bindings::new(o.binds.clone(), &bus, FIRST_PANE);
+        // (The first shell gets the next pane id; a detached tab brings its
+        // panes.)
+        let first_pane = match &seed {
+            Seed::Tab(d) => d.tab.focus,
+            _ => NEXT_PANE.load(std::sync::atomic::Ordering::Relaxed) + 1,
+        };
+        let interactions = Interactions::new(o.rules.clone(), &bus, first_pane);
+        let bindings = crate::bindings::Bindings::new(o.binds.clone(), &bus, first_pane);
         let pane_events = bus.subscribe(
             seraphim_events::Pattern::Any(vec![
                 "terminal.bell".into(),
@@ -671,15 +936,14 @@ impl App {
             renderer,
             panes: Default::default(),
             panels: Default::default(),
-            term_focus: FIRST_PANE,
+            term_focus: first_pane,
             history: Default::default(),
             packages: Default::default(),
             layouts: o.layouts.clone(),
             config_path: o.config_path.clone(),
             extension_list: Vec::new(),
             ws: Workspace::new(),
-            next_pane: 0,
-            last_focus: FIRST_PANE,
+            last_focus: first_pane,
             spawn: SpawnConfig {
                 command,
                 term: o.term.clone(),
@@ -723,8 +987,9 @@ impl App {
             toast: o.notice.clone().map(|m| (m, Instant::now() + TOAST_TIME * 2)),
             watcher: o.live_reload.then(|| {
                 let proxy = self.proxy.clone();
+                let key = self.key;
                 crate::watch::Watcher::spawn(o.watch.clone(), move |changed| {
-                    proxy.send_event(UserEvent::ConfigChanged(changed)).is_ok()
+                    proxy.send_event(UserEvent::ConfigChanged(key, changed)).is_ok()
                 })
             }),
             interactions,
@@ -736,19 +1001,46 @@ impl App {
             config_binds: o.binds.clone(),
         };
         // What the window opens with: --layout, a restored session, the
-        // startup layout, or one shell.
-        let saved = (o.restore_session && o.command.is_none() && o.cli_layout.is_none())
-            .then(crate::restore::load)
-            .flatten();
-        let layout = o.cli_layout.clone().or(o.startup_layout.clone()).filter(|_| saved.is_none());
-        let restored = saved.is_some_and(|s| active.restore(s));
-        if !restored {
-            if let Some(name) = layout {
-                active.open_layout(&name);
+        // startup layout, or one shell (the first window); a detached tab;
+        // or one shell.
+        let mut cwd = None;
+        let mut script_panels = Vec::new();
+        match seed {
+            Seed::First(saved) => {
+                let layout =
+                    o.cli_layout.clone().or(o.startup_layout.clone()).filter(|_| saved.is_none());
+                let restored = saved.is_some_and(|s| active.restore(s));
+                if !restored {
+                    if let Some(name) = layout {
+                        active.open_layout(&name);
+                    }
+                }
+            }
+            Seed::Restore(saved) => {
+                active.restore(saved);
+            }
+            Seed::Shell(dir) => cwd = dir,
+            Seed::Tab(d) => {
+                for (id, p) in d.panes {
+                    // Its events go to this window's bus (and rules) now.
+                    p.session.move_to(&active.bus);
+                    active.panes.insert(id, p);
+                }
+                for (id, p) in d.panels {
+                    if let crate::panels::Kind::Script { ext, id } = &p.kind {
+                        script_panels.push((ext.clone(), id.clone()));
+                    }
+                    active.panels.insert(id, p);
+                }
+                let i = active.ws.add_tab(d.tab.root.clone(), d.tab.profile.clone());
+                let t = &mut active.ws.tabs[i];
+                t.focus = d.tab.focus;
+                t.zoomed = d.tab.zoomed;
+                t.label = d.tab.label;
             }
         }
         if active.ws.tabs.is_empty() || active.panes.is_empty() {
-            let first = active.spawn_pane(None, None)?;
+            let first = active.spawn_pane(cwd, None)?;
             active.ws.add_tab(Node::Pane(first), None);
         }
         active.term_focus = active
@@ -760,8 +1052,9 @@ impl App {
         active.last_focus = active.term_focus;
         active.apply_layout();
         let proxy = self.proxy.clone();
+        let key = self.key;
         let wake: seraphim_script::Waker = Arc::new(move || {
-            let _ = proxy.send_event(UserEvent::Script);
+            let _ = proxy.send_event(UserEvent::Script(key));
         });
         let (warnings, _) =
             active.scripts.configure(o.script_sources(), &active.bus, wake, &mut active.visual);
@@ -773,6 +1066,16 @@ impl App {
         }
         active.extension_list = active.scripts.installed.clone();
         active.rebuild_menu();
+        for (ext, id) in script_panels {
+            active.scripts.panel_event(&ext, &id, seraphim_script::PanelEvent::Open(true));
+        }
+        // Rules, bindings and scripts follow the focused terminal; a
+        // detached tab may bring its own profile.
+        let id = active.term_focus;
+        active.interactions.set_session(id, &mut active.visual);
+        active.bindings.set_session(id, &mut active.visual);
+        active.scripts.set_session(id);
+        active.check_tab_profile();
         phase(timed, "shell started, scene built");
         Ok(active)
     }
@@ -781,9 +1084,9 @@ impl App {
     /// shell: theme, fonts, background layers and visual settings change;
     /// the background crossfades.
     /// Handle a [`Request`] from the window.
-    fn handle(&mut self, request: Request, event_loop: &ActiveEventLoop) {
+    fn handle(&mut self, request: Request, _event_loop: &ActiveEventLoop) {
         match request {
-            Request::Quit => event_loop.exit(),
+            Request::Quit => self.closed = true,
             Request::NextProfile
             | Request::Reload
             | Request::Profile(_)
@@ -807,24 +1110,22 @@ impl App {
                 self.resize_grid();
             }
             Request::NewWindow => {
-                let exe = std::env::current_exe();
-                let mut cmd = match exe {
-                    Ok(exe) => std::process::Command::new(exe),
-                    Err(e) => return eprintln!("seraphim: new window: {e}"),
-                };
-                if let Some(p) = &self.options.config_path {
-                    cmd.arg("--config").arg(p);
+                let cwd = self.active.as_ref().and_then(|a| a.focused_cwd());
+                self.outgoing = Some(Seed::Shell(cwd));
+            }
+            Request::DetachTab(position) => {
+                let Some(a) = &mut self.active else { return };
+                let i = a.ws.active;
+                // The window keeps a terminal (panels alone don't keep
+                // one open).
+                let others = a.ws.tabs.iter().enumerate().filter(|(j, _)| *j != i);
+                let keeps =
+                    others.flat_map(|(_, t)| t.root.panes()).any(|p| a.panes.contains_key(&p));
+                if !keeps {
+                    a.notify("This tab is the window's only terminal".to_owned());
+                    return;
                 }
-                cmd.args(["--profile", &self.options.profile]);
-                if let Some(p) = &self.options.cli_preset {
-                    cmd.args(["--preset", p]);
-                }
-                if let Some(cwd) = self.active.as_ref().and_then(|a| a.focused_cwd()) {
-                    cmd.current_dir(cwd);
-                }
-                if let Err(e) = cmd.spawn() {
-                    eprintln!("seraphim: new window: {e}");
-                }
+                self.outgoing = Some(Seed::Tab(a.detach_tab(i, position)));
             }
             Request::OpenConfigFolder => {
                 let dir = self
@@ -918,6 +1219,8 @@ impl App {
         o.cli_font_size = self.options.cli_font_size;
         o.cli_preset = self.options.cli_preset.clone();
         o.cli_extensions = self.options.cli_extensions.clone();
+        o.cli_command = self.options.cli_command;
+        o.config_command = self.options.config_command.clone();
         if o.cli_font_family.is_some() {
             o.font_family = o.cli_font_family.clone();
         }
@@ -998,8 +1301,9 @@ impl App {
             a.scripts.reapply_layers(&mut a.visual);
         }
         let proxy = self.proxy.clone();
+        let key = self.key;
         let wake: seraphim_script::Waker = Arc::new(move || {
-            let _ = proxy.send_event(UserEvent::Script);
+            let _ = proxy.send_event(UserEvent::Script(key));
         });
         if request_kind == Request::Reload {
             a.scripts.invalidate();
@@ -1338,6 +1642,7 @@ impl Active {
                 self.renaming = Some(current);
                 self.apply_layout();
             }
+            Action::DetachTab => self.pending = Some(Request::DetachTab(None)),
             Action::SplitRight => self.split(Split::Right),
             Action::SplitDown => self.split(Split::Down),
             Action::ClosePane => {
@@ -1440,8 +1745,7 @@ impl Active {
         cwd: Option<std::path::PathBuf>,
         command: Option<Command>,
     ) -> Result<u64, String> {
-        self.next_pane += 1;
-        let id = self.next_pane;
+        let id = next_pane_id();
         let area = self.pane_area();
         let (cols, rows) = self.renderer.grid_size(area.w as u32, area.h as u32, self.pad);
         let mut command = command.unwrap_or_else(|| self.spawn.command.clone());
@@ -1582,8 +1886,7 @@ impl Active {
     }
 
     fn open_panel(&mut self, kind: crate::panels::Kind, place: &str) -> u64 {
-        self.next_pane += 1;
-        let id = self.next_pane;
+        let id = next_pane_id();
         if let crate::panels::Kind::Script { ext, id: pid } = &kind {
             self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(true));
         }
@@ -1620,8 +1923,7 @@ impl Active {
         if let Some(name) = &p.panel {
             let kind =
                 crate::panels::Kind::parse(name).ok_or_else(|| format!("no panel {name:?}"))?;
-            self.next_pane += 1;
-            let id = self.next_pane;
+            let id = next_pane_id();
             if let crate::panels::Kind::Script { ext, id: pid } = &kind {
                 self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(true));
             }
@@ -1727,9 +2029,9 @@ impl Active {
                     }
                     SavedPane::Panel { panel } => {
                         let Some(kind) = crate::panels::Kind::parse(panel) else { continue };
-                        self.next_pane += 1;
-                        self.panels.insert(self.next_pane, crate::panels::PanelState::new(kind));
-                        self.next_pane
+                        let id = next_pane_id();
+                        self.panels.insert(id, crate::panels::PanelState::new(kind));
+                        id
                     }
                 };
                 map.insert(*old, new);
@@ -1855,6 +2157,38 @@ impl Active {
                 .find(|p| self.panes.contains_key(p))
                 .unwrap_or_else(|| *self.panes.keys().next().unwrap_or(&0))
         };
+    }
+
+    /// Take tab `i` out of this window, sessions running, for another
+    /// window. The window keeps at least one other tab.
+    fn detach_tab(
+        &mut self,
+        i: usize,
+        position: Option<winit::dpi::PhysicalPosition<i32>>,
+    ) -> Detached {
+        let tab = self.ws.tabs[i].clone();
+        let mut panes = Vec::new();
+        let mut panels = Vec::new();
+        for id in self.ws.close_tab(i) {
+            if let Some(p) = self.panes.remove(&id) {
+                panes.push((id, p));
+            }
+            if let Some(p) = self.panels.remove(&id) {
+                if let crate::panels::Kind::Script { ext, id: pid } = &p.kind {
+                    self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(false));
+                }
+                panels.push((id, p));
+            }
+            self.renderer.drop_slot(id);
+        }
+        for (_, p) in &mut panes {
+            p.last_generation = u64::MAX;
+            p.activity = false;
+        }
+        self.fix_term_focus();
+        self.apply_layout();
+        self.focus_changed();
+        Detached { tab, panes, panels, size: self.window.inner_size(), position }
     }
 
     fn close_tab(&mut self, i: usize) -> bool {
@@ -2580,6 +2914,21 @@ impl Active {
         }
         if let (Some(from), false, WButton::Left) = (self.tab_drag, pressed, button) {
             self.tab_drag = None;
+            // Dropped outside the window: the tab gets a window of its own
+            // there.
+            let size = self.window.inner_size();
+            let (x, y) = self.mouse.pos;
+            let outside = x < 0.0 || y < 0.0 || x >= size.width as f64 || y >= size.height as f64;
+            if outside && self.ws.tabs.len() > 1 {
+                let origin = self.window.outer_position().unwrap_or_default();
+                let at = winit::dpi::PhysicalPosition::new(
+                    origin.x + x as i32 - 40,
+                    origin.y + y as i32 - 10,
+                );
+                self.ws.active = from.min(self.ws.tabs.len() - 1);
+                self.pending = Some(Request::DetachTab(Some(at)));
+                return;
+            }
             let col =
                 (self.mouse.pos.0 / self.overlay.cell_metrics().width as f64).max(0.0) as usize;
             if let crate::tabbar::Hit::Tab(to) | crate::tabbar::Hit::Close(to) =
@@ -2983,7 +3332,7 @@ fn encode_base64(data: &[u8]) -> String {
     out
 }
 
-impl ApplicationHandler<UserEvent> for App {
+impl Win {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.active.is_some() {
             return;
@@ -2992,17 +3341,17 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(a) => self.active = Some(a),
             Err(e) => {
                 self.error = Some(e);
-                event_loop.exit();
+                self.closed = true;
             }
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        if let UserEvent::ConfigChanged(files) = event {
+        if let UserEvent::ConfigChanged(_, files) = event {
             self.handle(Request::Files(files), event_loop);
             return;
         }
-        if let UserEvent::Script = event {
+        if let UserEvent::Script(_) = event {
             if let Some(a) = &mut self.active {
                 let theme = a.renderer.theme().clone();
                 let fx = a.scripts.apply(&mut a.visual, &theme);
@@ -3024,7 +3373,7 @@ impl ApplicationHandler<UserEvent> for App {
         for (id, code) in exited {
             if a.close_pane(id) {
                 self.exit_code = code;
-                event_loop.exit();
+                self.closed = true;
                 return;
             }
         }
@@ -3088,7 +3437,7 @@ impl ApplicationHandler<UserEvent> for App {
             eprintln!("seraphim: input {event:?}");
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.closed = true,
             WindowEvent::Resized(size) => {
                 a.gpu.config.width = size.width.max(1);
                 a.gpu.config.height = size.height.max(1);
@@ -3276,8 +3625,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(a) = &mut self.active else { return };
+    /// Timers and animation; returns when the window next needs the loop.
+    fn about_to_wait(&mut self) -> Option<Instant> {
+        let Some(a) = &mut self.active else { return None };
         let now = Instant::now();
         let mut wake: Option<Instant> = None;
 
@@ -3294,8 +3644,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if now >= due && t.key_at.is_none() {
                     if p.left == 0 {
-                        event_loop.exit();
-                        return;
+                        self.closed = true;
+                        return None;
                     }
                     p.left -= 1;
                     p.sent += 1;
@@ -3430,22 +3780,12 @@ impl ApplicationHandler<UserEvent> for App {
         } else {
             a.blink_on = true;
         }
-        event_loop.set_control_flow(match wake {
-            Some(t) => ControlFlow::WaitUntil(t),
-            None => ControlFlow::Wait,
-        });
+        wake
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn exiting(&mut self) {
         if let Some(t) = self.active.as_ref().and_then(|a| a.timing.as_ref()) {
             t.report();
-        }
-        if let Some(a) = &self.active {
-            if self.options.restore_session {
-                if let Err(e) = crate::restore::save(&a.saved_session()) {
-                    eprintln!("seraphim: saving the session: {e}");
-                }
-            }
         }
         // Dropping the session hangs up the shell (SIGHUP to its group).
         self.active = None;

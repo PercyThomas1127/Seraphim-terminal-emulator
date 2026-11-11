@@ -191,3 +191,29 @@ fn terminal_guard_releases_on_drop() {
     let cols = s.terminal().cols(); // a second, sequential lock is fine
     assert_eq!((cols, rows), (80, 24));
 }
+
+#[test]
+fn a_moved_session_publishes_on_its_new_bus() {
+    // A tab moved to another window: the shell keeps running, and its
+    // events (and its current directory) go to the new window's bus.
+    let old = EventBus::new();
+    let new = EventBus::new();
+    let old_sub = old.subscribe("*", 256);
+    let new_sub = new.subscribe("*", 256);
+    let cmd = Command::new("/bin/sh").args([
+        "-c",
+        "printf '\\033]7;file:///tmp\\007'; read x; printf 'after %s\\a' \"$x\"; read y",
+    ]);
+    let s = Session::spawn(5, SessionConfig { command: cmd, ..Default::default() }, &old).unwrap();
+    wait_event(&old_sub, "session.cwd.changed");
+    s.move_to(&new);
+    assert_eq!(wait_event(&new_sub, "session.cwd.changed").data["cwd"], "/tmp");
+    s.write(b"moved\n").unwrap();
+    wait_screen(&s, "after moved");
+    assert_eq!(wait_event(&new_sub, "terminal.bell").session, Some(5));
+    while let Ok(e) = old_sub.recv_timeout(Duration::from_millis(50)) {
+        assert_ne!(e.name, "terminal.bell", "the old bus still gets events");
+    }
+    s.write(b"\n").unwrap();
+    s.wait_exit(Duration::from_secs(10)).expect("exited");
+}

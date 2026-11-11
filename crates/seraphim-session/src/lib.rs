@@ -129,6 +129,8 @@ struct Shared {
     /// Bumped whenever terminal state changes; renderers poll/compare this
     /// to decide whether a frame is needed.
     generation: AtomicU64,
+    /// Whether the session runs as root, as last published.
+    root: Mutex<Option<bool>>,
 }
 
 /// One running terminal session.
@@ -138,6 +140,7 @@ pub struct Session {
     pty: Arc<Mutex<Pty>>,
     writer: Arc<Mutex<std::fs::File>>,
     shared: Arc<Shared>,
+    publisher: Arc<Mutex<Publisher>>,
     io_thread: Option<JoinHandle<()>>,
     cell_pixels: Mutex<Option<(f32, f32)>>,
 }
@@ -164,9 +167,9 @@ impl Session {
         let pid = pty.pid();
         let pty = Arc::new(Mutex::new(pty));
         let shared = Arc::new(Shared::default());
-        let publisher = bus.publisher("session");
+        let publisher = Arc::new(Mutex::new(bus.publisher("session")));
 
-        publisher.publish(
+        publisher.lock().unwrap().publish(
             "session.created",
             Some(id),
             json!({"pid": pid, "cols": config.cols, "rows": config.rows}),
@@ -179,7 +182,7 @@ impl Session {
             writer: writer.clone(),
             pty: pty.clone(),
             shared: shared.clone(),
-            publisher,
+            publisher: publisher.clone(),
             shell_pid: pid,
             command: None,
             root: None,
@@ -195,6 +198,7 @@ impl Session {
             pty,
             writer,
             shared,
+            publisher,
             io_thread: Some(io_thread),
             cell_pixels: Mutex::new(config.cell_pixels),
         })
@@ -280,6 +284,22 @@ impl Session {
         std::mem::take(&mut *self.shared.clipboard.lock().unwrap())
     }
 
+    /// Publish this session's events on another bus from now on (its pane
+    /// moved to another window), and announce its current state there:
+    /// privilege and working directory.
+    pub fn move_to(&self, bus: &EventBus) {
+        let p = bus.publisher("session");
+        *self.publisher.lock().unwrap() = p.clone();
+        if let Some(root) = *self.shared.root.lock().unwrap() {
+            p.publish("session.privileged", Some(self.id), json!({"root": root}));
+        }
+        let cwd = self.terminal.lock().unwrap().cwd().map(str::to_owned);
+        if let Some(cwd) = cwd {
+            p.publish("session.cwd.changed", Some(self.id), json!({"cwd": cwd}));
+        }
+        self.shared.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Info on the shell (the session's first process).
     pub fn shell_process(&self) -> Option<ProcessInfo> {
         ProcessInfo::read(self.pty.lock().unwrap().pid())
@@ -347,7 +367,7 @@ struct IoLoop {
     writer: Arc<Mutex<std::fs::File>>,
     pty: Arc<Mutex<Pty>>,
     shared: Arc<Shared>,
-    publisher: Publisher,
+    publisher: Arc<Mutex<Publisher>>,
     shell_pid: u32,
     command: Option<(Option<String>, Instant)>,
     root: Option<bool>,
@@ -355,6 +375,11 @@ struct IoLoop {
 }
 
 impl IoLoop {
+    /// Where events go now (the pane may have moved to another window).
+    fn publisher(&self) -> Publisher {
+        self.publisher.lock().unwrap().clone()
+    }
+
     fn changed(&self) {
         self.shared.generation.fetch_add(1, Ordering::Release);
         if let Some(n) = &self.notify {
@@ -378,7 +403,7 @@ impl IoLoop {
             // Three levels of output (spec §8.4): raw bytes, parsed text,
             // and semantic shell events (below). The costly ones are built
             // only when someone listens.
-            let p = &self.publisher;
+            let p = &self.publisher();
             let want_text = p.wants("terminal.output") || p.wants("command.output");
             let want_cursor = p.wants("terminal.cursor.moved");
             let (events, responses, text, cursor) = {
@@ -427,7 +452,7 @@ impl IoLoop {
             code: status.and_then(|s| s.code()),
             signal: status.and_then(|s| s.signal()),
         };
-        self.publisher.publish(
+        self.publisher().publish(
             "session.exited",
             Some(self.id),
             json!({"exit_code": info.code, "signal": info.signal}),
@@ -439,7 +464,7 @@ impl IoLoop {
 
     fn handle(&mut self, ev: TerminalEvent) {
         let id = Some(self.id);
-        let p = &self.publisher;
+        let p = &self.publisher();
         match ev {
             TerminalEvent::Bell => {
                 p.publish("terminal.bell", id, json!({}));
@@ -513,7 +538,12 @@ impl IoLoop {
         if let Some(root) = info.map(|i| i.is_root()) {
             if self.root != Some(root) {
                 self.root = Some(root);
-                self.publisher.publish("session.privileged", Some(self.id), json!({"root": root}));
+                *self.shared.root.lock().unwrap() = Some(root);
+                self.publisher().publish(
+                    "session.privileged",
+                    Some(self.id),
+                    json!({"root": root}),
+                );
             }
         }
     }
