@@ -495,6 +495,13 @@ struct Active {
     tab_hits: crate::tabbar::Hits,
     /// A divider being dragged.
     drag: Option<Divider>,
+    /// Floating panels over the panes, bottom first. They belong to the
+    /// window, not a tab.
+    floats: Vec<Float>,
+    /// A floating panel has the keyboard.
+    float_focus: Option<u64>,
+    /// A floating panel being moved or resized.
+    float_drag: Option<FloatDrag>,
     /// A tab being dragged to a new place.
     tab_drag: Option<usize>,
     /// Rename Tab: the label being typed.
@@ -569,6 +576,28 @@ impl Active {
         let unfocused = !self.focused && !self.visual_cfg.animate_unfocused;
         self.visual.set_paused(unfocused || self.occluded);
     }
+}
+
+/// A floating panel and where it is (pixels in the window).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Float {
+    id: u64,
+    rect: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FloatDrag {
+    id: u64,
+    /// Resizing by the corner rather than moving by the title.
+    resize: bool,
+    from: (f64, f64),
+    start: Rect,
+}
+
+/// Rect slots of floating panels' frames (one per panel, so that each
+/// frame is drawn under its own panel and over the ones beneath).
+fn frame_slot(id: u64) -> u64 {
+    DECOR_SLOT - 1 - id
 }
 
 /// Where Seraphim's window buttons are drawn.
@@ -986,6 +1015,9 @@ impl Win {
             probe: o.probe.map(|left| Probe { left, sent: 0, next: None }),
             tab_hits: Default::default(),
             drag: None,
+            floats: Vec::new(),
+            float_focus: None,
+            float_drag: None,
             tab_drag: None,
             renaming: None,
             pane_events,
@@ -1034,7 +1066,6 @@ impl Win {
         // startup layout, or one shell (the first window); a detached tab;
         // or one shell.
         let mut cwd = None;
-        let mut script_panels = Vec::new();
         match seed {
             Seed::First(saved) => {
                 let layout =
@@ -1057,9 +1088,6 @@ impl Win {
                     active.panes.insert(id, p);
                 }
                 for (id, p) in d.panels {
-                    if let crate::panels::Kind::Script { ext, id } = &p.kind {
-                        script_panels.push((ext.clone(), id.clone()));
-                    }
                     active.panels.insert(id, p);
                 }
                 let i = active.ws.add_tab(d.tab.root.clone(), d.tab.profile.clone());
@@ -1096,6 +1124,16 @@ impl Win {
         }
         active.extension_list = active.scripts.installed.clone();
         active.rebuild_menu();
+        // Extension panels the window opened with (restored, or in a
+        // detached tab) render once their extension hears they are open.
+        let script_panels: Vec<_> = active
+            .panels
+            .values()
+            .filter_map(|p| match &p.kind {
+                crate::panels::Kind::Script { ext, id } => Some((ext.clone(), id.clone())),
+                _ => None,
+            })
+            .collect();
         for (ext, id) in script_panels {
             active.scripts.panel_event(&ext, &id, seraphim_script::PanelEvent::Open(true));
         }
@@ -1571,6 +1609,36 @@ impl Active {
     }
 
     fn run_action(&mut self, action: Action) {
+        // Moving around the tabs and splits takes the keyboard from a
+        // floating panel.
+        use Action as A;
+        if matches!(
+            action,
+            A::NewTab
+                | A::CloseTab
+                | A::NextTab
+                | A::PrevTab
+                | A::GotoTab(_)
+                | A::MoveTabLeft
+                | A::MoveTabRight
+                | A::RenameTab
+                | A::DetachTab
+                | A::SplitRight
+                | A::SplitDown
+                | A::FocusLeft
+                | A::FocusRight
+                | A::FocusUp
+                | A::FocusDown
+                | A::ResizeLeft
+                | A::ResizeRight
+                | A::ResizeUp
+                | A::ResizeDown
+                | A::ZoomPane
+                | A::EqualizePanes
+        ) && self.float_focus.take().is_some()
+        {
+            self.focus_changed();
+        }
         let rows = focused!(self).terminal().rows() as i64;
         let scroll = |a: &mut Active, delta: i64| {
             focused!(a).terminal().scroll_display(delta);
@@ -1673,6 +1741,7 @@ impl Active {
                 self.apply_layout();
             }
             Action::DetachTab => self.pending = Some(Request::DetachTab(None)),
+            Action::FloatPanel => self.toggle_float(),
             Action::SplitRight => self.split(Split::Right),
             Action::SplitDown => self.split(Split::Down),
             Action::ClosePane => {
@@ -1825,8 +1894,90 @@ impl Active {
         (self.panes_cfg.divider * self.scale as f32).round().max(1.0)
     }
 
+    /// The pane with the keyboard: a floating panel, or the tab's focus.
     fn focus_id(&self) -> u64 {
-        self.ws.focus().unwrap_or(0)
+        self.float_focus
+            .filter(|f| self.floats.iter().any(|x| x.id == *f))
+            .unwrap_or_else(|| self.ws.focus().unwrap_or(0))
+    }
+
+    fn float_rect(&self, id: u64) -> Option<Rect> {
+        self.floats.iter().find(|f| f.id == id).map(|f| f.rect)
+    }
+
+    /// The topmost floating panel under a point.
+    fn float_at(&self, x: f32, y: f32) -> Option<u64> {
+        self.floats.iter().rev().find(|f| f.rect.contains(x, y)).map(|f| f.id)
+    }
+
+    fn raise_float(&mut self, id: u64) {
+        if let Some(i) = self.floats.iter().position(|f| f.id == id) {
+            let f = self.floats.remove(i);
+            self.floats.push(f);
+        }
+    }
+
+    /// Show panel `id` floating (it must not be in a tab), focused, in the
+    /// middle of the panes (cascaded when there are others).
+    fn add_float(&mut self, id: u64) {
+        let area = self.pane_area();
+        let m = self.renderer.cell_metrics();
+        let n = self.floats.len() as f32;
+        let w = ((area.w * 0.45).max(m.width * 40.0).min(area.w) / m.width).floor() * m.width;
+        let h = ((area.h * 0.6).max(m.height * 10.0).min(area.h) / m.height).floor() * m.height;
+        let step = m.height * 1.5 * (n % 5.0);
+        let x = (area.x + (area.w - w) / 2.0 + step).round();
+        let y = (area.y + (area.h - h) / 3.0 + step).round();
+        self.floats.push(Float { id, rect: Rect::new(x, y, w, h) });
+        self.clamp_floats();
+        self.float_focus = Some(id);
+        self.focus_changed();
+        self.window.request_redraw();
+    }
+
+    /// Keep floating panels inside the window, at least a few cells big
+    /// and whole cells in size.
+    fn clamp_floats(&mut self) {
+        let area = self.pane_area();
+        let m = self.renderer.cell_metrics();
+        for f in &mut self.floats {
+            let r = &mut f.rect;
+            r.w = ((r.w.min(area.w).max(m.width * 16.0)) / m.width).floor() * m.width;
+            r.h = ((r.h.min(area.h).max(m.height * 4.0)) / m.height).floor() * m.height;
+            r.x = r.x.min(area.x + area.w - r.w).max(area.x);
+            r.y = r.y.min(area.y + area.h - r.h).max(area.y);
+        }
+    }
+
+    /// View → Float Panel: a panel in a tab floats; a floating one goes
+    /// back into the tab, beside the terminal.
+    fn toggle_float(&mut self) {
+        let id = self.focus_id();
+        if !self.panels.contains_key(&id) {
+            self.notify("Float Panel works on panels (focus one first)");
+            return;
+        }
+        if self.float_rect(id).is_some() {
+            self.floats.retain(|f| f.id != id);
+            self.float_focus = None;
+            self.ws.split_with(id, Split::Right, 0.62);
+            self.renderer.drop_slot(frame_slot(id));
+            self.apply_layout();
+            self.focus_changed();
+            return;
+        }
+        // Leave the tab; never the last terminal's.
+        if self.ws.tab().is_some_and(|t| t.root.panes().len() == 1) && self.ws.tabs.len() == 1 {
+            self.notify("The window needs its terminal: open the panel beside one first");
+            return;
+        }
+        let closed = self.ws.close(id);
+        if closed == Closed::Last {
+            return;
+        }
+        self.fix_term_focus();
+        self.apply_layout();
+        self.add_float(id);
     }
 
     /// Start a shell (or `command`) in a new pane; it isn't placed yet.
@@ -1885,6 +2036,7 @@ impl Active {
 
     /// Size every visible pane's terminal to its rectangle.
     fn apply_layout(&mut self) {
+        self.clamp_floats();
         let (rects, _) = self.ws.layout(self.pane_area(), self.gap());
         for (id, r) in rects {
             let Some(p) = self.panes.get_mut(&id) else { continue };
@@ -1975,12 +2127,7 @@ impl Active {
         self.open_panel(kind, place);
     }
 
-    fn open_panel(&mut self, kind: crate::panels::Kind, place: &str) -> u64 {
-        let id = next_pane_id();
-        if let crate::panels::Kind::Script { ext, id: pid } = &kind {
-            self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(true));
-        }
-        self.panels.insert(id, crate::panels::PanelState::new(kind));
+    fn open_panel_in_tab(&mut self, id: u64, place: &str) {
         match place {
             "tab" => {
                 self.ws.add_tab(Node::Pane(id), None);
@@ -1994,6 +2141,25 @@ impl Active {
         }
         self.apply_layout();
         self.focus_changed();
+    }
+
+    fn open_panel(&mut self, kind: crate::panels::Kind, place: &str) -> u64 {
+        let id = next_pane_id();
+        if let crate::panels::Kind::Script { ext, id: pid } = &kind {
+            self.scripts.panel_event(ext, pid, seraphim_script::PanelEvent::Open(true));
+        }
+        self.panels.insert(id, crate::panels::PanelState::new(kind));
+        match place {
+            "float" => {
+                self.add_float(id);
+                return id;
+            }
+            _ => {
+                // A panel in the tab takes the keyboard.
+                self.float_focus = None;
+                self.open_panel_in_tab(id, place);
+            }
+        }
         id
     }
 
@@ -2077,7 +2243,22 @@ impl Active {
                 }
             })
             .collect();
-        crate::restore::Saved { version: 1, active: self.ws.active, tabs }
+        let area = self.pane_area();
+        let floats = self
+            .floats
+            .iter()
+            .filter_map(|f| {
+                let p = self.panels.get(&f.id)?;
+                Some(crate::restore::SavedFloat {
+                    panel: p.kind.name(),
+                    x: (f.rect.x - area.x) / area.w.max(1.0),
+                    y: (f.rect.y - area.y) / area.h.max(1.0),
+                    w: f.rect.w / area.w.max(1.0),
+                    h: f.rect.h / area.h.max(1.0),
+                })
+            })
+            .collect();
+        crate::restore::Saved { version: 1, active: self.ws.active, tabs, floats }
     }
 
     /// Rebuild saved tabs. Returns false if nothing could be restored.
@@ -2152,6 +2333,20 @@ impl Active {
         }
         if any {
             self.ws.active = saved.active.min(self.ws.tabs.len() - 1);
+            let area = self.pane_area();
+            for f in &saved.floats {
+                let Some(kind) = crate::panels::Kind::parse(&f.panel) else { continue };
+                let id = next_pane_id();
+                self.panels.insert(id, crate::panels::PanelState::new(kind));
+                let rect = Rect::new(
+                    area.x + f.x * area.w,
+                    area.y + f.y * area.h,
+                    f.w * area.w,
+                    f.h * area.h,
+                );
+                self.floats.push(Float { id, rect });
+            }
+            self.clamp_floats();
         }
         any && !self.panes.is_empty()
     }
@@ -2212,6 +2407,13 @@ impl Active {
     /// Close a pane (hanging up its shell). Returns true when it was the
     /// window's last.
     fn close_pane(&mut self, id: u64) -> bool {
+        if self.float_rect(id).is_some() {
+            self.floats.retain(|f| f.id != id);
+            self.renderer.drop_slot(frame_slot(id));
+            if self.float_focus == Some(id) {
+                self.float_focus = None;
+            }
+        }
         let closed = self.ws.close(id);
         if let Some(p) = self.panels.remove(&id) {
             if let crate::panels::Kind::Script { ext, id: pid } = &p.kind {
@@ -2301,6 +2503,8 @@ impl Active {
     }
 
     fn switch_tab(&mut self, f: impl FnOnce(&mut Workspace)) {
+        // The keyboard goes to the tab (floating panels stay up).
+        self.float_focus = None;
         let before = self.ws.active;
         f(&mut self.ws);
         if self.ws.active != before {
@@ -2435,6 +2639,29 @@ impl Active {
             let mut t = seraphim_terminal::Terminal::with_scrollback(cols, rows, 0);
             t.set_color_scheme(theme.scheme());
             t.advance(&painted.bytes);
+            if self.float_rect(id).is_some() {
+                // A close button in the title, a grip in the corner.
+                let on = self.focused && id == focus;
+                let (fg, bg) = if on {
+                    (palette.hi_fg, palette.hi_bg)
+                } else {
+                    (palette.bar_fg, palette.bar_bg)
+                };
+                let c = |c: [u8; 3]| format!("{};{};{}", c[0], c[1], c[2]);
+                t.advance(
+                    format!(
+                        "\x1b[1;{}H\x1b[0;38;2;{};48;2;{}m×\x1b[{};{}H\x1b[0;38;2;{};48;2;{}m◢\x1b[0m",
+                        cols.saturating_sub(1).max(1),
+                        c(fg),
+                        c(bg),
+                        rows,
+                        cols,
+                        c(palette.dim),
+                        c(palette.menu_bg),
+                    )
+                    .as_bytes(),
+                );
+            }
             let view = View {
                 width: r.w.max(1.0) as u32,
                 height: r.h.max(1.0) as u32,
@@ -2509,11 +2736,22 @@ impl Active {
 
     /// The pane under a pixel position.
     fn pane_at(&self, x: f32, y: f32) -> Option<u64> {
-        self.drawn.iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| *id)
+        self.float_at(x, y)
+            .or_else(|| self.drawn.iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| *id))
+    }
+
+    /// Where a pane was drawn: floating, or in the tab.
+    fn rect_of(&self, id: u64) -> Rect {
+        self.float_rect(id)
+            .or_else(|| self.drawn.iter().find(|(p, _)| *p == id).map(|(_, r)| *r))
+            .unwrap_or_default()
     }
 
     /// The divider under a pixel position (a little slack to grab it).
     fn divider_at(&self, x: f32, y: f32) -> Option<Divider> {
+        if self.float_at(x, y).is_some() {
+            return None;
+        }
         let (_, divs) = self.ws.layout(self.pane_area(), self.gap());
         divs.into_iter().find(|d| {
             let r = d.rect;
@@ -3034,6 +3272,26 @@ impl Active {
         if self.decor_motion() {
             return;
         }
+        if let Some(d) = self.float_drag {
+            let (dx, dy) = ((x - d.from.0) as f32, (y - d.from.1) as f32);
+            if let Some(f) = self.floats.iter_mut().find(|f| f.id == d.id) {
+                if d.resize {
+                    f.rect.w = d.start.w + dx;
+                    f.rect.h = d.start.h + dy;
+                } else {
+                    f.rect.x = (d.start.x + dx).round();
+                    f.rect.y = (d.start.y + dy).round();
+                }
+            }
+            self.clamp_floats();
+            self.window.request_redraw();
+            return;
+        }
+        if self.float_at(x as f32, y as f32).is_some() {
+            self.window.set_cursor(CursorIcon::Default);
+            self.mouse.reporting = true; // the icon is re-evaluated on the way out
+            return;
+        }
         // Dragging a divider resizes the panes on either side.
         if let Some(d) = &self.drag {
             let ratio = match d.split {
@@ -3149,9 +3407,46 @@ impl Active {
                 return;
             }
         }
+        if self.float_drag.is_some() && !pressed && button == WButton::Left {
+            self.float_drag = None;
+            return;
+        }
+        // Floating panels: the title moves one, the corner resizes it, ×
+        // closes it; a press anywhere on one raises it and gives it the
+        // keyboard. A press elsewhere gives the keyboard back to the tab.
+        if pressed && !terminal_drag {
+            if let Some(id) = self.float_at(x, y) {
+                self.raise_float(id);
+                if self.float_focus != Some(id) {
+                    self.float_focus = Some(id);
+                    self.focus_changed();
+                }
+                let r = self.rect_of(id);
+                let m = self.renderer.cell_metrics();
+                let title = y < r.y + m.height;
+                let close = title && x >= r.x + r.w - m.width * 2.0;
+                let corner = y >= r.y + r.h - m.height && x >= r.x + r.w - m.width * 2.0;
+                if button == WButton::Left && close {
+                    if self.close_pane(id) {
+                        self.pending = Some(Request::Quit);
+                    }
+                    return;
+                }
+                if button == WButton::Left && (title || corner) {
+                    self.float_drag =
+                        Some(FloatDrag { id, resize: corner, from: self.mouse.pos, start: r });
+                    return;
+                }
+            } else if self.float_focus.take().is_some() {
+                self.focus_changed();
+            }
+        }
         // A press in another pane focuses it (and does nothing else).
         if pressed && !terminal_drag {
-            if let Some(id) = self.pane_at(x, y).filter(|id| *id != self.focus_id()) {
+            if let Some(id) = self
+                .pane_at(x, y)
+                .filter(|id| *id != self.focus_id() && self.float_rect(*id).is_none())
+            {
                 self.ws.set_focus(id);
                 self.focus_changed();
                 return;
@@ -3160,8 +3455,9 @@ impl Active {
         // Clicks in a panel pick its rows.
         if let Some(id) = self.pane_at(x, y).filter(|id| self.panels.contains_key(id)) {
             if pressed && button == WButton::Left {
-                let r =
-                    self.drawn.iter().find(|(p, _)| *p == id).map(|(_, r)| *r).unwrap_or_default();
+                let r = self.rect_of(id);
+                // Floating panels have no padding.
+                let pad = if self.float_rect(id).is_some() { 0.0 } else { pad };
                 let ch = self.renderer.cell_metrics().height;
                 let row = ((y - r.y - pad) / ch).floor().max(0.0) as usize;
                 let sessions = self.session_rows();
@@ -3714,6 +4010,8 @@ impl Win {
                 let (rects, dividers) = a.ws.layout(a.pane_area(), a.gap());
                 let focus = a.focus_id();
                 a.paint_panels(&rects, pad);
+                let floats: Vec<(u64, Rect)> = a.floats.iter().map(|f| (f.id, f.rect)).collect();
+                a.paint_panels(&floats, 0.0);
                 for (id, r) in &rects {
                     let Some(p) = a.panes.get_mut(id) else { continue };
                     let view = View {
@@ -3765,6 +4063,40 @@ impl Win {
                     size.height,
                     &decor,
                 );
+                // Each floating panel's frame: a soft shadow and a border
+                // (the accent when it has the keyboard).
+                let palette = menu::Palette::from_theme(&theme);
+                for f in a.floats.clone() {
+                    let r = f.rect;
+                    let on = a.focused && f.id == focus;
+                    let edge = palette.border.map(|c| c as f32 / 255.0);
+                    let accent = palette.accent.map(|c| c as f32 / 255.0);
+                    let b = if on { accent } else { edge };
+                    let mut rects = Vec::new();
+                    for (grow, alpha) in [(10.0, 0.08), (6.0, 0.12), (3.0, 0.18)] {
+                        rects.push((
+                            [
+                                r.x - grow + 3.0,
+                                r.y - grow + 5.0,
+                                r.w + 2.0 * grow,
+                                r.h + 2.0 * grow,
+                            ],
+                            [0.0, 0.0, 0.0, alpha],
+                        ));
+                    }
+                    rects.push((
+                        [r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0],
+                        [b[0], b[1], b[2], 1.0],
+                    ));
+                    a.renderer.select(&a.gpu.device, frame_slot(f.id));
+                    a.renderer.prepare_rects(
+                        &a.gpu.device,
+                        &a.gpu.queue,
+                        size.width,
+                        size.height,
+                        &rects,
+                    );
+                }
                 a.renderer.select(&a.gpu.device, focus);
                 a.drawn = rects;
                 // The tab bar, below the menu bar.
@@ -3943,7 +4275,8 @@ impl Win {
         }
 
         // Panels that change by themselves (the system monitor).
-        let visible: Vec<u64> = a.drawn.iter().map(|(id, _)| *id).collect();
+        let visible: Vec<u64> =
+            a.drawn.iter().map(|(id, _)| *id).chain(a.floats.iter().map(|f| f.id)).collect();
         for (id, p) in a.panels.iter_mut().filter(|(id, _)| visible.contains(id)) {
             let _ = id;
             if let Some((sampled, next)) = p.tick(now) {
@@ -4090,6 +4423,20 @@ fn draw(a: &mut Active) {
         pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
         a.renderer.select(&a.gpu.device, DECOR_SLOT);
         a.renderer.render(&mut pass);
+        // Floating panels, bottom first, each over its frame.
+        for f in &a.floats {
+            let r = f.rect;
+            if r.w < 1.0 || r.h < 1.0 || r.x + r.w > w as f32 + 0.5 || r.y + r.h > h as f32 + 0.5 {
+                continue;
+            }
+            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            a.renderer.select(&a.gpu.device, frame_slot(f.id));
+            a.renderer.render(&mut pass);
+            pass.set_viewport(r.x.max(0.0), r.y.max(0.0), r.w, r.h, 0.0, 1.0);
+            a.renderer.select(&a.gpu.device, f.id);
+            a.renderer.render(&mut pass);
+        }
+        pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
         a.renderer.select(&a.gpu.device, focus);
         let tb = a.title_bar_height() as f32;
         if tb > 0.0 && tb <= h as f32 {

@@ -43,6 +43,19 @@ pub struct Saved {
     pub version: u32,
     pub active: usize,
     pub tabs: Vec<SavedTab>,
+    /// Floating panels, bottom first.
+    #[serde(default)]
+    pub floats: Vec<SavedFloat>,
+}
+
+/// A floating panel: which, and where, as fractions of the pane area.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedFloat {
+    pub panel: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 /// Every window (version 2; version 1 files hold one [`Saved`]).
@@ -137,6 +150,7 @@ mod tests {
                 profile: None,
                 panes,
             }],
+            floats: vec![SavedFloat { panel: "history".into(), x: 0.1, y: 0.2, w: 0.5, h: 0.5 }],
         };
         save(&[s.clone(), Saved { tabs: vec![], ..s.clone() }]).unwrap();
         // Windows without tabs are dropped.

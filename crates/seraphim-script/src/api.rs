@@ -947,8 +947,8 @@ fn ui(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
                 return Err(err(format!("ui.open_panel: no panel {id:?} (ui.panel first)")));
             }
             let place = opt::<String>(&opts, "place")?.unwrap_or_else(|| "right".into());
-            if !["right", "down", "tab"].contains(&place.as_str()) {
-                return Err(err("ui.open_panel: place is right, down or tab"));
+            if !["right", "down", "tab", "float"].contains(&place.as_str()) {
+                return Err(err("ui.open_panel: place is right, down, tab or float"));
             }
             c.send(Command::OpenPanel { ext: c.name.clone(), id, place });
             Ok(())

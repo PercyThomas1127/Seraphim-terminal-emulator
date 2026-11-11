@@ -58,6 +58,7 @@ items = [
     { label = "Sessio&ns", action = "panel-sessions" },
     { label = "Command &History", action = "panel-history" },
     { label = "&Package Activity", action = "panel-packages" },
+    { label = "&Float or Dock Panel", action = "float-panel" },
 ]
 
 [[menu]]

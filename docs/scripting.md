@@ -254,7 +254,7 @@ The screen is a snapshot, at most 50 ms old, never the live grid.
 | `ui.key(chord, command_id or fn)` | A shortcut such as `ctrl+shift+e`, `alt+enter` or `f5`. Extension shortcuts take precedence over the built-in ones; a bare letter is refused. |
 | `ui.action(name)` | A built-in action: `copy`, `paste`, `zoom-in`, `new-tab`, `split-right`, `close-pane`, `panel-system`, `settings`, … (the menu actions). |
 | `ui.panel(id, {title, render, on_select, on_key, interval})` | A panel (below). It appears in the Extensions menu. |
-| `ui.open_panel(id, {place})` | Show it: `place` is `right` (default), `down` or `tab`. |
+| `ui.open_panel(id, {place})` | Show it: `place` is `right` (default), `down`, `tab` or `float` (over the panes; drag its title to move it, its corner to resize it). |
 | `ui.refresh(id)` | Render an open panel again now. |
 | `ui.open_layout(name)` | Open a `[[layout]]`. |
 

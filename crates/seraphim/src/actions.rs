@@ -49,6 +49,7 @@ pub enum Action {
     GotoTab(u8),
     RenameTab,
     DetachTab,
+    FloatPanel,
     SplitRight,
     SplitDown,
     ClosePane,
@@ -122,6 +123,7 @@ impl Action {
             "move-tab-right" => MoveTabRight,
             "rename-tab" => RenameTab,
             "detach-tab" => DetachTab,
+            "float-panel" => FloatPanel,
             "split-right" => SplitRight,
             "split-down" => SplitDown,
             "close-pane" => ClosePane,
@@ -180,7 +182,7 @@ impl Action {
             ResizeLeft | ResizeRight | ResizeUp | ResizeDown => "Ctrl+Alt+Arrows",
             ZoomPane => "Ctrl+Shift+Z",
             OpenPanel(PanelId::Settings) => "Ctrl+Shift+,",
-            OpenPanel(_) => "",
+            OpenPanel(_) | FloatPanel => "",
             OpenFileManager | ClearScrollback | OpenConfigFolder | Shortcuts | About
             | EqualizePanes => "",
         }
@@ -223,6 +225,7 @@ impl Action {
             GotoTab(_) => "Go to tab 1-9",
             RenameTab => "Rename tab",
             DetachTab => "Move tab to a new window",
+            FloatPanel => "Float or dock the focused panel",
             SplitRight => "Split right",
             SplitDown => "Split down",
             ClosePane => "Close pane",
