@@ -257,6 +257,13 @@ replaces it).
     red.
   * Choosing a profile in a tab makes it that tab's, with its own theme
     and background.
+  * Drag a tab out of the window, or press Ctrl+Shift+L, to give it a
+    window of its own. Its shells keep running.
+  * Tab designs (`[tabs]`): `style` is `classic`, `powerline`, `rounded`,
+    `slanted` or `minimal`; `position` is `top` or `bottom`; there are
+    widths, buttons and `[tabs.colors]` too.
+
+  ![Tab styles: classic, powerline, rounded, slanted, minimal](docs/images/tab-styles.png)
 * **Splits:** Ctrl+Shift+E splits right and Ctrl+Shift+O down. Alt+arrows
   move between panes, Ctrl+Alt+arrows resize them, Ctrl+Shift+Z zooms
   one, and Ctrl+Shift+X closes it. Drag dividers; click a pane to focus
@@ -264,7 +271,17 @@ replaces it).
   are dimmed (`[panes]`).
 * **Panels** (View menu): System Monitor, Sessions, Command History
   (Enter types a command again) and Package Activity, plus panels from
-  extensions (`ui.panel`, see the scripting guide).
+  extensions (`ui.panel`, see the scripting guide). View → Float or Dock
+  Panel lifts the focused panel over the panes: drag its title to move
+  it and its corner to resize it.
+
+  ![Two floating panels over a terminal](docs/images/floating-panels.png)
+* **Window decorations:** `[window] decorations = "seraphim"` draws
+  Seraphim's own title bar with minimize, maximize and close buttons
+  (in the tab bar when it is at the top). `"none"` leaves the title bar
+  out. Either way the window's edges resize it.
+
+  ![Seraphim's title bar, and its buttons in the tab bar](docs/images/decorations.png)
 * **Settings** (Ctrl+Shift+, or Settings → Configure Seraphim): change
   the theme, preset, font, transitions, bars, effects and extensions. Each
   change is written into your config file, keeping its comments, and
@@ -272,9 +289,10 @@ replaces it).
 * **Layouts:** `[[layout]]` names an arrangement of tabs and panes:
   commands, directories and panels. Open one from the Settings menu, with
   `--layout NAME`, or at startup (`startup_layout`).
-* **Restoration:** with `restore_session = true`, closing the window saves
-  your tabs, splits, directories and recent screen text, and the next
-  start brings them back.
+* **Restoration:** with `restore_session = true`, Seraphim saves your
+  windows, tabs, splits, directories, floating panels and recent screen
+  text every 30 seconds and when you quit, and the next start brings them
+  back (after a crash too).
 
 ```toml
 [[layout]]

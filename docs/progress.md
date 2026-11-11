@@ -8,12 +8,12 @@ phase's listed tasks that is done, not a measure of effort.
 | I. Functional Foundation | Complete | ~100 % |
 | II. Visual Identity | Complete (real-GPU measurements pending) | ~100 % |
 | III. Programmability | Complete: Lua extensions, API, permissions | ~100 % |
-| IV. Full Interface | Complete (detachable tabs not done) | ~95 % |
+| IV. Full Interface | Complete | 100 % |
 | V. Divinity Integration | System metrics and Gabriel-event hooks only | ~10 % |
-| **Overall** | Four of five phases done | **~80 %** |
+| **Overall** | Four of five phases done | **~82 %** |
 
-The code: 10 crates, ~32,000 lines of Rust, ~600 lines of WGSL and six
-example extensions, 325 automated tests (unit, pixel tests through the
+The code: 10 crates, ~35,000 lines of Rust, ~600 lines of WGSL and six
+example extensions, 344 automated tests (unit, pixel tests through the
 real wgpu pipeline, xterm conformance, fuzzing, Lua runtime end to end),
 all passing; clippy clean.
 
@@ -84,15 +84,16 @@ See `docs/phase-4-plan.md` and ADR 0010.
 
 | Task | Where | Notes |
 |---|---|---|
-| Tabs | `workspace.rs`, `tabbar.rs`, `window.rs` | bar (auto/always/never), labels and rename, icons, activity/bell marks, OSC 9;4 progress, root color, drag to reorder, per-tab profiles |
+| Tabs | `workspace.rs`, `tabbar.rs`, `window.rs` | bar (auto/always/never), labels and rename, icons, activity/bell marks, OSC 9;4 progress, root color, drag to reorder, per-tab profiles; designs (styles, top/bottom, widths, buttons, colors); detach into a new window with the shells running |
+| Windows | `window.rs`, `decor.rs` | all windows in one process; Seraphim's own title bar and buttons (or none), resizable edges |
 | Split panes | `workspace.rs` | split right/down, focus by direction, resize, zoom, drag dividers, click to focus, dimmed inactive panes; one renderer with per-pane slots |
-| Custom panels | `panel.rs`, `panels.rs` | widget trees painted by Seraphim; system monitor, sessions, history, package activity; extension panels via `ui.panel` |
+| Custom panels | `panel.rs`, `panels.rs` | widget trees painted by Seraphim; system monitor, sessions, history, package activity; extension panels via `ui.panel`; docked or floating |
 | GUI configuration | `settings.rs` | settings panel editing the config file in place (comments kept), applied live; extension switches |
 | Layout management | `[[layout]]` | named trees of commands, directories and panels; `--layout`, `startup_layout`, Settings menu, `ui.open_layout` |
-| Session restoration | `restore.rs` | tabs, splits, directories, labels, profiles, panels, last 200 lines per terminal |
+| Session restoration | `restore.rs` | every window: tabs, splits, directories, labels, profiles, panels (floating ones too), last 200 lines per terminal; saved every 30 s and on quit |
 
-Still open from spec §9: detachable tabs, floating panels, custom window
-decorations, custom tab designs beyond the label format.
+Nothing from spec §9 is open. Possible additions: moving a tab into
+another existing window, floating terminals.
 
 ## Phase V — Divinity Integration: ~10 %
 

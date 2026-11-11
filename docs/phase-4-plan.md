@@ -1,7 +1,8 @@
 # Phase IV plan — Full Interface
 
-**Status: complete** except the stretch item (detachable tabs). As
-built: [ADR 0010](adr/0010-interface.md).
+**Status: complete**, including the items first left over: detachable
+tabs, floating panels, window decorations, tab designs and periodic
+session saves. As built: [ADR 0010](adr/0010-interface.md).
 
 **Goal (spec §15):** build the complete terminal application.
 **Milestone:** a complete terminal application.
@@ -78,5 +79,11 @@ configuration), §18.3 (interface extensibility; ADR 0006 reserves
 - [x] Edits keep the file's comments and layout (`toml_edit`)
 
 ### 10. Close-out
-- [ ] Detachable tabs: move a tab to a new window (the PTY is handed over) — stretch, not done (ADR 0010)
+- [x] Detachable tabs: move a tab to a new window with its shells running (all windows share one process)
 - [x] ADR 0010, README, docs, tests, real-window checks, `docs/progress.md`
+
+### 11. Leftovers, done after the close-out
+- [x] Floating panels: over the panes, moved by the title, resized by the corner, restored with the session
+- [x] Window decorations: Seraphim's own title bar and buttons (or none), resizable edges
+- [x] Tab designs: styles, position, sizes, buttons and colors
+- [x] The session is saved every 30 seconds, so it survives a crash

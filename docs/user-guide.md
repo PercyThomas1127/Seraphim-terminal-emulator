@@ -276,9 +276,11 @@ trail = true
 | Jump to a tab | Alt+1…9 |
 | Move tab | Ctrl+Shift+PgUp / PgDn |
 | Rename | Ctrl+Alt+S |
+| Move to a new window | Ctrl+Shift+L, or drag the tab out of the window |
 
 - Use the bar with the mouse: click to switch, middle-click or × to
-  close, drag to reorder.
+  close, drag to reorder. Drop a tab outside the window and it gets a
+  window of its own there, with its shells still running.
 - Each tab shows the running program's icon.
 - Marks for tabs out of sight: a dot for new output and `!` for a bell.
   Programs that report progress fill their tab.
@@ -288,6 +290,25 @@ trail = true
 - Settings in `[tabs]`: `bar = "auto"`, `"always"` or `"never"`;
   `icons`; and the `label` format (`{title}`, `{program}`, `{cwd}`,
   `{index}`).
+
+#### Tab designs
+
+| Setting | Values |
+|---|---|
+| `style` | `classic`, `powerline`, `rounded`, `slanted` (these three need a Nerd Font) or `minimal` (no backgrounds; the active tab is underlined) |
+| `position` | `top` or `bottom` |
+| `min_width`, `max_width` | Width of a tab in columns (default 6 and 32) |
+| `close_button`, `new_tab_button` | Show the × and the + |
+| `[tabs.colors]` | `bar`, `active_fg`, `active_bg`, `inactive_fg`, `inactive_bg`, `accent` as `"#rrggbb"`; unset ones follow the theme |
+
+```toml
+[tabs]
+style = "powerline"
+position = "bottom"
+
+[tabs.colors]
+active_bg = "#f5a6d0"
+```
 
 ### Split panes
 
@@ -314,6 +335,37 @@ Panels open as panes from the View menu:
 
 Extensions can add their own (see [section 6](#6-extensions-lua)). In a
 panel, Up and Down move, Enter or a click chooses, and Escape closes it.
+
+**Floating panels.** View → Float or Dock Panel lifts the focused panel
+out of its tab and floats it over the panes (and puts a floating one
+back). Extensions can open theirs floating with
+`ui.open_panel(id, { place = "float" })`.
+
+- Drag the title to move it and the ◢ corner to resize it. × closes it.
+- Clicking a floating panel brings it to the front and gives it the
+  keyboard. Clicking a terminal gives the keyboard back.
+- Floating panels stay up when you switch tabs, and session restore
+  brings them back where they were.
+
+### Window decorations
+
+`[window] decorations` sets who draws the window's frame. It takes
+effect for new windows.
+
+| Value | What you get |
+|---|---|
+| `system` (default) | The desktop's title bar and borders |
+| `seraphim` | Seraphim's own title bar with minimize, maximize and close buttons. When the tab bar (or a pinned menu bar) is at the top, the buttons go at its right end and there is no separate title row |
+| `none` | No title bar, for tiling window managers |
+
+With `seraphim`, drag empty space in the title bar (or tab bar) to move
+the window, and double-click it to maximize or restore. With `seraphim`
+or `none`, drag the window's edges and corners to resize it.
+
+### Windows
+
+New Window (Ctrl+Shift+N) and detached tabs open in the same Seraphim
+process, so tabs can move between windows with their programs running.
 
 ### Settings
 
@@ -347,10 +399,12 @@ with `startup_layout = "dev"` at the top of the config.
 
 ### Session restore
 
-With `restore_session = true` (at the top of the config), closing the
-window saves your tabs, splits, directories, labels and the last 200
-lines of each terminal. The next start reopens them, with the old text
-shown above a new prompt. Programs are not re-run.
+With `restore_session = true` (at the top of the config), Seraphim saves
+every window's tabs, splits, directories, labels, floating panels and the
+last 200 lines of each terminal. It saves every 30 seconds and when you
+quit, so even a crash loses little. The next start reopens them all,
+with the old text shown above a new prompt. Programs are not re-run, and
+a `seraphim -e PROGRAM` window never replaces the saved session.
 
 ## 6. Extensions (Lua)
 
@@ -440,14 +494,6 @@ Results on real hardware are in [benchmarks.md](benchmarks.md).
 - **Extension SDK:** packaging and publishing tools, and WebAssembly
   extensions so untrusted Gallery code can run safely. Not started.
 
-### Left over from Phase IV
-
-- Moving a tab to a new window.
-- Floating panels.
-- Custom window decorations.
-- Tab designs beyond the label format.
-- Saving the session periodically so it survives a crash.
-
 ### Other gaps
 
 - Contrast checks for accessibility.
@@ -472,6 +518,7 @@ Results on real hardware are in [benchmarks.md](benchmarks.md).
 | Jump to tab | Alt+1…9 (with two or more tabs) |
 | Move tab | Ctrl+Shift+PgUp / PgDn |
 | Rename tab | Ctrl+Alt+S |
+| Move tab to a new window | Ctrl+Shift+L (with two or more tabs) |
 | Split right / down | Ctrl+Shift+E / Ctrl+Shift+O |
 | Move between panes | Alt+arrows (with two or more panes) |
 | Resize pane | Ctrl+Alt+arrows |

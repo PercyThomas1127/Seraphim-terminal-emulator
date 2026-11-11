@@ -1,7 +1,8 @@
-//! The windowed front end: winit window + wgpu surface + one session.
+//! The windowed front end: the windows of this process (`App`), each a
+//! winit window and wgpu surface (`Win`, `Active`) with tabs of panes.
 //!
-//! Threading: the event loop thread owns the window, surface and renderer.
-//! The session's I/O thread never touches them; it only pokes the loop via
+//! Threading: the event loop thread owns the windows, surfaces and
+//! renderers. Sessions' I/O threads never touch them; they only poke the loop via
 //! an `EventLoopProxy`, and the loop redraws (coalesced, vsync-paced) when
 //! it gets around to it. No frames are rendered while nothing changes; the
 //! only timer is cursor blinking, and only when the application asked for a
