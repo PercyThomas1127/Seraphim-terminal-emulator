@@ -44,6 +44,7 @@ use std::time::Duration;
 mod actions;
 mod bench;
 mod bindings;
+mod decor;
 mod desktop;
 mod interaction;
 mod menu;

@@ -782,6 +782,10 @@ pub struct Window {
     /// Alt/Option is tapped and hides when the menu closes (Ctrl+Shift+M
     /// toggles at runtime).
     pub menu_bar: bool,
+    /// Window decorations: `system` (the desktop's title bar and
+    /// borders), `seraphim` (Seraphim's own title bar, buttons and
+    /// resizable edges) or `none` (no title bar; edges still resize).
+    pub decorations: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -838,7 +842,13 @@ impl Default for Font {
 
 impl Default for Window {
     fn default() -> Self {
-        Window { columns: 100, rows: 30, padding: 6.0, menu_bar: false }
+        Window {
+            columns: 100,
+            rows: 30,
+            padding: 6.0,
+            menu_bar: false,
+            decorations: "system".into(),
+        }
     }
 }
 
@@ -1090,6 +1100,12 @@ impl Config {
             return Err(format!(
                 "tabs.bar must be auto, always or never (got {:?})",
                 self.tabs.bar
+            ));
+        }
+        if !["system", "seraphim", "none"].contains(&self.window.decorations.as_str()) {
+            return Err(format!(
+                "window.decorations must be system, seraphim or none (got {:?})",
+                self.window.decorations
             ));
         }
         if !TAB_STYLES.contains(&self.tabs.style.as_str()) {

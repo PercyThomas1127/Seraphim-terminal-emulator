@@ -148,6 +148,8 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(80);
 const DECOR_SLOT: u64 = u64::MAX;
 /// Overlay slot for the tab bar (slot 0 is the menu bar).
 const TAB_BAR_SLOT: u64 = 1;
+/// Seraphim's title bar (`window.decorations = "seraphim"`).
+const TITLE_SLOT: u64 = 2;
 use crate::menu::{self, Command as MenuCommand, Hit, MenuBar, MenuKey, Outcome};
 
 #[derive(Clone, Debug)]
@@ -184,6 +186,8 @@ pub struct WindowOptions {
     pub cli_preset: Option<String>,
     /// Show the menu bar.
     pub menu_bar: bool,
+    /// `system`, `seraphim` or `none` (`window.decorations`).
+    pub decorations: String,
     /// Menu bar contents (built-in merged with `[[menu]]`).
     pub menus: Vec<seraphim_config::Menu>,
     /// Files the configuration came from (watched for live reload).
@@ -277,6 +281,7 @@ impl Default for WindowOptions {
             cli_font_size: None,
             cli_preset: None,
             menu_bar: false,
+            decorations: "system".into(),
             menus: seraphim_config::builtin_menu(),
             watch: Vec::new(),
             live_reload: true,
@@ -520,6 +525,16 @@ struct Active {
     /// The bar is pinned (reserves a row); otherwise it only appears
     /// while a menu is open.
     menu_pinned: bool,
+    /// `window.decorations`, as the window was created.
+    decorations: String,
+    /// The title bar button under the pointer.
+    decor_hover: Option<crate::decor::Button>,
+    /// The pointer shows a resize arrow (on a window edge).
+    edge_cursor: bool,
+    /// When the title bar was last pressed (a double-click maximizes).
+    title_click: Option<Instant>,
+    /// The title bar is pressed: moving the pointer moves the window.
+    title_drag: bool,
     /// Alt went down with nothing else pressed since: a release opens the
     /// menu.
     alt_tap: bool,
@@ -554,6 +569,14 @@ impl Active {
         let unfocused = !self.focused && !self.visual_cfg.animate_unfocused;
         self.visual.set_paused(unfocused || self.occluded);
     }
+}
+
+/// Where Seraphim's window buttons are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ButtonsRow {
+    Menu,
+    Tabs,
+    Title,
 }
 
 /// Work for `App`, which owns the configuration and the event loop.
@@ -834,7 +857,8 @@ impl Win {
         .map_err(|e| e.to_string())?;
         let m = fonts.metrics();
         let pad = (o.padding as f64 * scale).round() as f32;
-        let bar = if o.menu_bar { m.height.ceil() } else { 0.0 };
+        let bar = if o.menu_bar { m.height.ceil() } else { 0.0 }
+            + if o.decorations == "seraphim" { m.height.ceil() } else { 0.0 };
         let mut size = PhysicalSize::new(
             (o.cols as f32 * m.width + 2.0 * pad) as u32,
             (o.rows as f32 * m.height + 2.0 * pad + bar) as u32,
@@ -854,7 +878,8 @@ impl Win {
                 (m.width * 10.0) as u32,
                 (m.height * 3.0) as u32,
             ))
-            .with_window_icon(crate::desktop::window_icon());
+            .with_window_icon(crate::desktop::window_icon())
+            .with_decorations(o.decorations == "system");
         // WM_CLASS / app id: desktops match the window to seraphim.desktop
         // (its menu entry and icon). Both X11 and Wayland read this name.
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
@@ -982,6 +1007,11 @@ impl Win {
             overlay,
             menu: MenuBar::default(),
             menu_pinned: o.menu_bar,
+            decorations: o.decorations.clone(),
+            decor_hover: None,
+            edge_cursor: false,
+            title_click: None,
+            title_drag: false,
             alt_tap: false,
             menu_src: (o.menus.clone(), o.config_path.clone(), o.profile.clone()),
             toast: o.notice.clone().map(|m| (m, Instant::now() + TOAST_TIME * 2)),
@@ -1718,6 +1748,53 @@ impl Active {
         }
     }
 
+    /// Which row holds Seraphim's window buttons: the pinned menu bar, the
+    /// tab bar at the top, or a title bar of its own. `None` with system
+    /// (or no) decorations.
+    fn buttons_row(&self) -> Option<ButtonsRow> {
+        if self.decorations != "seraphim" {
+            return None;
+        }
+        Some(if self.menu_pinned {
+            ButtonsRow::Menu
+        } else if self.tab_bar_visible() && !self.tabs_at_bottom() {
+            ButtonsRow::Tabs
+        } else {
+            ButtonsRow::Title
+        })
+    }
+
+    fn title_bar_height(&self) -> u32 {
+        match self.buttons_row() {
+            Some(ButtonsRow::Title) => self.overlay.cell_metrics().height.ceil() as u32,
+            _ => 0,
+        }
+    }
+
+    /// The top and height of the row with the window buttons.
+    fn buttons_row_span(&self) -> Option<(ButtonsRow, f64, f64)> {
+        let row = self.buttons_row()?;
+        let (top, h) = match row {
+            ButtonsRow::Menu => (0, self.menu_height()),
+            ButtonsRow::Tabs => (self.tab_bar_top(), self.tab_bar_height()),
+            ButtonsRow::Title => (0, self.title_bar_height()),
+        };
+        Some((row, top as f64, h as f64))
+    }
+
+    fn decor_colors(&self) -> crate::decor::Colors {
+        let theme = self.renderer.theme();
+        let p = menu::Palette::from_theme(theme);
+        let d = crate::tabbar::Design::new(&self.tabs_cfg, &p);
+        crate::decor::Colors {
+            bar: d.bar,
+            fg: p.bar_fg,
+            dim: p.dim,
+            hover: p.border,
+            alert: theme.ansi[1],
+        }
+    }
+
     fn tabs_at_bottom(&self) -> bool {
         self.tabs_cfg.position == "bottom"
     }
@@ -1735,7 +1812,9 @@ impl Active {
     fn pane_area(&self) -> Rect {
         let s = self.window.inner_size();
         let tabs = self.tab_bar_height();
-        let top = self.menu_height() + if self.tabs_at_bottom() { 0 } else { tabs };
+        let top = self.title_bar_height()
+            + self.menu_height()
+            + if self.tabs_at_bottom() { 0 } else { tabs };
         let top = top.min(s.height.saturating_sub(1));
         let h = s.height.saturating_sub(top + if self.tabs_at_bottom() { tabs } else { 0 }).max(1);
         Rect::new(0.0, top as f32, s.width as f32, h as f32)
@@ -2257,6 +2336,8 @@ impl Active {
                 }
             }
             (Hit::NewTab, _) | (Hit::Bar, WButton::Middle) => self.new_tab(),
+            // With Seraphim's decorations the tab bar is the title bar.
+            (Hit::Bar, WButton::Left) if self.decorations == "seraphim" => self.title_press(),
             _ => {}
         }
         self.window.request_redraw();
@@ -2851,9 +2932,106 @@ impl Active {
         }
     }
 
+    /// The window edge under the pointer, when Seraphim (not the desktop)
+    /// handles resizing.
+    fn edge_under_pointer(&self) -> Option<winit::window::ResizeDirection> {
+        if self.decorations == "system" || self.window.is_maximized() {
+            return None;
+        }
+        let s = self.window.inner_size();
+        let border = (4.0 * self.scale).max(2.0);
+        let (x, y) = self.mouse.pos;
+        crate::decor::edge_at(x, y, s.width as f64, s.height as f64, border)
+    }
+
+    /// Whether the pointer is in the row of window buttons, and on which.
+    fn decor_at_pointer(&self) -> (bool, Option<crate::decor::Button>) {
+        let Some((_, top, h)) = self.buttons_row_span() else { return (false, None) };
+        let y = self.mouse.pos.1;
+        if y < top || y >= top + h {
+            return (false, None);
+        }
+        let (cols, _, _, col) = self.overlay_grid();
+        (true, crate::decor::button_at(col, cols))
+    }
+
+    /// Pointer motion over Seraphim's decorations: resize arrows on the
+    /// edges, highlighted buttons. True if it took the motion.
+    fn decor_motion(&mut self) -> bool {
+        if self.title_drag {
+            self.title_drag = false;
+            let _ = self.window.drag_window();
+            return true;
+        }
+        if self.decorations == "system" || self.mouse.left || self.drag.is_some() {
+            return false;
+        }
+        if let Some(d) = self.edge_under_pointer() {
+            self.window.set_cursor(crate::decor::cursor_for(d));
+            self.edge_cursor = true;
+            return true;
+        }
+        if self.edge_cursor {
+            self.edge_cursor = false;
+            let reporting = self.reporting();
+            self.window.set_cursor(if reporting { CursorIcon::Default } else { CursorIcon::Text });
+            self.mouse.reporting = reporting;
+        }
+        let (in_row, hover) = self.decor_at_pointer();
+        if hover != self.decor_hover {
+            self.decor_hover = hover;
+            self.window.request_redraw();
+        }
+        if in_row && (hover.is_some() || self.buttons_row() == Some(ButtonsRow::Title)) {
+            self.window.set_cursor(CursorIcon::Default);
+            self.mouse.reporting = true; // the icon is re-evaluated on the way out
+            return true;
+        }
+        false
+    }
+
+    /// A press on the window's decorations: an edge, a button, or the title
+    /// bar. True if it took the press.
+    fn decor_press(&mut self) -> bool {
+        if self.decorations == "system" || self.menu.engaged() {
+            return false;
+        }
+        if let Some(d) = self.edge_under_pointer() {
+            let _ = self.window.drag_resize_window(d);
+            return true;
+        }
+        let (in_row, button) = self.decor_at_pointer();
+        use crate::decor::Button;
+        match button {
+            Some(Button::Minimize) => self.window.set_minimized(true),
+            Some(Button::Maximize) => self.window.set_maximized(!self.window.is_maximized()),
+            Some(Button::Close) => self.pending = Some(Request::Quit),
+            None if in_row && self.buttons_row() == Some(ButtonsRow::Title) => self.title_press(),
+            None => return false,
+        }
+        true
+    }
+
+    /// Pressing empty title bar: drag the window; double-click maximizes.
+    fn title_press(&mut self) {
+        let now = Instant::now();
+        if self.title_click.is_some_and(|t| now - t < Duration::from_millis(400)) {
+            self.title_click = None;
+            self.window.set_maximized(!self.window.is_maximized());
+            return;
+        }
+        // The window moves once the pointer does, so that a second click
+        // still reaches us.
+        self.title_click = Some(now);
+        self.title_drag = true;
+    }
+
     fn on_cursor_moved(&mut self, x: f64, y: f64, pad: f32) {
         self.mouse.pos = (x, y);
         if self.menu_motion() {
+            return;
+        }
+        if self.decor_motion() {
             return;
         }
         // Dragging a divider resizes the panes on either side.
@@ -2911,6 +3089,13 @@ impl Active {
     fn on_mouse_button(&mut self, state: ElementState, button: WButton, pad: f32) {
         let pressed = state == ElementState::Pressed;
         self.alt_tap = false;
+        if !pressed && button == WButton::Left && self.title_drag {
+            self.title_drag = false;
+            return;
+        }
+        if pressed && button == WButton::Left && self.tab_drag.is_none() && self.decor_press() {
+            return;
+        }
         // Releases of a press the terminal saw still go to the terminal.
         let terminal_drag = !pressed && button == WButton::Left && self.mouse.left;
         if !terminal_drag && self.menu_button(pressed, button) {
@@ -3589,15 +3774,24 @@ impl Win {
                     let palette = menu::Palette::from_theme(&theme);
                     let design = crate::tabbar::Design::new(&a.tabs_cfg, &palette);
                     let alert = theme.ansi[9];
+                    // The window buttons may share the row.
+                    let buttons = a.buttons_row() == Some(ButtonsRow::Tabs);
+                    let tab_cols =
+                        if buttons { cols.saturating_sub(crate::decor::BUTTONS) } else { cols };
                     let (bytes, hits) = crate::tabbar::paint(
                         &a.tab_infos(),
-                        cols,
+                        tab_cols,
                         alert,
                         a.renaming.as_deref(),
                         &design,
                     );
                     let mut t = seraphim_terminal::Terminal::with_scrollback(cols, 1, 0);
                     t.advance(&bytes);
+                    if buttons {
+                        let c = a.decor_colors();
+                        let max = a.window.is_maximized();
+                        t.advance(&crate::decor::paint_buttons(cols, a.decor_hover, max, &c));
+                    }
                     t.advance(b"\x1b[?25l");
                     a.tab_hits = hits;
                     let view = View {
@@ -3611,12 +3805,45 @@ impl Win {
                     a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
                     a.overlay.select(&a.gpu.device, 0);
                 }
+                // Seraphim's title bar.
+                if a.title_bar_height() > 0 {
+                    let m = a.overlay.cell_metrics();
+                    let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
+                    let title = if a.title.is_empty() { "Seraphim" } else { a.title.as_str() };
+                    let c = a.decor_colors();
+                    let bytes = crate::decor::paint_title(
+                        title,
+                        cols,
+                        a.focused,
+                        a.decor_hover,
+                        a.window.is_maximized(),
+                        &c,
+                    );
+                    let mut t = seraphim_terminal::Terminal::with_scrollback(cols, 1, 0);
+                    t.advance(&bytes);
+                    t.advance(b"\x1b[?25l");
+                    let view = View {
+                        width: size.width,
+                        height: a.title_bar_height(),
+                        padding: 0.0,
+                        focused: true,
+                        cursor_on: false,
+                    };
+                    a.overlay.select(&a.gpu.device, TITLE_SLOT);
+                    a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
+                    a.overlay.select(&a.gpu.device, 0);
+                }
                 if a.overlay_visible() {
                     let (cols, rows, _, _) = a.overlay_grid();
                     let palette = menu::Palette::from_theme(a.renderer.theme());
                     let mut t = seraphim_terminal::Terminal::with_scrollback(cols, rows, 0);
                     a.menu.toast = a.toast.as_ref().map(|t| t.0.clone());
                     t.advance(&a.menu.paint(cols, rows, a.menu_pinned, &palette));
+                    if a.buttons_row() == Some(ButtonsRow::Menu) {
+                        let c = a.decor_colors();
+                        let max = a.window.is_maximized();
+                        t.advance(&crate::decor::paint_buttons(cols, a.decor_hover, max, &c));
+                    }
                     let view = View {
                         width: size.width,
                         height: size.height,
@@ -3864,6 +4091,13 @@ fn draw(a: &mut Active) {
         a.renderer.select(&a.gpu.device, DECOR_SLOT);
         a.renderer.render(&mut pass);
         a.renderer.select(&a.gpu.device, focus);
+        let tb = a.title_bar_height() as f32;
+        if tb > 0.0 && tb <= h as f32 {
+            pass.set_viewport(0.0, 0.0, w as f32, tb, 0.0, 1.0);
+            a.overlay.select(&a.gpu.device, TITLE_SLOT);
+            a.overlay.render(&mut pass);
+            a.overlay.select(&a.gpu.device, 0);
+        }
         if a.tab_bar_visible() {
             let top = a.tab_bar_top() as f32;
             let th = a.tab_bar_height() as f32;

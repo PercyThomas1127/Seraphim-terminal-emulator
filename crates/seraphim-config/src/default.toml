@@ -41,6 +41,13 @@ padding = 6.0
 # Alt (Option), and hides again when you're done. true keeps it on screen
 # (toggle at runtime with Ctrl+Shift+M).
 menu_bar = false
+# Window decorations: "system" (the desktop's title bar and borders),
+# "seraphim" (Seraphim draws the title bar and its buttons; with the tab
+# bar or menu bar at the top, the buttons go there; drag empty space to
+# move the window, double-click to maximize) or "none" (no title bar).
+# Without system decorations, the window's edges resize it. Takes effect
+# in new windows.
+decorations = "system"
 
 [terminal]
 # TERM for new sessions. "auto" uses xterm-seraphim (24-bit color in tmux,

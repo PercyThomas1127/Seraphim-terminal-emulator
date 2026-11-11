@@ -84,6 +84,7 @@ pub fn options_from_config(
         transition: transition_style(&c.visual.transition, config_dir),
         cursor: c.cursor.clone(),
         menu_bar: c.window.menu_bar,
+        decorations: c.window.decorations.clone(),
         menus: crate::menu::merge(&seraphim_config::builtin_menu(), &c.menu),
         profile: profile.to_owned(),
         config_path: None,

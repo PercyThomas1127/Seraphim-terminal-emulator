@@ -81,6 +81,11 @@ pub fn all(dir: &Path, extensions: &[(String, String)]) -> Vec<Setting> {
         s("Scene transition", "visual.transition", Kind::Choice(transitions)),
         s("Reduced motion", "visual.reduced_motion", Kind::Toggle),
         s("Show the menu bar", "window.menu_bar", Kind::Toggle),
+        s(
+            "Window decorations (new windows)",
+            "window.decorations",
+            choice(&["system", "seraphim", "none"]),
+        ),
         s("Tab bar", "tabs.bar", choice(&["auto", "always", "never"])),
         s("Tab style", "tabs.style", choice(seraphim_config::TAB_STYLES)),
         s("Tab bar position", "tabs.position", choice(&["top", "bottom"])),
