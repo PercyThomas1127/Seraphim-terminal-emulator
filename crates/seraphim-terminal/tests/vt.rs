@@ -466,3 +466,31 @@ fn vertical_movement_and_margins_follow_xterm() {
     assert_eq!(at("\x1b[8;1H\x1b[9F"), (3, 1));
     assert_eq!(at("\x1b[1;1H\x1b[9E"), (5, 1));
 }
+
+#[test]
+fn programs_ask_for_notifications() {
+    use seraphim_terminal::{Terminal, TerminalEvent};
+    let mut t = Terminal::new(40, 5);
+    // iTerm2, rxvt/foot, kitty (two parts, the body in base64), and
+    // ConEmu's OSC 9;4 progress, which is not one.
+    t.advance(b"\x1b]9;Build done; 3 warnings\x07");
+    t.advance(b"\x1b]777;notify;Tests;all passed\x1b\\");
+    t.advance(b"\x1b]99;i=1:d=0;Backup\x1b\\\x1b]99;i=1:p=body:e=1;ZmluaXNoZWQ=\x1b\\");
+    t.advance(b"\x1b]9;4;1;50\x07\x1b]99;i=2:p=?;\x1b\\");
+    let n: Vec<_> = t
+        .take_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            TerminalEvent::Notification { title, body } => Some((title, body)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        n,
+        [
+            ("".to_owned(), "Build done; 3 warnings".to_owned()),
+            ("Tests".to_owned(), "all passed".to_owned()),
+            ("Backup".to_owned(), "finished".to_owned()),
+        ]
+    );
+}

@@ -148,6 +148,8 @@ end, { priority = 10, throttle = 100 })
 | `terminal.cursor.moved` | `{row, col}`: 0-based |
 | `terminal.title.changed` | `{title}` |
 | `terminal.bell` | `{}` |
+| `terminal.notification` | `{title, body}`: the program asked for a desktop notification (OSC 9, OSC 777;notify, OSC 99) |
+| `notification.sent` | `{title, body, reason, shown}`: Seraphim sent a desktop notification; `reason` is `program`, `command`, `package` or `bell` |
 | `terminal.screen.alternate` | `{active}`: a full-screen app started or stopped |
 | `session.created`, `session.exited`, `session.closed` | `{pid, cols, rows}`, `{exit_code, signal}`, `{}` |
 | `session.privileged` | `{root}`: from process credentials, never from output |

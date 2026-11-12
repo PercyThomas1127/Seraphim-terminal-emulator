@@ -504,6 +504,9 @@ impl IoLoop {
             TerminalEvent::AlternateScreen(active) => {
                 p.publish("terminal.screen.alternate", id, json!({"active": active}));
             }
+            TerminalEvent::Notification { title, body } => {
+                p.publish("terminal.notification", id, json!({"title": title, "body": body}));
+            }
             TerminalEvent::Progress { state, percent } => {
                 p.publish("terminal.progress", id, json!({"state": state, "percent": percent}));
             }

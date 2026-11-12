@@ -52,6 +52,19 @@ pub enum TerminalEvent {
         state: u8,
         percent: u8,
     },
+    /// A desktop notification the program asks for: OSC 9 (iTerm2),
+    /// OSC 777;notify (rxvt, foot) or OSC 99 (kitty).
+    Notification {
+        title: String,
+        body: String,
+    },
+}
+
+/// Longest notification title or body kept (characters).
+const NOTIFY_MAX: usize = 1024;
+
+fn notify_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() || *c == '\n').take(NOTIFY_MAX).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -194,6 +207,8 @@ pub(crate) struct State {
     pub cwd: Option<String>,
     pub hyperlinks: Vec<Hyperlink>,
     pub events: Vec<TerminalEvent>,
+    /// OSC 99 notifications arriving in parts (`d=0`), by id: title, body.
+    notify_parts: Vec<(String, String, String)>,
     pub responses: Vec<u8>,
     /// Printed text (with line feeds and tabs) since the last take, when
     /// someone wants it (`terminal.output` / `command.output` events).
@@ -254,6 +269,7 @@ impl State {
             cwd: None,
             hyperlinks: Vec::new(),
             events: Vec::new(),
+            notify_parts: Vec::new(),
             text: None,
             responses: Vec::new(),
             damage: vec![true; rows],
@@ -1191,6 +1207,81 @@ impl State {
                 let state = num(2).min(4) as u8;
                 let percent = num(3).min(100) as u8;
                 self.events.push(TerminalEvent::Progress { state, percent });
+            }
+            // OSC 9 ; text (iTerm2). ConEmu's OSC 9 ; <number> ; … are
+            // other commands.
+            b"9" if params.len() > 1 && !text(1).chars().all(|c| c.is_ascii_digit()) => {
+                let body = params[1..]
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                self.events.push(TerminalEvent::Notification {
+                    title: String::new(),
+                    body: notify_text(&body),
+                });
+            }
+            // OSC 777 ; notify ; title ; body (rxvt-unicode, foot, …).
+            b"777" if params.get(1).is_some_and(|p| *p == b"notify") => {
+                let body = params[3.min(params.len())..]
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                self.events.push(TerminalEvent::Notification {
+                    title: notify_text(&text(2)),
+                    body: notify_text(&body),
+                });
+            }
+            // OSC 99 ; metadata ; payload (kitty): parts with d=0 until d=1,
+            // p=title (the default) or p=body, e=1 for base64.
+            b"99" => {
+                let meta = text(1);
+                let mut id = String::new();
+                let (mut done, mut part, mut b64) = (true, "title".to_owned(), false);
+                for kv in meta.split(':') {
+                    match kv.split_once('=') {
+                        Some(("i", v)) => id = v.chars().take(64).collect(),
+                        Some(("d", v)) => done = v != "0",
+                        Some(("p", v)) => part = v.to_owned(),
+                        Some(("e", v)) => b64 = v == "1",
+                        _ => {}
+                    }
+                }
+                let raw = params[2.min(params.len())..].join(&b';');
+                let payload = if b64 {
+                    crate::graphics::base64(&raw)
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default()
+                } else {
+                    String::from_utf8_lossy(&raw).into_owned()
+                };
+                // Queries (p=?) and other parts (icons, buttons) are ignored.
+                if part != "title" && part != "body" {
+                    return;
+                }
+                let i = match self.notify_parts.iter().position(|(k, _, _)| *k == id) {
+                    Some(i) => i,
+                    None => {
+                        if self.notify_parts.len() >= 8 {
+                            self.notify_parts.remove(0);
+                        }
+                        self.notify_parts.push((id.clone(), String::new(), String::new()));
+                        self.notify_parts.len() - 1
+                    }
+                };
+                let entry = &mut self.notify_parts[i];
+                let field = if part == "title" { &mut entry.1 } else { &mut entry.2 };
+                if field.len() < NOTIFY_MAX * 4 {
+                    field.push_str(&payload);
+                }
+                if done {
+                    let (_, title, body) = self.notify_parts.remove(i);
+                    let (title, body) = (notify_text(&title), notify_text(&body));
+                    if !title.is_empty() || !body.is_empty() {
+                        self.events.push(TerminalEvent::Notification { title, body });
+                    }
+                }
             }
             b"0" | b"2" => {
                 // Titles may legitimately contain ';', which vte splits on.

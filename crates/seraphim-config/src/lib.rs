@@ -72,6 +72,7 @@ pub struct Config {
     pub tabs: Tabs,
     /// Split panes.
     pub panes: Panes,
+    pub notifications: Notifications,
     /// The Lua scripting runtime.
     pub scripting: Scripting,
     /// Per-extension switches and permissions, by extension name.
@@ -230,6 +231,35 @@ pub struct TabColors {
     /// Progress, the minimal style's active tab.
     #[serde(deserialize_with = "opt_color")]
     pub accent: Option<Rgb>,
+}
+
+/// `[notifications]`: desktop notifications.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notifications {
+    /// Programs' own notifications (OSC 9, OSC 777;notify, OSC 99).
+    pub programs: bool,
+    /// A command that ran at least this many seconds finished out of
+    /// sight (0: never).
+    pub command_seconds: u32,
+    /// A package manager finished (or failed) out of sight.
+    pub packages: bool,
+    /// The bell rang out of sight.
+    pub bell: bool,
+    /// Also while the terminal is in sight (focused window, visible pane).
+    pub always: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Notifications {
+            programs: true,
+            command_seconds: 10,
+            packages: true,
+            bell: false,
+            always: false,
+        }
+    }
 }
 
 /// `[panes]`.
@@ -428,6 +458,7 @@ impl Default for Config {
             bind: Vec::new(),
             tabs: Tabs::default(),
             panes: Panes::default(),
+            notifications: Notifications::default(),
             scripting: Scripting::default(),
             extensions: Default::default(),
             menu: Vec::new(),

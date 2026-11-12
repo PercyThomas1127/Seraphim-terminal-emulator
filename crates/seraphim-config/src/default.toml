@@ -299,6 +299,22 @@ new_tab_button = true
 divider = 2.0
 dim_inactive = 0.25
 
+# Desktop notifications (through notify-send, or gdbus).
+[notifications]
+# Programs' own requests: OSC 9 (iTerm2), OSC 777;notify (rxvt, foot) and
+# OSC 99 (kitty). Shown even while you are looking.
+programs = true
+# A command that ran at least this many seconds finished while you
+# couldn't see it (window unfocused, or its tab in the background).
+# Needs shell integration. 0 turns this off.
+command_seconds = 10
+# A package manager finished or failed while you couldn't see it.
+packages = true
+# The bell rang while you couldn't see the terminal.
+bell = false
+# Notify even while the terminal is in sight.
+always = false
+
 # Lua extensions: folders in extensions/ (extension.toml + init.lua) and
 # one-file scripts in scripts/*.lua, next to this file. Each runs in its
 # own sandbox on a script thread; a handler that runs longer than

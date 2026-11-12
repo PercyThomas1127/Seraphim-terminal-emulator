@@ -99,6 +99,7 @@ pub fn options_from_config(
         tabs: c.tabs.clone(),
         term: c.terminal.term.clone(),
         panes: c.panes.clone(),
+        notifications: c.notifications.clone(),
         layouts: c.layout.clone(),
         startup_layout: c.startup_layout.clone(),
         restore_session: c.restore_session,

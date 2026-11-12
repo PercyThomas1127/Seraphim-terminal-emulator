@@ -400,6 +400,29 @@ With `seraphim`, drag empty space in the title bar (or tab bar) to move
 the window, and double-click it to maximize or restore. With `seraphim`
 or `none`, drag the window's edges and corners to resize it.
 
+### Desktop notifications
+
+Seraphim sends desktop notifications through `notify-send`, or `gdbus`
+when that isn't installed. Settings go in `[notifications]`:
+
+| Setting | Default | Notifies when |
+|---|---|---|
+| `programs` | `true` | A program asks for one, with OSC 9 (iTerm2), OSC 777;notify (rxvt, foot) or OSC 99 (kitty) |
+| `command_seconds` | `10` | A command that ran at least this long finishes out of sight. Needs shell integration; `0` turns it off |
+| `packages` | `true` | A package manager finishes or fails out of sight |
+| `bell` | `false` | The bell rings out of sight |
+| `always` | `false` | The same, even while you are looking |
+
+"Out of sight" means the window doesn't have focus, or the terminal is
+in a background tab. A program's own requests always show. To try it:
+
+```bash
+printf '\e]777;notify;Seraphim;hello\e\\'
+```
+
+The window also asks for attention (its taskbar entry flashes). At most
+five notifications go out every ten seconds.
+
 ### Windows
 
 New Window (Ctrl+Shift+N) and detached tabs open in the same Seraphim

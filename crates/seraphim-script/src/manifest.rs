@@ -69,6 +69,7 @@ pub const RESERVED: &[&str] = &[
     "audio",
     "network",
     "package",
+    "notification",
     "clipboard",
     "extension",
     "seraphim",

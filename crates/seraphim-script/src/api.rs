@@ -1050,21 +1050,7 @@ fn system(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
         t.set(
             "notify",
             lua.create_function(|_, (title, body): (String, Option<String>)| {
-                let mut cmd = std::process::Command::new("notify-send");
-                cmd.arg("--app-name=Seraphim").arg(title);
-                if let Some(b) = body {
-                    cmd.arg(b);
-                }
-                cmd.stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                match cmd.spawn() {
-                    Ok(mut child) => {
-                        std::thread::spawn(move || child.wait());
-                        Ok(true)
-                    }
-                    Err(_) => Ok(false),
-                }
+                Ok(crate::desktop::notify(&title, body.as_deref().unwrap_or("")))
             })?,
         )?;
     }

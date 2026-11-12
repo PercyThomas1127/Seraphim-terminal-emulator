@@ -211,6 +211,7 @@ pub struct WindowOptions {
     pub config_command: Option<Command>,
     pub tabs: seraphim_config::Tabs,
     pub panes: seraphim_config::Panes,
+    pub notifications: seraphim_config::Notifications,
     /// `terminal.term`.
     pub term: String,
     pub layouts: Vec<seraphim_config::Layout>,
@@ -296,6 +297,7 @@ impl Default for WindowOptions {
             config_command: None,
             tabs: Default::default(),
             panes: Default::default(),
+            notifications: Default::default(),
             term: "auto".into(),
             layouts: Vec::new(),
             startup_layout: None,
@@ -486,6 +488,12 @@ struct Active {
     pad: f32,
     tabs_cfg: seraphim_config::Tabs,
     panes_cfg: seraphim_config::Panes,
+    notify_cfg: seraphim_config::Notifications,
+    /// When the last desktop notifications went out (a flood is cut).
+    notified: std::collections::VecDeque<Instant>,
+    /// Sessions whose package manager just notified: their command's own
+    /// "finished" notice is left out.
+    package_notified: std::collections::BTreeSet<u64>,
     /// The window's own profile (tabs without one use it).
     base_profile: String,
     /// Pane rectangles drawn this frame.
@@ -972,6 +980,7 @@ impl Win {
                 "session.privileged".into(),
                 "command.completed".into(),
                 "package.*".into(),
+                "terminal.notification".into(),
             ]),
             1024,
         );
@@ -1012,6 +1021,9 @@ impl Win {
             pad,
             tabs_cfg: o.tabs.clone(),
             panes_cfg: o.panes.clone(),
+            notify_cfg: o.notifications.clone(),
+            notified: Default::default(),
+            package_notified: Default::default(),
             base_profile: o.profile.clone(),
             drawn: Vec::new(),
             timing: (std::env::var_os("SERAPHIM_TIMING").is_some() || o.probe.is_some())
@@ -1335,6 +1347,7 @@ impl Win {
             a.spawn.grapheme_clustering = o.grapheme_clustering;
             a.tabs_cfg = o.tabs.clone();
             a.panes_cfg = o.panes.clone();
+            a.notify_cfg = o.notifications.clone();
             // A profile chosen here becomes the tab's; a tab switch
             // (TabProfile) only applies the tab's own.
             if matches!(request_kind, Request::Profile(_) | Request::NextProfile) {
@@ -2832,7 +2845,86 @@ impl Active {
     fn pump_pane_events(&mut self) -> bool {
         let visible: Vec<u64> = self.ws.tab().map(|t| t.root.panes()).unwrap_or_default();
         let mut changed = false;
-        for e in self.pane_events.drain() {
+        // Out of sight: the window is unfocused, or the pane isn't shown.
+        let unseen = |id: Option<u64>| {
+            !self.focused || id.is_some_and(|id| !visible.contains(&id)) || self.notify_cfg.always
+        };
+        let mut notes: Vec<(String, String, &str, Option<u64>)> = Vec::new();
+        let cfg = self.notify_cfg.clone();
+        let events = self.pane_events.drain();
+        for e in &events {
+            match e.name.as_str() {
+                "terminal.notification" if cfg.programs => {
+                    let title = e.data["title"].as_str().unwrap_or("").to_owned();
+                    let body = e.data["body"].as_str().unwrap_or("").to_owned();
+                    notes.push((title, body, "program", e.session));
+                }
+                "terminal.bell" if cfg.bell && unseen(e.session) => {
+                    notes.push(("Bell".into(), self.pane_title(e.session), "bell", e.session));
+                }
+                "command.completed" if cfg.command_seconds > 0 && unseen(e.session) => {
+                    let ms = e.data["duration_ms"].as_u64().unwrap_or(0);
+                    let skip = e.session.is_some_and(|s| self.package_notified.remove(&s));
+                    if ms >= cfg.command_seconds as u64 * 1000 && !skip {
+                        let code = e.data["exit_code"].as_i64();
+                        let title = if code.is_some_and(|c| c != 0) {
+                            "Command failed"
+                        } else {
+                            "Command finished"
+                        };
+                        let cmd = e.data["command"].as_str().unwrap_or("").trim();
+                        let mut body = cmd.chars().take(200).collect::<String>();
+                        body.push_str(&match code {
+                            Some(c) if c != 0 => {
+                                format!("\nexit {c} after {}", crate::panels::duration(ms))
+                            }
+                            _ => format!("\nafter {}", crate::panels::duration(ms)),
+                        });
+                        notes.push((title.into(), body, "command", e.session));
+                    }
+                }
+                n if cfg.packages
+                    && (n.ends_with(".completed") || n.ends_with(".failed"))
+                    && n.starts_with("package.") =>
+                {
+                    if !unseen(e.session) {
+                        continue;
+                    }
+                    let d = &e.data;
+                    let manager = d["manager"].as_str().unwrap_or("package manager");
+                    let failed = n.ends_with(".failed");
+                    let done = match d["operation"].as_str().unwrap_or("") {
+                        "install" => "installed",
+                        "remove" => "removed",
+                        "upgrade" => "upgraded",
+                        _ => "synced",
+                    };
+                    let what = d["packages"]
+                        .as_array()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| l.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>().join(" "))
+                        .unwrap_or_else(|| "the system".into());
+                    let title = if failed {
+                        format!("{manager} failed")
+                    } else {
+                        format!("{manager}: {done}")
+                    };
+                    let body = match (failed, d["exit_code"].as_i64()) {
+                        (true, Some(c)) => format!("{what}\nexit {c}"),
+                        _ => what,
+                    };
+                    if let Some(s) = e.session {
+                        self.package_notified.insert(s);
+                    }
+                    notes.push((title, body, "package", e.session));
+                }
+                _ => {}
+            }
+        }
+        for (title, body, reason, session) in notes {
+            self.desktop_notify(&title, &body, reason, session);
+        }
+        for e in events {
             if e.name == "command.completed" {
                 if let Some(cmd) = e.data["command"].as_str().filter(|c| !c.trim().is_empty()) {
                     self.history.retain(|h| h.command != cmd);
@@ -2925,6 +3017,40 @@ impl Active {
             changed = true;
         }
         changed
+    }
+
+    /// The title of a pane's terminal (for notifications).
+    fn pane_title(&self, id: Option<u64>) -> String {
+        let p = id.and_then(|id| self.panes.get(&id));
+        let title = p.map(|p| p.session.terminal().title().to_owned()).unwrap_or_default();
+        if title.is_empty() {
+            "A terminal rang its bell".into()
+        } else {
+            title
+        }
+    }
+
+    /// Send a desktop notification (at most five every ten seconds), mark
+    /// the window for attention, and publish `notification.sent`.
+    fn desktop_notify(&mut self, title: &str, body: &str, reason: &str, session: Option<u64>) {
+        let now = Instant::now();
+        while self.notified.front().is_some_and(|t| now - *t > Duration::from_secs(10)) {
+            self.notified.pop_front();
+        }
+        if self.notified.len() >= 5 {
+            return;
+        }
+        self.notified.push_back(now);
+        let shown = seraphim_script::desktop::notify(title, body);
+        if !self.focused {
+            self.window
+                .request_user_attention(Some(winit::window::UserAttentionType::Informational));
+        }
+        self.bus.publisher("notification").publish(
+            "notification.sent",
+            session,
+            seraphim_events::json!({ "title": title, "body": body, "reason": reason, "shown": shown }),
+        );
     }
 
     fn bar_visible(&self) -> bool {
