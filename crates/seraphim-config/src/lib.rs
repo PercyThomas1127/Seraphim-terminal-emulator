@@ -708,21 +708,34 @@ impl Rule {
         if self.duration_ms > 600_000 {
             return Err("duration_ms must be at most 600000".into());
         }
-        for (k, v) in &self.when {
-            let ok = match v {
-                toml::Value::String(_) | toml::Value::Boolean(_) => true,
-                toml::Value::Integer(_) | toml::Value::Float(_) => true,
-                toml::Value::Array(a) => a.iter().all(|x| x.is_str()),
-                _ => false,
-            };
-            if !ok {
-                return Err(format!(
-                    "when.{k}: expected a string, number, boolean or list of strings"
-                ));
-            }
-        }
-        Ok(())
+        check_when(&self.when)
     }
+}
+
+/// `when` conditions (`[[on]]`, `[[sound]]`): each is a string (a glob), a
+/// number or a boolean, or a list of them (any entry matches).
+fn check_when(when: &std::collections::BTreeMap<String, toml::Value>) -> Result<(), String> {
+    let scalar = |v: &toml::Value| {
+        matches!(
+            v,
+            toml::Value::String(_)
+                | toml::Value::Boolean(_)
+                | toml::Value::Integer(_)
+                | toml::Value::Float(_)
+        )
+    };
+    for (k, v) in when {
+        let ok = match v {
+            toml::Value::Array(a) => a.iter().all(scalar),
+            v => scalar(v),
+        };
+        if !ok {
+            return Err(format!(
+                "when.{k} = {v}: expected a string, number or boolean, or a list of them"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Built-in themes: (name, colors as TOML).
@@ -1197,16 +1210,7 @@ impl Config {
             if s.volume.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
                 return Err(format!("sound #{}: volume must be 0-1", i + 1));
             }
-            if let Some((k, v)) = s
-                .when
-                .iter()
-                .find(|(_, v)| matches!(v, toml::Value::Table(_) | toml::Value::Datetime(_)))
-            {
-                return Err(format!(
-                    "sound #{}: when.{k} = {v}: use a string, number, boolean or list",
-                    i + 1
-                ));
-            }
+            check_when(&s.when).map_err(|e| format!("sound #{}: {e}", i + 1))?;
         }
         if !["system", "seraphim", "none"].contains(&self.window.decorations.as_str()) {
             return Err(format!(
@@ -1611,6 +1615,21 @@ profile = "work"
         )
         .unwrap_err();
         assert!(e.contains("when.a"), "{e}");
+        // Lists of numbers and booleans are fine in both kinds of rule
+        // (the documented [[sound]] example); tables and nested lists aren't.
+        let when = "when = { exit_code = [1, 2, 127], ok = [true, \"x*\"], t = 0.5 }";
+        parse(&format!("[[on]]\nevent = \"x\"\nlayer = \"a\"\nparam = \"p\"\n{when}\n")).unwrap();
+        parse(&format!("[[sound]]\nevent = \"x\"\nfile = \"tone\"\n{when}\n")).unwrap();
+        for bad in
+            ["when = { a = [[1]] }", "when = { a = [{ b = 1 }] }", "when = { a = { b = 1 } }"]
+        {
+            let e = parse(&format!("[[on]]\nevent = \"x\"\nlayer = \"a\"\nparam = \"p\"\n{bad}\n"))
+                .unwrap_err();
+            assert!(e.contains("when.a"), "{bad}: {e}");
+            let e =
+                parse(&format!("[[sound]]\nevent = \"x\"\nfile = \"tone\"\n{bad}\n")).unwrap_err();
+            assert!(e.contains("sound #1: when.a"), "{bad}: {e}");
+        }
         let e = parse("[[background]]\nkind = \"shader\"\nshader = \"heavens\"\npalette = { base = \"theme.bright.9\" }\n")
             .unwrap_err();
         assert!(e.contains("palette.base"), "{e}");

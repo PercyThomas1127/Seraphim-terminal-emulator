@@ -25,6 +25,36 @@ enum Cond {
     Globs(Vec<String>),
     Bool(bool),
     Number(f64),
+    /// A list: any of its entries matches.
+    Any(Vec<Cond>),
+}
+
+impl Cond {
+    fn from_toml(v: &toml::Value) -> Cond {
+        match v {
+            toml::Value::Boolean(b) => Cond::Bool(*b),
+            toml::Value::Integer(i) => Cond::Number(*i as f64),
+            toml::Value::Float(f) => Cond::Number(*f),
+            toml::Value::String(s) => Cond::Globs(vec![s.clone()]),
+            toml::Value::Array(a) => Cond::Any(a.iter().map(Cond::from_toml).collect()),
+            // Rejected by config validation.
+            _ => Cond::Any(Vec::new()),
+        }
+    }
+
+    fn test(&self, v: Option<&Value>) -> bool {
+        match (self, v) {
+            (Cond::Any(c), v) => c.iter().any(|c| c.test(v)),
+            (Cond::Bool(b), Some(Value::Bool(x))) => b == x,
+            (Cond::Number(n), Some(Value::Number(x))) => x.as_f64() == Some(*n),
+            (Cond::Globs(g), Some(Value::String(s))) => g.iter().any(|g| glob(g, s)),
+            (Cond::Globs(g), Some(v @ (Value::Number(_) | Value::Bool(_)))) => {
+                let s = v.to_string();
+                g.iter().any(|g| glob(g, &s))
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Rule {
@@ -32,21 +62,7 @@ impl Rule {
         let when = r
             .when
             .iter()
-            .map(|(k, v)| {
-                let path = k.split('.').map(str::to_owned).collect();
-                let cond = match v {
-                    toml::Value::Boolean(b) => Cond::Bool(*b),
-                    toml::Value::Integer(i) => Cond::Number(*i as f64),
-                    toml::Value::Float(f) => Cond::Number(*f),
-                    toml::Value::String(s) => Cond::Globs(vec![s.clone()]),
-                    toml::Value::Array(a) => Cond::Globs(
-                        a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-                    ),
-                    // Rejected by config validation.
-                    _ => Cond::Globs(Vec::new()),
-                };
-                (path, cond)
-            })
+            .map(|(k, v)| (k.split('.').map(str::to_owned).collect(), Cond::from_toml(v)))
             .collect();
         let duration = r.duration_ms as f64 / 1000.0;
         let transition = match r.easing.as_str() {
@@ -68,19 +84,10 @@ impl Rule {
 
     pub fn matches(&self, name: &str, data: &Value) -> bool {
         self.pattern.matches(name)
-            && self.when.iter().all(|(path, cond)| {
-                let v = path.iter().try_fold(data, |v, k| v.get(k));
-                match (cond, v) {
-                    (Cond::Bool(b), Some(Value::Bool(x))) => b == x,
-                    (Cond::Number(n), Some(Value::Number(x))) => x.as_f64() == Some(*n),
-                    (Cond::Globs(g), Some(Value::String(s))) => g.iter().any(|g| glob(g, s)),
-                    (Cond::Globs(g), Some(v @ (Value::Number(_) | Value::Bool(_)))) => {
-                        let s = v.to_string();
-                        g.iter().any(|g| glob(g, &s))
-                    }
-                    _ => false,
-                }
-            })
+            && self
+                .when
+                .iter()
+                .all(|(path, cond)| cond.test(path.iter().try_fold(data, |v, k| v.get(k))))
     }
 
     /// Run the rule's animation. Returns false if the layer or parameter
@@ -264,6 +271,15 @@ mod tests {
             !r.matches("command.started", &json!({"command": "brew install jq", "x": {"code": 1}}))
         );
         assert!(!r.matches("command.started", &json!({"command": null, "x": {"code": 0}})));
+
+        // A list matches any of its entries, numbers too (the documented
+        // [[sound]] example).
+        let r = rule("[[on]]\nevent = \"command.completed\"\nwhen = { exit_code = [1, 2, 127], ok = [false, \"maybe\"] }\nlayer = \"sky\"\nparam = \"alert\"\n");
+        assert!(r.matches("command.completed", &json!({"exit_code": 127, "ok": false})));
+        assert!(r.matches("command.completed", &json!({"exit_code": 1, "ok": "maybe"})));
+        assert!(!r.matches("command.completed", &json!({"exit_code": 0, "ok": false})));
+        assert!(!r.matches("command.completed", &json!({"exit_code": 1, "ok": true})));
+        assert!(!r.matches("command.completed", &json!({"ok": false})), "missing field");
     }
 
     #[test]
