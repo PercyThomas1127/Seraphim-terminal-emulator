@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 pub fn notify(title: &str, body: &str) -> bool {
     let title = if title.is_empty() { "Seraphim" } else { title };
     let mut send = Command::new("notify-send");
-    send.args(["--app-name=Seraphim", "--icon=seraphim", "--", title, body]);
+    send.args(["--app-name=Seraphim", "--icon=seraphim", "--", title]);
+    send.arg(notify_send_body(body));
     if spawn(send) {
         return true;
     }
@@ -43,6 +44,13 @@ fn spawn(mut cmd: Command) -> bool {
     }
 }
 
+/// `notify-send` unescapes the body, not the summary (`\n` becomes a line
+/// break, `\a` an `a`), so the body's backslashes are doubled to arrive as
+/// typed.
+fn notify_send_body(s: &str) -> String {
+    s.replace('\\', "\\\\")
+}
+
 /// A GVariant string literal, as `gdbus call` parses its arguments.
 fn gvariant_string(s: &str) -> String {
     let mut out = String::from("'");
@@ -63,5 +71,10 @@ mod tests {
     #[test]
     fn gvariant_quoting() {
         assert_eq!(super::gvariant_string("it's a \\ test\nok"), "'it\\'s a \\\\ test\\nok'");
+    }
+
+    #[test]
+    fn notify_send_quoting() {
+        assert_eq!(super::notify_send_body("printf '\\a' C:\\x\nok"), "printf '\\\\a' C:\\\\x\nok");
     }
 }
