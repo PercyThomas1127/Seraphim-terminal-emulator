@@ -985,12 +985,48 @@ fn system(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
             ("memory", Metric::Memory),
             ("load", Metric::Load),
             ("hour", Metric::Hour),
+            ("temperature", Metric::CpuTemp),
         ] {
             let c = ctx.clone();
             t.set(
                 name,
                 lua.create_function(move |_, ()| {
                     Ok(c.state.lock().unwrap().sampler.read(m, Instant::now()))
+                })?,
+            )?;
+        }
+        // Tables of related readings; fields are nil where unknown.
+        for (name, fields) in [
+            (
+                "gpu",
+                &[
+                    ("busy", Metric::Gpu),
+                    ("memory", Metric::GpuMemory),
+                    ("temperature", Metric::GpuTemp),
+                ][..],
+            ),
+            (
+                "network",
+                &[("rx", Metric::NetRx), ("tx", Metric::NetTx), ("online", Metric::NetOnline)][..],
+            ),
+            ("disk", &[("read", Metric::DiskRead), ("write", Metric::DiskWrite)][..]),
+        ] {
+            let c = ctx.clone();
+            t.set(
+                name,
+                lua.create_function(move |l, ()| {
+                    let mut st = c.state.lock().unwrap();
+                    let now = Instant::now();
+                    let out = l.create_table()?;
+                    for (k, m) in fields {
+                        let v = st.sampler.read(*m, now);
+                        if *m == Metric::NetOnline {
+                            out.set(*k, v.map(|v| v > 0.5))?;
+                        } else {
+                            out.set(*k, v)?;
+                        }
+                    }
+                    Ok(Value::Table(out))
                 })?,
             )?;
         }

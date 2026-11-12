@@ -143,6 +143,10 @@ pub struct PanelState {
     pub rows: Vec<(usize, usize)>,
     cpu: VecDeque<f32>,
     mem: VecDeque<f32>,
+    gpu: VecDeque<f32>,
+    /// Network receive and send, KiB/s.
+    rx: VecDeque<f32>,
+    tx: VecDeque<f32>,
     sampler: Sampler,
     next_sample: Instant,
 }
@@ -179,6 +183,9 @@ impl PanelState {
             rows: Vec::new(),
             cpu: VecDeque::new(),
             mem: VecDeque::new(),
+            gpu: VecDeque::new(),
+            rx: VecDeque::new(),
+            tx: VecDeque::new(),
             sampler: Sampler::default(),
             next_sample: Instant::now(),
         }
@@ -205,7 +212,13 @@ impl PanelState {
         let due = now >= self.next_sample;
         if due {
             self.next_sample = now + Duration::from_secs(1);
-            for (m, buf) in [(Metric::Cpu, &mut self.cpu), (Metric::Memory, &mut self.mem)] {
+            for (m, buf) in [
+                (Metric::Cpu, &mut self.cpu),
+                (Metric::Memory, &mut self.mem),
+                (Metric::Gpu, &mut self.gpu),
+                (Metric::NetRx, &mut self.rx),
+                (Metric::NetTx, &mut self.tx),
+            ] {
                 if let Some(v) = self.sampler.read(m, now) {
                     buf.push_back(v as f32);
                     if buf.len() > SPARK {
@@ -247,11 +260,66 @@ impl PanelState {
                         values: self.mem.iter().copied().collect(),
                         max: Some(100.0),
                     },
-                    Widget::Separator,
                 ];
+                if let Some(g) = self.gpu.back().copied() {
+                    let mem = self.sampler.read(Metric::GpuMemory, now);
+                    w.push(Widget::Gauge {
+                        label: "GPU".into(),
+                        value: g / 100.0,
+                        text: Some(match mem {
+                            Some(m) => format!("{g:.0}% · mem {m:.0}%"),
+                            None => format!("{g:.0}%"),
+                        }),
+                        style: Style::Normal,
+                    });
+                    w.push(Widget::Sparkline {
+                        label: "".into(),
+                        values: self.gpu.iter().copied().collect(),
+                        max: Some(100.0),
+                    });
+                }
+                if !self.rx.is_empty() {
+                    let rate = |k: f32| {
+                        if k >= 1024.0 {
+                            format!("{:.1} MiB/s", k / 1024.0)
+                        } else {
+                            format!("{k:.0} KiB/s")
+                        }
+                    };
+                    let peak = self.rx.iter().chain(&self.tx).copied().fold(64.0, f32::max);
+                    w.push(Widget::Sparkline {
+                        label: format!("↓ {}", rate(self.rx.back().copied().unwrap_or(0.0))),
+                        values: self.rx.iter().copied().collect(),
+                        max: Some(peak),
+                    });
+                    w.push(Widget::Sparkline {
+                        label: format!("↑ {}", rate(self.tx.back().copied().unwrap_or(0.0))),
+                        values: self.tx.iter().copied().collect(),
+                        max: Some(peak),
+                    });
+                }
+                w.push(Widget::Separator);
                 let mut kv = Vec::new();
                 if let Some(l) = load {
                     kv.push(("Load per core".to_owned(), format!("{l:.2}")));
+                }
+                let temps: Vec<String> = [("CPU", Metric::CpuTemp), ("GPU", Metric::GpuTemp)]
+                    .iter()
+                    .filter_map(|(n, m)| {
+                        self.sampler.read(*m, now).map(|t| format!("{n} {t:.0}°C"))
+                    })
+                    .collect();
+                if !temps.is_empty() {
+                    kv.push(("Temperature".into(), temps.join(" · ")));
+                }
+                if let (Some(r), Some(wr)) = (
+                    self.sampler.read(Metric::DiskRead, now),
+                    self.sampler.read(Metric::DiskWrite, now),
+                ) {
+                    kv.push(("Disk".into(), format!("r {r:.0} · w {wr:.0} KiB/s")));
+                }
+                if self.sampler.read(Metric::NetOnline, now) == Some(0.0) {
+                    kv.push(("Network".into(), "offline".into()));
                 }
                 if let Some(b) = self.sampler.read(Metric::BatteryLevel, now) {
                     let charging = self.sampler.read(Metric::BatteryCharging, now) == Some(1.0);

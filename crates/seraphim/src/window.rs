@@ -503,6 +503,9 @@ struct Active {
     float_focus: Option<u64>,
     /// A floating panel being moved or resized.
     float_drag: Option<FloatDrag>,
+    /// Whether the machine was online at the last check (network.*).
+    net_online: Option<bool>,
+    net_checked: Instant,
     /// A tab being dragged to a new place.
     tab_drag: Option<usize>,
     /// Rename Tab: the label being typed.
@@ -1019,6 +1022,8 @@ impl Win {
             floats: Vec::new(),
             float_focus: None,
             float_drag: None,
+            net_online: None,
+            net_checked: Instant::now(),
             tab_drag: None,
             renaming: None,
             pane_events,
@@ -4333,6 +4338,33 @@ impl Win {
             a.panes.get(&focus).and_then(|p| a.scripts.refresh_snapshot(&p.session, now))
         {
             wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
+
+        // network.online / network.offline, when someone listens.
+        if a.bus.wants("network.online")
+            || a.bus.wants("network.offline")
+            || a.bus.wants("network.changed")
+        {
+            let due = a.net_checked + Duration::from_secs(2);
+            if now >= due || a.net_online.is_none() {
+                a.net_checked = now;
+                let v4 = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+                let v6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+                let online = seraphim_script::metrics::default_route(&v4, &v6);
+                if a.net_online.is_some_and(|o| o != online) {
+                    let p = a.bus.publisher("network");
+                    let name = if online { "network.online" } else { "network.offline" };
+                    p.publish(name, None, seraphim_events::json!({ "online": online }));
+                    p.publish(
+                        "network.changed",
+                        None,
+                        seraphim_events::json!({ "online": online }),
+                    );
+                }
+                a.net_online = Some(online);
+            }
+            let next = a.net_checked + Duration::from_secs(2);
+            wake = Some(wake.map_or(next, |w| w.min(next)));
         }
 
         // Bindings: metrics on their intervals, latest event values.

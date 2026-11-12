@@ -217,7 +217,10 @@ selection_fade_ms = 90
 
 # Continuous bindings: a layer parameter follows a live value, eased over
 # smoothing_ms. Sources: system.cpu (percent), system.memory (percent),
-# system.load (load average per core), battery.level (percent),
+# system.load (load average per core), system.gpu and system.gpu.memory
+# (percent), system.gpu.temp and system.temp (°C), network.rx and
+# network.tx (KiB/s), network.online (0 or 1), disk.read and disk.write
+# (KiB/s), battery.level (percent),
 # battery.charging (0 or 1), time.hour (0-24, local),
 # terminal.last_exit_code, session.root, session.cwd, terminal.alt_screen;
 # or the latest event of a kind with `event` and `field`. `input` (default:

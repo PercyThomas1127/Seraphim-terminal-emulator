@@ -152,6 +152,7 @@ end, { priority = 10, throttle = 100 })
 | `session.created`, `session.exited`, `session.closed` | `{pid, cols, rows}`, `{exit_code, signal}`, `{}` |
 | `session.privileged` | `{root}`: from process credentials, never from output |
 | `session.cwd.changed` | `{cwd}` |
+| `network.online`, `network.offline`, `network.changed` | `{online}`: the default route came or went |
 | `interface.focus.changed` | `{focused}` |
 | `interface.resized` | `{cols, rows, width, height}` |
 | `interface.menu.toggled` | `{open}` |
@@ -222,7 +223,9 @@ visual.bind("sky.alert", { event = "session.privileged", field = "root", mapping
 * `target` is `layer.parameter`, `layer.opacity`, `layer.color` or
   `layer.color.<name>`.
 * `source` can be `system.cpu`, `system.memory`, `system.load`,
-  `battery.level`, `battery.charging`, `time.hour`,
+  `system.gpu`, `system.gpu.memory`, `system.gpu.temp`, `system.temp`,
+  `network.rx`, `network.tx`, `network.online`, `disk.read`,
+  `disk.write`, `battery.level`, `battery.charging`, `time.hour`,
   `terminal.last_exit_code`, `session.root`, `session.cwd` or
   `terminal.alt_screen`. You can also pass `event` and `field` instead.
 * The value maps with `input = {a, b}` onto `min`/`max`, or through
@@ -301,7 +304,12 @@ complete one.
 ### `system` (`metrics`, `system`)
 
 `system.cpu()`, `system.memory()` (percent), `system.load()` (per core),
-`system.battery() → {level, charging}` or `nil`, `system.hour()`. With
+`system.battery() → {level, charging}` or `nil`, `system.hour()`,
+`system.temperature()` (CPU, °C), `system.gpu() → {busy, memory,
+temperature}` (percent, percent, °C; AMD and Intel from sysfs, NVIDIA from
+`nvidia-smi`), `system.network() → {rx, tx, online}` (KiB/s) and
+`system.disk() → {read, write}` (KiB/s). Readings the machine doesn't
+have are `nil`. With
 `system`: `system.notify(title, body)` shows a desktop notification
 through `notify-send`.
 

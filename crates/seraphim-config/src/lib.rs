@@ -482,6 +482,16 @@ pub const BIND_SOURCES: &[(&str, [f32; 2])] = &[
     ("battery.level", [0.0, 100.0]),
     ("battery.charging", [0.0, 1.0]),
     ("time.hour", [0.0, 24.0]),
+    ("system.gpu", [0.0, 100.0]),
+    ("system.gpu.memory", [0.0, 100.0]),
+    ("system.gpu.temp", [30.0, 90.0]),
+    ("system.temp", [30.0, 90.0]),
+    // KiB/s; 10 MiB/s is "busy" for the default range.
+    ("network.rx", [0.0, 10240.0]),
+    ("network.tx", [0.0, 10240.0]),
+    ("network.online", [0.0, 1.0]),
+    ("disk.read", [0.0, 102400.0]),
+    ("disk.write", [0.0, 102400.0]),
 ];
 
 /// "This layer property follows that value" (spec 5.3, 11.4).
@@ -1484,7 +1494,7 @@ profile = "work"
         assert_eq!(c.bind.len(), 2);
         assert_eq!(c.bind[0].smoothing_ms, 600);
         for (bad, want) in [
-            ("source = \"system.gpu\"", "unknown source"),
+            ("source = \"system.fan\"", "unknown source"),
             ("source = \"system.cpu\"\nevent = \"x\"", "exactly one"),
             ("event = \"x\"", "needs `event` and `field`"),
             ("source = \"system.cpu\"\ninput = [1, 1]", "two different"),
