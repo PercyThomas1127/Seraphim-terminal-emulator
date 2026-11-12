@@ -358,7 +358,10 @@ seraphim --install-terminfo
 ```
 
 New sessions then use `TERM=xterm-seraphim`. Hosts you ssh into need the
-entry too, or set `terminal.term = "xterm-256color"`.
+entry too, or set `terminal.term = "xterm-256color"`. If tmux says
+`missing or unsuitable terminal: xterm-seraphim`, or vim shows no colors,
+run the command again: earlier entries were too large for some ncurses
+builds.
 
 ### Performance
 

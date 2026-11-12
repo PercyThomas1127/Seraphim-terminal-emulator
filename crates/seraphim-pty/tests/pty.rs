@@ -34,7 +34,35 @@ fn child_is_a_tty_with_our_size_and_env() {
         .args(["-c", "test -t 0 && test -t 1 && stty size && echo $TERM $FOO"])
         .env("FOO", "bar");
     let pty = Pty::spawn(&cmd, PtySize::new(100, 30)).unwrap();
-    assert_eq!(read_all(&pty).trim(), "30 100\r\nxterm-256color bar");
+    // xterm-seraphim when it is installed, else xterm-256color.
+    let term = seraphim_pty::default_term();
+    assert_eq!(read_all(&pty).trim(), format!("30 100\r\n{term} bar"));
+}
+
+/// ncurses built without extended numbers (Gentoo's narrow libtinfo, which
+/// tmux and vim use there) reads at most 4096 bytes of a compiled entry and
+/// calls longer ones unknown. Compiled against this system's
+/// xterm-256color; skipped without `tic`.
+#[test]
+fn terminfo_entry_fits_every_ncurses() {
+    let dir = std::env::temp_dir().join(format!("seraphim-tic-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("xterm-seraphim.terminfo");
+    std::fs::write(&src, include_str!("../../../extra/terminfo/xterm-seraphim.terminfo")).unwrap();
+    let out = dir.join("out");
+    let status = std::process::Command::new("tic").arg("-x").arg("-o").arg(&out).arg(&src).status();
+    let Ok(status) = status else {
+        eprintln!("skipping: tic not installed");
+        return;
+    };
+    assert!(status.success(), "tic failed");
+    let size = ["x", "78"]
+        .iter()
+        .find_map(|d| std::fs::metadata(out.join(d).join("xterm-seraphim")).ok())
+        .expect("compiled entry")
+        .len();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(size <= 4096, "compiled xterm-seraphim is {size} bytes");
 }
 
 #[test]

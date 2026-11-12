@@ -7,6 +7,21 @@ use std::time::{Duration, Instant};
 use seraphim_events::EventBus;
 use seraphim_session::{Command, Session, SessionConfig};
 
+/// The child gets a temporary HOME, but Seraphim's TERM may be an entry in
+/// the real ~/.terminfo: keep that where ncurses looks.
+fn terminfo_dirs() -> std::ffi::OsString {
+    let mut dirs = std::ffi::OsString::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::Path::new(&home).join(".terminfo"));
+    }
+    // An empty entry is the system's own directories.
+    dirs.push(":");
+    if let Some(d) = std::env::var_os("TERMINFO_DIRS") {
+        dirs.push(d);
+    }
+    dirs
+}
+
 fn have(prog: &str) -> bool {
     let found = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
@@ -55,7 +70,8 @@ fn vim_edit_save_and_restore_screen() {
     let cmd = Command::new("vim")
         .args(["-u", "NONE", "-i", "NONE", "-N", "-n"])
         .arg(file.as_os_str())
-        .env("HOME", std::env::temp_dir());
+        .env("HOME", std::env::temp_dir())
+        .env("TERMINFO_DIRS", terminfo_dirs());
     let (_bus, s) = spawn(cmd, 60, 15);
 
     wait_until(&s, "vim to draw the file", |t| t.contains("line 001 ✦ 天使"));

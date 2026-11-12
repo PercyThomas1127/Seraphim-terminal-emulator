@@ -6,6 +6,21 @@ use std::time::{Duration, Instant};
 use seraphim_events::EventBus;
 use seraphim_session::{Command, Session, SessionConfig};
 
+/// The child gets a temporary HOME, but Seraphim's TERM may be an entry in
+/// the real ~/.terminfo: keep that where ncurses looks.
+fn terminfo_dirs() -> std::ffi::OsString {
+    let mut dirs = std::ffi::OsString::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::Path::new(&home).join(".terminfo"));
+    }
+    // An empty entry is the system's own directories.
+    dirs.push(":");
+    if let Some(d) = std::env::var_os("TERMINFO_DIRS") {
+        dirs.push(d);
+    }
+    dirs
+}
+
 /// A prompt long enough to wrap when the terminal narrows.
 const PS1: &str = "[a-rather-long-prompt-that-wraps-when-the-terminal-narrows] $ ";
 
@@ -24,7 +39,8 @@ fn bash(cols: u16, rows: u16) -> (EventBus, Session) {
     let cmd = Command::new("bash")
         .args(["--norc", "--noprofile", "-i"])
         .env("PS1", PS1)
-        .env("HOME", std::env::temp_dir());
+        .env("HOME", std::env::temp_dir())
+        .env("TERMINFO_DIRS", terminfo_dirs());
     let s = Session::spawn(
         1,
         SessionConfig { command: cmd, cols, rows, scrollback: 1000, ..Default::default() },

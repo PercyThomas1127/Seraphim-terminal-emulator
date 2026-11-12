@@ -273,6 +273,18 @@ fn install_terminfo() -> Result<(), String> {
                 "Installed xterm-seraphim into {}; new sessions use TERM=xterm-seraphim.",
                 out.display()
             );
+            // The size depends on the system's xterm-256color, which it uses.
+            let size = ["x", "78"]
+                .iter()
+                .find_map(|d| std::fs::metadata(out.join(d).join("xterm-seraphim")).ok())
+                .map(|m| m.len());
+            if let Some(size) = size.filter(|&n| n > 4096) {
+                eprintln!(
+                    "seraphim: warning: the entry is {size} bytes; ncurses built without \
+                     extended numbers (tmux and vim use it on some systems) can't read \
+                     entries over 4096 bytes. Remove it, or report this."
+                );
+            }
             Ok(())
         }
         s => Err(format!("tic failed ({s})")),

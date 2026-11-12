@@ -9,6 +9,21 @@
 #   Ms              set the clipboard (OSC 52)
 #   Sync            synchronized output (mode 2026)
 #   fullkbd         the Kitty keyboard protocol
+#
+# Size: the compiled entry must stay at most 4096 bytes. ncurses built
+# without extended numbers (Gentoo's narrow libtinfo, used by tmux and
+# vim there) reads no more than that and calls longer entries unknown.
+# xterm-256color alone is about 4070, so what Seraphim doesn't do is
+# cancelled, which also stops programs from relying on it:
+#
+#   ka1 … kpZRO     application keypad keys (keypad keys send their
+#                   characters, keypad Enter a CR)
+#   flash           visual bell by reverse video (mode 5)
+#   smglr, smglp,   left and right margins (mode 69)
+#   smgrp, mgc
+#   smm, rmm        meta mode (mode 1034)
+#   mc0, mc4, mc5   printing
+#   meml, memu      memory lock
 xterm-seraphim|Seraphim terminal,
 	Tc,
 	RGB,
@@ -20,4 +35,11 @@ xterm-seraphim|Seraphim terminal,
 	Se=\E[2 q,
 	Ms=\E]52;%p1%s;%p2%s\007,
 	Sync=\E[?2026%?%p1%{1}%-%tl%eh%;,
+	ka1@, ka2@, ka3@, kb1@, kb2@, kb3@, kc1@, kc2@, kc3@, kent@,
+	kp5@, kpADD@, kpCMA@, kpDIV@, kpDOT@, kpMUL@, kpSUB@, kpZRO@,
+	flash@,
+	smglr@, smglp@, smgrp@, mgc@,
+	smm@, rmm@,
+	mc0@, mc4@, mc5@,
+	meml@, memu@,
 	use=xterm-256color,
