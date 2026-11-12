@@ -155,6 +155,7 @@ end, { priority = 10, throttle = 100 })
 | `session.privileged` | `{root}`: from process credentials, never from output |
 | `session.cwd.changed` | `{cwd}` |
 | `network.online`, `network.offline`, `network.changed` | `{online}`: the default route came or went |
+| `audio.playing` | `{playing}`: the default output started or stopped making sound (listened for only while someone subscribes) |
 | `interface.focus.changed` | `{focused}` |
 | `interface.resized` | `{cols, rows, width, height}` |
 | `interface.menu.toggled` | `{open}` |
@@ -227,7 +228,8 @@ visual.bind("sky.alert", { event = "session.privileged", field = "root", mapping
 * `source` can be `system.cpu`, `system.memory`, `system.load`,
   `system.gpu`, `system.gpu.memory`, `system.gpu.temp`, `system.temp`,
   `network.rx`, `network.tx`, `network.online`, `disk.read`,
-  `disk.write`, `battery.level`, `battery.charging`, `time.hour`,
+  `disk.write`, `audio.level`, `audio.bass`, `audio.mid`,
+  `audio.treble`, `battery.level`, `battery.charging`, `time.hour`,
   `terminal.last_exit_code`, `session.root`, `session.cwd` or
   `terminal.alt_screen`. You can also pass `event` and `field` instead.
 * The value maps with `input = {a, b}` onto `min`/`max`, or through
@@ -310,10 +312,13 @@ complete one.
 `system.temperature()` (CPU, °C), `system.gpu() → {busy, memory,
 temperature}` (percent, percent, °C; AMD and Intel from sysfs, NVIDIA from
 `nvidia-smi`), `system.network() → {rx, tx, online}` (KiB/s) and
-`system.disk() → {read, write}` (KiB/s). Readings the machine doesn't
-have are `nil`. With
+`system.disk() → {read, write}` (KiB/s), and `system.audio() → {level,
+bass, mid, treble}` (0–1, what the default output plays; the first call
+starts listening). Readings the machine doesn't have are `nil`. With
 `system`: `system.notify(title, body)` shows a desktop notification
-through `notify-send`.
+through `notify-send` (or `gdbus`), and `system.play(file, {volume})`
+plays a sound file from the extension's folder, its data folder or a
+granted path (`"tone"` and `"bell"` are Seraphim's own sounds).
 
 ### `process` (`process.read`, `process.exec`)
 

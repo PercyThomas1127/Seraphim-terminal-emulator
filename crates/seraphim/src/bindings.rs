@@ -68,6 +68,7 @@ impl Bind {
             ),
             _ => return None,
         };
+        let audio = matches!(&input, Input::Metric(m) if m.is_audio());
         let (map, palette, color) = if b.is_color() {
             let mut palette = Vec::new();
             let mut map = BTreeMap::new();
@@ -88,8 +89,16 @@ impl Bind {
             map,
             palette,
             color,
-            smoothing: Duration::from_millis(b.smoothing_ms as u64),
-            interval: Duration::from_millis(b.interval_ms as u64),
+            // Audio moves fast: sampled every 33 ms and barely smoothed,
+            // unless the binding says otherwise.
+            smoothing: Duration::from_millis(match b.smoothing_ms {
+                600 if audio => 60,
+                ms => ms as u64,
+            }),
+            interval: Duration::from_millis(match b.interval_ms {
+                1000 if audio => 33,
+                ms => ms as u64,
+            }),
         })
     }
 

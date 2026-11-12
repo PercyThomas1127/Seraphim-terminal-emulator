@@ -13,6 +13,7 @@
 //!   overrunning it is disabled.
 //! * What an extension may do is decided by its [`perm::Grant`].
 
+pub mod audio;
 pub mod desktop;
 pub mod manifest;
 pub mod metrics;

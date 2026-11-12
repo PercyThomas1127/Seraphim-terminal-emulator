@@ -39,6 +39,28 @@ pub fn load(
     Ok((o, warnings))
 }
 
+/// A sound file: `~/…`, absolute, next to the configuration, or in its
+/// `sounds/` folder. `tone` and `bell` stay as they are.
+fn sound_path(file: &str, config_dir: Option<&Path>) -> String {
+    if file == "tone" || file == "bell" {
+        return file.to_owned();
+    }
+    if let Some(rest) = file.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return Path::new(&home).join(rest).to_string_lossy().into_owned();
+        }
+    }
+    let p = Path::new(file);
+    if p.is_absolute() {
+        return file.to_owned();
+    }
+    let Some(dir) = config_dir else { return file.to_owned() };
+    let beside = dir.join(p);
+    let in_sounds = dir.join("sounds").join(p);
+    let pick = if beside.exists() || !in_sounds.exists() { beside } else { in_sounds };
+    pick.to_string_lossy().into_owned()
+}
+
 /// Window settings from a (layered) configuration. Returns warnings for
 /// background layers that could not be prepared (e.g. unreadable shader
 /// files); those layers are skipped.
@@ -100,6 +122,12 @@ pub fn options_from_config(
         term: c.terminal.term.clone(),
         panes: c.panes.clone(),
         notifications: c.notifications.clone(),
+        audio: c.audio.clone(),
+        sounds: c
+            .sound
+            .iter()
+            .map(|s| seraphim_config::Sound { file: sound_path(&s.file, config_dir), ..s.clone() })
+            .collect(),
         layouts: c.layout.clone(),
         startup_layout: c.startup_layout.clone(),
         restore_session: c.restore_session,

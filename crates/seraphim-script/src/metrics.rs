@@ -28,9 +28,22 @@ pub enum Metric {
     /// Disk read and write rates, KiB/s (whole disks).
     DiskRead,
     DiskWrite,
+    /// The default output's loudness, 0–1, overall and per band. Reading
+    /// one starts listening (crate::audio).
+    AudioLevel,
+    AudioBass,
+    AudioMid,
+    AudioTreble,
 }
 
 impl Metric {
+    pub fn is_audio(self) -> bool {
+        matches!(
+            self,
+            Metric::AudioLevel | Metric::AudioBass | Metric::AudioMid | Metric::AudioTreble
+        )
+    }
+
     pub fn parse(s: &str) -> Option<Metric> {
         Some(match s {
             "system.cpu" => Metric::Cpu,
@@ -48,6 +61,10 @@ impl Metric {
             "network.online" => Metric::NetOnline,
             "disk.read" => Metric::DiskRead,
             "disk.write" => Metric::DiskWrite,
+            "audio.level" => Metric::AudioLevel,
+            "audio.bass" => Metric::AudioBass,
+            "audio.mid" => Metric::AudioMid,
+            "audio.treble" => Metric::AudioTreble,
             _ => return None,
         })
     }
@@ -68,11 +85,10 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn read(&mut self, m: Metric, now: Instant) -> Option<f64> {
-        if let Some((_, _, v)) = self
-            .cache
-            .iter()
-            .find(|(k, t, _)| *k == m && now.duration_since(*t) < Duration::from_millis(150))
-        {
+        if let Some((_, _, v)) = self.cache.iter().find(|(k, t, _)| {
+            let fresh = if m.is_audio() { 15 } else { 150 };
+            *k == m && now.duration_since(*t) < Duration::from_millis(fresh)
+        }) {
             return *v;
         }
         let v = match m {
@@ -101,6 +117,15 @@ impl Sampler {
                 }
             }
             Metric::CpuTemp => cpu_temp(),
+            Metric::AudioLevel | Metric::AudioBass | Metric::AudioMid | Metric::AudioTreble => {
+                let l = crate::audio::levels()?;
+                Some(match m {
+                    Metric::AudioLevel => l.level,
+                    Metric::AudioBass => l.bass,
+                    Metric::AudioMid => l.mid,
+                    _ => l.treble,
+                } as f64)
+            }
             Metric::NetRx | Metric::NetTx => {
                 let now_bytes = net_bytes(&std::fs::read_to_string("/proc/net/dev").ok()?)?;
                 let r = rates(&mut self.net, now_bytes, now);

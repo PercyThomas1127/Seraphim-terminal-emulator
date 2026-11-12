@@ -212,6 +212,9 @@ pub struct WindowOptions {
     pub tabs: seraphim_config::Tabs,
     pub panes: seraphim_config::Panes,
     pub notifications: seraphim_config::Notifications,
+    pub audio: seraphim_config::Audio,
+    /// `[[sound]]`, with their files resolved.
+    pub sounds: Vec<seraphim_config::Sound>,
     /// `terminal.term`.
     pub term: String,
     pub layouts: Vec<seraphim_config::Layout>,
@@ -298,6 +301,8 @@ impl Default for WindowOptions {
             tabs: Default::default(),
             panes: Default::default(),
             notifications: Default::default(),
+            audio: Default::default(),
+            sounds: Vec::new(),
             term: "auto".into(),
             layouts: Vec::new(),
             startup_layout: None,
@@ -511,6 +516,12 @@ struct Active {
     float_focus: Option<u64>,
     /// A floating panel being moved or resized.
     float_drag: Option<FloatDrag>,
+    /// `[[sound]]` and the audible bell.
+    sounds: crate::sounds::Sounds,
+    /// Sound is playing on the default output (audio.playing), and since
+    /// when the level has said otherwise.
+    audio_playing: bool,
+    audio_flip: Option<Instant>,
     /// Whether the machine was online at the last check (network.*).
     net_online: Option<bool>,
     net_checked: Instant,
@@ -1034,6 +1045,9 @@ impl Win {
             floats: Vec::new(),
             float_focus: None,
             float_drag: None,
+            sounds: crate::sounds::Sounds::new(&o.audio, &o.sounds, &bus),
+            audio_playing: false,
+            audio_flip: None,
             net_online: None,
             net_checked: Instant::now(),
             tab_drag: None,
@@ -1348,6 +1362,7 @@ impl Win {
             a.tabs_cfg = o.tabs.clone();
             a.panes_cfg = o.panes.clone();
             a.notify_cfg = o.notifications.clone();
+            a.sounds = crate::sounds::Sounds::new(&o.audio, &o.sounds, &a.bus);
             // A profile chosen here becomes the tab's; a tab switch
             // (TabProfile) only applies the tab's own.
             if matches!(request_kind, Request::Profile(_) | Request::NextProfile) {
@@ -4466,6 +4481,31 @@ impl Win {
             wake = Some(wake.map_or(t, |w| w.min(t)));
         }
 
+        a.sounds.pump();
+        // audio.playing: the default output starts or stops making sound
+        // (heard only while someone listens for it).
+        if a.bus.wants("audio.playing") {
+            if let Some(l) = seraphim_script::audio::levels() {
+                let differs = if a.audio_playing { l.level < 0.08 } else { l.level > 0.2 };
+                let hold = Duration::from_millis(if a.audio_playing { 1500 } else { 300 });
+                match (differs, a.audio_flip) {
+                    (false, _) => a.audio_flip = None,
+                    (true, None) => a.audio_flip = Some(now),
+                    (true, Some(t)) if now - t >= hold => {
+                        a.audio_playing = !a.audio_playing;
+                        a.audio_flip = None;
+                        a.bus.publisher("audio").publish(
+                            "audio.playing",
+                            None,
+                            seraphim_events::json!({ "playing": a.audio_playing }),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let next = now + Duration::from_millis(100);
+            wake = Some(wake.map_or(next, |w| w.min(next)));
+        }
         // network.online / network.offline, when someone listens.
         if a.bus.wants("network.online")
             || a.bus.wants("network.offline")

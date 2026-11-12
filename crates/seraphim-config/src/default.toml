@@ -315,6 +315,40 @@ bell = false
 # Notify even while the terminal is in sight.
 always = false
 
+# Sound. Seraphim plays sounds with pw-play, paplay, aplay or ffplay
+# (whichever is installed) and needs no audio library.
+[audio]
+# The bell: "none", "default" (the desktop's bell sound, through
+# canberra-gtk-play, else a tone), "tone" (a short soft tone) or a sound
+# file.
+bell = "none"
+# Volume of Seraphim's sounds, 0-1.
+volume = 0.8
+
+# Sounds for events, matched like [[on]] rules. `file` is a sound file
+# (relative: next to this file, or in sounds/), "tone" or "bell".
+#
+# [[sound]]
+# event = "package.install.completed"
+# file = "sounds/done.ogg"
+#
+# [[sound]]
+# event = "command.completed"
+# when = { exit_code = [1, 2, 127] }
+# file = "tone"
+# volume = 0.5
+#
+# Audio-reactive backgrounds: bind to audio.level, audio.bass, audio.mid
+# or audio.treble (0-1, what the default output is playing, read with
+# parec or ffmpeg from its monitor; listening starts only when something
+# binds to it):
+#
+# [[bind]]
+# source = "audio.bass"
+# layer = "sky"
+# param = "intensity"
+# output = [0.2, 1.0]
+
 # Lua extensions: folders in extensions/ (extension.toml + init.lua) and
 # one-file scripts in scripts/*.lua, next to this file. Each runs in its
 # own sandbox on a script thread; a handler that runs longer than

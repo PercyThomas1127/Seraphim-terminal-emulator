@@ -54,6 +54,7 @@ mod profile;
 mod restore;
 mod scripting;
 mod settings;
+mod sounds;
 mod tabbar;
 mod watch;
 mod window;

@@ -1030,6 +1030,17 @@ fn system(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
                 })?,
             )?;
         }
+        // The default output's loudness; the first call starts listening.
+        t.set(
+            "audio",
+            lua.create_function(move |l, ()| match crate::audio::levels() {
+                Some(a) => to_lua(
+                    l,
+                    &json!({ "level": a.level, "bass": a.bass, "mid": a.mid, "treble": a.treble }),
+                ),
+                None => Ok(Value::Nil),
+            })?,
+        )?;
         let c = ctx.clone();
         t.set(
             "battery",
@@ -1051,6 +1062,29 @@ fn system(lua: &Lua, ctx: &Arc<Ctx>) -> mlua::Result<Table> {
             "notify",
             lua.create_function(|_, (title, body): (String, Option<String>)| {
                 Ok(crate::desktop::notify(&title, body.as_deref().unwrap_or("")))
+            })?,
+        )?;
+        // A sound from the extension's folder, its data folder or a
+        // granted path; "tone" or "bell" for Seraphim's own.
+        let dir = ctx.ext.dir.clone();
+        let mut roots = vec![dir.clone(), ctx.data_dir()];
+        roots.extend(ctx.grant.paths.iter().cloned());
+        t.set(
+            "play",
+            lua.create_function(move |_, (file, opts): (String, Option<Table>)| {
+                let volume = opt::<f32>(&opts, "volume")?.unwrap_or(0.8).clamp(0.0, 1.0);
+                if file == "tone" || file == "bell" {
+                    let which = if file == "bell" { "default" } else { "tone" };
+                    return Ok(crate::audio::bell(which, volume));
+                }
+                let p = normalize(&file, &dir).ok_or_else(|| err("system.play: bad path"))?;
+                let real = resolve(&p);
+                if !roots.iter().any(|r| real.starts_with(resolve(r))) {
+                    return Err(err(format!(
+                        "system.play: {file} is outside the extension's folder and granted paths"
+                    )));
+                }
+                Ok(crate::audio::play(&real, volume))
             })?,
         )?;
     }

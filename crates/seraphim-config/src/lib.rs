@@ -73,6 +73,9 @@ pub struct Config {
     /// Split panes.
     pub panes: Panes,
     pub notifications: Notifications,
+    pub audio: Audio,
+    /// Sounds played when events arrive.
+    pub sound: Vec<Sound>,
     /// The Lua scripting runtime.
     pub scripting: Scripting,
     /// Per-extension switches and permissions, by extension name.
@@ -231,6 +234,39 @@ pub struct TabColors {
     /// Progress, the minimal style's active tab.
     #[serde(deserialize_with = "opt_color")]
     pub accent: Option<Rgb>,
+}
+
+/// `[audio]`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Audio {
+    /// The bell's sound: `none`, `default` (the desktop's bell), `tone`
+    /// (a short soft tone) or a sound file.
+    pub bell: String,
+    /// Volume of Seraphim's sounds, 0–1.
+    pub volume: f32,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Audio { bell: "none".into(), volume: 0.8 }
+    }
+}
+
+/// `[[sound]]`: play a sound when an event arrives.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[derive(Default)]
+pub struct Sound {
+    /// Event name: exact, `prefix.*` or `*`.
+    pub event: String,
+    /// Conditions on the event's data, as in `[[on]]`.
+    pub when: std::collections::BTreeMap<String, toml::Value>,
+    /// A sound file (relative paths: next to the configuration, then in
+    /// `sounds/`), or `tone`, or `bell` (the desktop's bell sound).
+    pub file: String,
+    /// 0–1; default: `audio.volume`.
+    pub volume: Option<f32>,
 }
 
 /// `[notifications]`: desktop notifications.
@@ -459,6 +495,8 @@ impl Default for Config {
             tabs: Tabs::default(),
             panes: Panes::default(),
             notifications: Notifications::default(),
+            audio: Audio::default(),
+            sound: Vec::new(),
             scripting: Scripting::default(),
             extensions: Default::default(),
             menu: Vec::new(),
@@ -523,6 +561,11 @@ pub const BIND_SOURCES: &[(&str, [f32; 2])] = &[
     ("network.online", [0.0, 1.0]),
     ("disk.read", [0.0, 102400.0]),
     ("disk.write", [0.0, 102400.0]),
+    // The default output's loudness (0–1; sampled every 33 ms).
+    ("audio.level", [0.0, 1.0]),
+    ("audio.bass", [0.0, 1.0]),
+    ("audio.mid", [0.0, 1.0]),
+    ("audio.treble", [0.0, 1.0]),
 ];
 
 /// "This layer property follows that value" (spec 5.3, 11.4).
@@ -1143,6 +1186,27 @@ impl Config {
                 "tabs.bar must be auto, always or never (got {:?})",
                 self.tabs.bar
             ));
+        }
+        if !(0.0..=1.0).contains(&self.audio.volume) {
+            return Err("audio.volume must be 0-1".into());
+        }
+        for (i, s) in self.sound.iter().enumerate() {
+            if s.event.is_empty() || s.file.is_empty() {
+                return Err(format!("sound #{}: needs `event` and `file`", i + 1));
+            }
+            if s.volume.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+                return Err(format!("sound #{}: volume must be 0-1", i + 1));
+            }
+            if let Some((k, v)) = s
+                .when
+                .iter()
+                .find(|(_, v)| matches!(v, toml::Value::Table(_) | toml::Value::Datetime(_)))
+            {
+                return Err(format!(
+                    "sound #{}: when.{k} = {v}: use a string, number, boolean or list",
+                    i + 1
+                ));
+            }
         }
         if !["system", "seraphim", "none"].contains(&self.window.decorations.as_str()) {
             return Err(format!(
