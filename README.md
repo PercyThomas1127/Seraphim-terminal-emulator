@@ -13,9 +13,11 @@ decisions that settle spec §18.
 
 ## Status
 
-Phases I (functional terminal), II (visual identity), III
-(programmability) and IV (full interface) of the specification are
-complete; Phase V (Divinity integration) is next. See
+All five phases of the specification are complete: I (functional
+terminal), II (visual identity), III (programmability), IV (full
+interface) and V (system integration). Phase V was rescoped: no Divinity
+OS integration, Gallery or SDK, and today's package managers instead of
+Gabriel. See
 [docs/progress.md](docs/progress.md) for where every part of the spec
 stands.
 
@@ -445,3 +447,20 @@ events (`package.install.started`, `package.upgrade.progress`,
 `package.remove.failed`, …) for rules and extensions. The `heavens`
 preset reacts to installs and upgrades. Shell integration adds exit
 codes; without it, Seraphim watches the foreground process.
+
+## System integration
+
+* **Monitoring:** CPU, memory, load, battery, GPU (AMD and Intel from
+  sysfs, NVIDIA through `nvidia-smi`), temperatures, network and disk
+  rates. They show in the System Monitor panel, and backgrounds can follow
+  them with `[[bind]] source = "system.gpu"`, `"network.rx"`,
+  `"disk.write"` and others. `network.online` and `network.offline`
+  events fire when the connection comes or goes.
+* **Notifications:** programs can ask for desktop notifications (OSC 9,
+  OSC 777, OSC 99). Seraphim sends its own when a long command, a package
+  manager or the bell finishes while you can't see it (`[notifications]`).
+* **Audio:** `[audio] bell` makes the bell audible, and `[[sound]]` plays
+  a sound when an event arrives. `audio.level`, `audio.bass`, `audio.mid`
+  and `audio.treble` let backgrounds react to the music you're playing.
+  Seraphim uses `pw-play`, `paplay` or `ffplay` and `parec`, with no audio
+  library.

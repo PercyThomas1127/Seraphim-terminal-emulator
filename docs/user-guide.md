@@ -281,6 +281,72 @@ trail = true
 - `live_reload = false` turns off reloading on save; **Ctrl+Shift+R**
   reloads by hand.
 
+### System monitoring
+
+The System Monitor panel (View menu) shows these readings, each where
+the machine has it:
+
+| Reading | Binding source | Unit |
+|---|---|---|
+| CPU, memory | `system.cpu`, `system.memory` | percent |
+| Load | `system.load` | per core |
+| GPU busy and memory (AMD, Intel, NVIDIA) | `system.gpu`, `system.gpu.memory` | percent |
+| GPU and CPU temperature | `system.gpu.temp`, `system.temp` | °C |
+| Network receive and send | `network.rx`, `network.tx` | KiB/s |
+| Online (a default route) | `network.online` | 0 or 1 |
+| Disk read and write | `disk.read`, `disk.write` | KiB/s |
+| Battery | `battery.level`, `battery.charging` | percent, 0 or 1 |
+
+For example, a background that speeds up with the GPU:
+
+```toml
+[[bind]]
+source = "system.gpu"
+layer = "sky"
+param = "speed"
+output = [0.6, 2.5]
+```
+
+Rules can react to `network.online` and `network.offline`.
+
+### Sound
+
+Seraphim plays sounds with whichever of `pw-play`, `paplay`, `aplay` or
+`ffplay` is installed.
+
+**The bell.** In `[audio]`, `bell = "default"` plays the desktop's bell
+sound, `"tone"` a short soft tone, or give a sound file. `volume` (0–1)
+sets the volume of Seraphim's sounds.
+
+**Sounds for events.** A `[[sound]]` plays when an event matches, with
+conditions like an `[[on]]` rule:
+
+```toml
+[[sound]]
+event = "package.install.completed"
+file = "sounds/done.ogg"     # next to the config, or in sounds/
+
+[[sound]]
+event = "command.completed"
+when = { exit_code = [1, 2, 127] }
+file = "tone"
+```
+
+**Audio-reactive backgrounds.** `audio.level`, `audio.bass`, `audio.mid`
+and `audio.treble` (0–1) follow what your speakers are playing. They are
+read with `parec` or `ffmpeg` from the default output's monitor, and
+listening starts only when something binds to them:
+
+```toml
+[[bind]]
+source = "audio.bass"
+layer = "sky"
+param = "intensity"
+output = [0.2, 1.0]
+```
+
+`audio.playing` events say when sound starts and stops.
+
 ## 5. Interface
 
 ### Menu bar
@@ -492,7 +558,7 @@ end)
 | Visuals | Add or remove layers; set parameters, colours and opacity; tweens and animations; bind properties to live values; switch profiles |
 | Interface | Notices; commands in the Extensions menu; shortcuts (`ui.key`); built-in actions; panels (`ui.panel`); opening layouts |
 | Terminal | Read the screen, cursor, title, directory and last command; type into the terminal (never into a root shell) |
-| System | Metrics; desktop notifications; running programs (`process.run`); files (`fs`); HTTP requests (`net`) |
+| System | Metrics (GPU, network, disk and audio levels too); desktop notifications; sounds (`system.play`); running programs (`process.run`); files (`fs`); HTTP requests (`net`) |
 
 Panel widgets: heading, text, key-value rows, gauge, sparkline, list and
 separator.
@@ -541,22 +607,11 @@ Results on real hardware are in [benchmarks.md](benchmarks.md).
 
 ## 8. Not built yet
 
-### Phase V: Divinity OS integration (planned)
+Phase V was rescoped: there is no Divinity OS integration, no Seraphim
+Gallery and no extension SDK. What remains open:
 
-- **Gabriel:** the effects react to `gabriel.install.*` events, but
-  nothing connects to the real package manager yet.
-- **System monitoring:** GPU and network monitoring are missing (CPU,
-  memory, load and battery work).
-- **Audio:** sound reactions and `audio.*` events. Not started.
-- **Desktop integration:** notifications go through `notify-send`.
-  Deeper desktop integration is not started.
-- **Seraphim Gallery:** a store for sharing themes, presets and
-  extensions. Not started.
-- **Extension SDK:** packaging and publishing tools, and WebAssembly
-  extensions so untrusted Gallery code can run safely. Not started.
-
-### Other gaps
-
+- Exit codes for package managers run without shell integration.
+- Moving a tab into a window that already exists, and floating terminals.
 - Contrast checks for accessibility.
 - Testing on macOS, Windows, Wayland and Intel or laptop GPUs.
 

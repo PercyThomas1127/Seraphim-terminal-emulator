@@ -1,5 +1,7 @@
 # Phase V plan — System integration
 
+**Status: complete.** As built: [ADR 0011](adr/0011-system-integration.md).
+
 **Scope, as revised:** Phase V no longer integrates with Divinity OS.
 The Seraphim Gallery and the official extension SDK are out of scope.
 The Gabriel integration is replaced by support for the package managers
@@ -35,47 +37,47 @@ make and hear sound.
   long command finishes, or the bell rings, while you can't see the
   terminal.
 * **Audio uses the sound server's command-line tools**:
-  * Sounds play through `pw-play`, `paplay` or `aplay`.
+  * Sounds play through `pw-play`, `paplay`, `aplay` or `ffplay`.
   * Audio-reactive visuals read levels from the default output's monitor
-    with `parec` or `pw-record`. There is no audio library dependency,
+    with `parec` or `ffmpeg`. There is no audio library dependency,
     and nothing runs unless the configuration asks for it.
 
 ## Checklist
 
 ### 1. Package managers (replacing Gabriel)
-- [ ] Command recognition: emerge (Portage), pacman, paru, yay, apt,
+- [x] Command recognition: emerge (Portage), pacman, paru, yay, apt,
   apt-get, dnf, yum, zypper, xbps-install/xbps-remove, apk, eopkg,
   nix-env/nix profile, flatpak, snap, brew; through sudo/doas/run0/pkexec
-- [ ] Operations: install, remove, upgrade (whole system), sync (refresh
+- [x] Operations: install, remove, upgrade (whole system), sync (refresh
   the package lists)
-- [ ] Progress parsing from each manager's output: the current package,
+- [x] Progress parsing from each manager's output: the current package,
   `(n/m)` style counts, percentages
-- [ ] Events: `package.<op>.started|progress|completed|failed`, published
+- [x] Events: `package.<op>.started|progress|completed|failed`, published
   by the session; without shell integration, from the foreground process
-- [ ] Replace `gabriel.*` everywhere: heavens preset, Package Activity
+- [x] Replace `gabriel.*` everywhere: heavens preset, Package Activity
   panel, tab icons, example extension, docs; `package` is a reserved
   namespace
-- [ ] Tests from real output of each manager
+- [x] Tests from real output of each manager
 
 ### 2. System monitoring
-- [ ] GPU: utilization, memory, temperature (AMD/Intel sysfs, NVIDIA via
+- [x] GPU: utilization, memory, temperature (AMD/Intel sysfs, NVIDIA via
   nvidia-smi)
-- [ ] Network: receive and send rates, online/offline (`network.*` events)
-- [ ] Temperatures (hwmon) and disk activity
-- [ ] Binding sources, Lua functions, System Monitor panel rows
+- [x] Network: receive and send rates, online/offline (`network.*` events)
+- [x] Temperatures (hwmon) and disk activity
+- [x] Binding sources, Lua functions, System Monitor panel rows
 
 ### 3. Desktop notifications
-- [ ] Program notifications: OSC 9 (text), OSC 777;notify, OSC 99 (kitty)
-- [ ] Long commands finishing, and bells, while the terminal is out of
+- [x] Program notifications: OSC 9 (text), OSC 777;notify, OSC 99 (kitty)
+- [x] Long commands finishing, and bells, while the terminal is out of
   sight
-- [ ] `[notifications]` settings; `notification.*` events
+- [x] `[notifications]` settings; `notification.*` events
 
 ### 4. Audio
-- [ ] Sounds for events (`[[sound]]`), and an audible bell
-- [ ] Audio levels as binding sources (level, bass, mid, treble) for
+- [x] Sounds for events (`[[sound]]`), and an audible bell
+- [x] Audio levels as binding sources (level, bass, mid, treble) for
   audio-reactive backgrounds; `audio.*` events
-- [ ] Only runs when configured; reduced motion stops audio-reactive
-  visuals
+- [x] Only runs when configured: playback for configured sounds, capture
+  once something reads a level
 
 ### 5. Close-out
-- [ ] ADR, README, user guide, scripting guide, `docs/progress.md`
+- [x] ADR, README, user guide, scripting guide, `docs/progress.md`

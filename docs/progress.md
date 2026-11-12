@@ -1,6 +1,6 @@
 # Seraphim: progress against the specification (v0.1)
 
-As of the end of Phase IV. Percentages are rough: the share of each
+As of the end of Phase V. Percentages are rough: the share of each
 phase's listed tasks that is done, not a measure of effort.
 
 | Phase (spec §15) | Status | Done |
@@ -9,11 +9,11 @@ phase's listed tasks that is done, not a measure of effort.
 | II. Visual Identity | Complete (real-GPU measurements pending) | ~100 % |
 | III. Programmability | Complete: Lua extensions, API, permissions | ~100 % |
 | IV. Full Interface | Complete | 100 % |
-| V. Divinity Integration | System metrics and Gabriel-event hooks only | ~10 % |
-| **Overall** | Four of five phases done | **~82 %** |
+| V. System Integration (rescoped) | Complete: package managers, metrics, notifications, audio | 100 % |
+| **Overall** | All five phases done (Phase V rescoped: no Divinity OS, Gallery or SDK) | **100 %** |
 
-The code: 10 crates, ~35,000 lines of Rust, ~600 lines of WGSL and six
-example extensions, 344 automated tests (unit, pixel tests through the
+The code: 10 crates, ~38,000 lines of Rust, ~600 lines of WGSL and six
+example extensions, 354 automated tests (unit, pixel tests through the
 real wgpu pipeline, xterm conformance, fuzzing, Lua runtime end to end),
 all passing; clippy clean.
 
@@ -71,7 +71,7 @@ Events (spec §11.2) now include `interface.tab.changed`,
 `terminal.output.raw`, `command.output`, `terminal.text.changed`,
 `terminal.cursor.moved`, `animation.completed`, `interface.focus.changed`,
 `interface.resized` and `interface.menu.toggled`, on top of the session,
-shell, command and visual events. Still missing: `audio.*`, `network.*` (Phase V integrations).
+shell, command and visual events. Phase V added `package.*`, `network.*`, `audio.playing`, `terminal.notification` and `notification.sent`.
 
 Event management (§11.3): subscriptions, filtering, metadata, custom
 events, priorities, cancellation (between scripts), asynchronous handling
@@ -95,16 +95,18 @@ See `docs/phase-4-plan.md` and ADR 0010.
 Nothing from spec §9 is open. Possible additions: moving a tab into
 another existing window, floating terminals.
 
-## Phase V — Divinity Integration: ~10 %
+## Phase V — System integration: complete
 
-| Task | Status |
-|---|---|
-| Gabriel integration | Event names (`gabriel.install.*`) are consumed by the `heavens` preset; no real Gabriel connection |
-| System monitoring | CPU, memory, load and battery readers (for `[[bind]]`); no GPU or network |
-| Audio integration | Not started |
-| Desktop notifications | In-window notices; `system.notify` for extensions (notify-send) |
-| Seraphim Gallery | Not started |
-| Official extension SDK | The Lua API, manifest format and examples are the base; no packaging or Gallery tooling |
+Rescoped: no Divinity OS integration, no Seraphim Gallery, no extension
+SDK; the package managers people use replace Gabriel. See
+`docs/phase-5-plan.md` and ADR 0011.
+
+| Task | Where | Notes |
+|---|---|---|
+| Package managers (replacing Gabriel) | `seraphim-session/src/packages.rs` | emerge, pacman, paru, yay, pikaur, apt, aptitude, nala, dnf, yum, zypper, xbps, apk, eopkg, nix, flatpak, snap, brew; through sudo/doas/run0/pkexec; progress from their output; `package.*` events; tab progress, panel, heavens preset |
+| System monitoring | `seraphim-script/src/metrics.rs` | CPU, memory, load, battery, GPU (AMD, Intel, NVIDIA), temperatures, network rates and online state, disk rates; `network.*` events |
+| Desktop notifications | `seraphim-script/src/desktop.rs`, `window.rs` | OSC 9/777/99; long commands, package managers and the bell out of sight; notify-send or gdbus |
+| Audio | `seraphim-script/src/audio.rs`, `sounds.rs` | `[[sound]]`, audible bell, audio levels as bindings, `audio.playing` |
 
 ## Non-functional requirements (spec §13)
 
@@ -122,10 +124,8 @@ another existing window, floating terminals.
 
 ## Known gaps worth scheduling
 
-1. Phase V: a real Gabriel connection, audio, desktop integration, the
-   Gallery and an SDK.
-2. More hardware: measured so far on an RTX 2060 Super and a Radeon Pro
+1. More hardware: measured so far on an RTX 2060 Super and a Radeon Pro
    WX 7100 under X11 (`docs/benchmarks.md`). Not yet: Wayland, Intel
    GPUs, laptops (integrated + discrete), high-refresh displays.
-3. WebAssembly extensions for untrusted Gallery code (ADR 0005), with the
-   Gallery itself (Phase V).
+2. Package managers without shell integration have no exit codes.
+3. Portability: macOS and Windows are untested.
