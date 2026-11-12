@@ -77,8 +77,14 @@ nothing.
 first of `pw-play`, `paplay`, `aplay` and `ffplay` that starts. The
 fallback bell is a tone Seraphim writes once as a WAV file.
 
+* **Playback:** volumes are linear amplitudes, converted to PulseAudio's
+  cubic scale for `paplay`. Streams are named Seraphim and marked
+  `state.restore-props = false`. Otherwise WirePlumber would remember
+  Seraphim's volume under the player's own name and apply it to that
+  player's later streams, from any program.
 * **Capture:** levels are read from the default output's monitor by
-  `parec` (or `ffmpeg -f pulse`) at 11 kHz mono. The thread starts the
+  `parec` (or `ffmpeg -f pulse`) at 24 kHz mono. At 11 kHz, resampling
+  had already cut a 5 kHz tone by 13 dB. The thread starts the
   first time something reads a level, and restarts if the server goes
   away.
 * **Analysis:** two one-pole filters split bass (< 250 Hz), mid and

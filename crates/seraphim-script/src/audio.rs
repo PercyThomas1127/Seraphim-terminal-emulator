@@ -22,11 +22,25 @@ pub fn play(path: &Path, volume: f32) -> bool {
     let p = path.to_string_lossy().into_owned();
     let wav = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav"));
     let mut tries: Vec<Command> = Vec::new();
+    // The sound server must not remember these streams' volumes: under a
+    // generic name ("paplay") WirePlumber would apply Seraphim's volume to
+    // every later stream of that name, from any program.
     let mut c = Command::new("pw-play");
-    c.args(["--volume", &format!("{v:.2}"), &p]);
+    c.args([
+        "--volume",
+        &format!("{v:.3}"),
+        "--properties",
+        "{ application.name = Seraphim state.restore-props = false }",
+        &p,
+    ]);
     tries.push(c);
     let mut c = Command::new("paplay");
-    c.args([&format!("--volume={}", (v * 65536.0) as u32), &p]);
+    c.args([
+        &format!("--volume={}", pulse_volume(v)),
+        "--client-name=Seraphim",
+        "--property=state.restore-props=false",
+        &p,
+    ]);
     tries.push(c);
     if wav {
         let mut c = Command::new("aplay");
@@ -45,6 +59,13 @@ pub fn play(path: &Path, volume: f32) -> bool {
     ]);
     tries.push(c);
     tries.into_iter().any(spawn)
+}
+
+/// `volume` (0–1, linear, as `pw-play` and `ffplay` take it) as a
+/// PulseAudio volume, which is cubic: 65536 is 100%, and 0.3 linear is
+/// 67% (`pa_sw_volume_from_linear`).
+fn pulse_volume(volume: f32) -> u32 {
+    (volume.clamp(0.0, 1.0).cbrt() * 65536.0).round() as u32
 }
 
 fn spawn(mut cmd: Command) -> bool {
@@ -183,7 +204,12 @@ impl Analyzer {
     }
 }
 
-const RATE: u32 = 11025;
+/// Capture rate. Resampling to it filters out everything near half of it,
+/// so it must sit well above the treble band: at 11025 Hz a 5 kHz tone
+/// already read 13 dB low. 24 kHz is half of the usual 48 kHz.
+const RATE: u32 = 24000;
+/// Samples per analysed block (about 33 ms).
+const BLOCK: usize = RATE as usize / 30;
 
 /// The latest levels and when they were read.
 type Shared = Arc<Mutex<Option<(Levels, Instant)>>>;
@@ -244,7 +270,7 @@ fn capture(out: Shared) {
         };
         let Some(mut stdout) = child.stdout.take() else { continue };
         let mut an = Analyzer::new(RATE as f32);
-        let mut buf = vec![0u8; (RATE as usize / 30) * 2];
+        let mut buf = vec![0u8; BLOCK * 2];
         let mut got_any = false;
         while stdout.read_exact(&mut buf).is_ok() {
             got_any = true;
@@ -280,23 +306,36 @@ mod tests {
     #[test]
     fn bands_follow_the_frequency() {
         let mut a = Analyzer::new(RATE as f32);
-        let silence = a.block(&vec![0; 368]);
+        let silence = a.block(&vec![0; BLOCK]);
         assert_eq!(silence.level, 0.0);
-        let mut a = Analyzer::new(RATE as f32);
-        for _ in 0..5 {
-            a.block(&sine(60.0, 0.5, 368));
-        }
-        let low = a.levels;
+        let steady = |freq: f32| {
+            let mut a = Analyzer::new(RATE as f32);
+            for _ in 0..5 {
+                a.block(&sine(freq, 0.5, BLOCK));
+            }
+            a
+        };
+        let low = steady(60.0).levels;
         assert!(low.bass > low.treble + 0.2 && low.level > 0.8, "{low:?}");
-        let mut a = Analyzer::new(RATE as f32);
-        for _ in 0..5 {
-            a.block(&sine(4000.0, 0.5, 368));
-        }
+        let mut a = steady(4000.0);
         let high = a.levels;
         assert!(high.treble > high.bass + 0.2, "{high:?}");
+        // Treble stands out from mid, up to well past 5 kHz.
+        for f in [5000.0, 8000.0] {
+            let l = steady(f).levels;
+            assert!(l.treble > l.mid + 0.1 && l.level > 0.8, "{f} Hz: {l:?}");
+        }
         // Falling is slower than rising.
-        let after = a.block(&vec![0; 368]);
+        let after = a.block(&vec![0; BLOCK]);
         assert!(after.level > 0.5, "{after:?}");
+    }
+
+    #[test]
+    fn pulse_volume_is_cubic() {
+        assert_eq!(pulse_volume(1.0), 65536);
+        assert_eq!(pulse_volume(0.125), 32768);
+        assert_eq!(pulse_volume(0.0), 0);
+        assert_eq!(pulse_volume(2.0), 65536);
     }
 
     #[test]
