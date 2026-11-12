@@ -98,7 +98,9 @@ pub fn icon_for(program: &str) -> char {
         "docker" | "podman" => '\u{f308}',
         "man" | "less" | "more" => '\u{f02d}',
         "make" | "cmake" | "ninja" => '\u{f0ad}',
-        "gabriel" => '\u{f187}',
+        "emerge" | "pacman" | "paru" | "yay" | "pikaur" | "apt" | "apt-get" | "aptitude"
+        | "nala" | "dnf" | "dnf5" | "yum" | "zypper" | "xbps-install" | "xbps-remove" | "apk"
+        | "eopkg" | "nix-env" | "flatpak" | "snap" | "brew" => '\u{f187}',
         _ => '\u{f489}', // terminal
     }
 }

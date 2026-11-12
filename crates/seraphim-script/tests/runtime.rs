@@ -342,18 +342,14 @@ fn emit_only_into_own_namespace() {
         &["interface"],
         r#"
         seraphim.emit("pkg.hello", { n = 1 })
-        local ok, err = pcall(seraphim.emit, "gabriel.install.started", {})
+        local ok, err = pcall(seraphim.emit, "package.install.started", {})
         ui.notify(err)
         ui.notify("ready")"#,
     );
     let rt = start(vec![(e, grant(V))], &root, &bus);
     let got = ready(&rt, 1);
     assert!(notices(&got)[0].contains("named pkg.<something>"), "{got:?}");
-    let events: Vec<_> = sub
-        .drain()
-        .into_iter()
-        .filter(|e| e.name.starts_with("pkg") || e.name.starts_with("gabriel"))
-        .collect();
+    let events: Vec<_> = sub.drain().into_iter().filter(|e| e.name.starts_with("pkg")).collect();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].source, "extension.pkg", "trusted source, set by the runtime");
 }

@@ -85,8 +85,8 @@ extension root.
 
 **Trusted provenance.** An extension's events must be named
 `<extension>.*` and carry the source `extension.<name>`. Extension names
-cannot be built-in namespaces (`terminal`, `session`, `gabriel`, …), so a
-script cannot forge `session.privileged` or `gabriel.install.*`.
+cannot be built-in namespaces (`terminal`, `session`, `package`, …), so a
+script cannot forge `session.privileged` or `package.install.*`.
 `animation.completed` is published by the runtime with source `animation`.
 
 **Reactive properties reuse `[[bind]]` (ADR 0008).** `visual.bind`

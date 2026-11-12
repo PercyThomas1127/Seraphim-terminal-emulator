@@ -1,0 +1,5 @@
+name = "package-glow"
+version = "2.0.0"
+description = "Light the sky while a package manager installs or upgrades (emerge, pacman, apt, dnf, xbps, …). Made for the heavens preset."
+api = 1
+permissions = ["visual", "interface"]

@@ -15,7 +15,7 @@
 * **Trusted provenance.** `Event.source` is fixed by the `Publisher`
   handle a subsystem is given, never by payload. Extensions will receive
   publishers scoped to their own namespace, so they cannot forge
-  `session.privileged` or `gabriel.*`.
+  `session.privileged` or `package.*`.
 * Events are `Arc`-shared; fan-out does not clone payloads.
 * Payloads are `serde_json::Value`: schemaless, maps 1:1 onto Lua tables.
 

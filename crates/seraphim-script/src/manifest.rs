@@ -68,7 +68,7 @@ pub const RESERVED: &[&str] = &[
     "system",
     "audio",
     "network",
-    "gabriel",
+    "package",
     "clipboard",
     "extension",
     "seraphim",
@@ -256,10 +256,10 @@ mod tests {
         assert!(Extension::from_dir(&c).unwrap_err().contains("inside the extension"));
         std::fs::write(c.join("extension.toml"), "name = \"Bad Name\"\n").unwrap();
         assert!(Extension::from_dir(&c).unwrap_err().contains("lowercase"));
-        std::fs::write(c.join("extension.toml"), "name = \"gabriel\"\n").unwrap();
+        std::fs::write(c.join("extension.toml"), "name = \"package\"\n").unwrap();
         assert!(
             Extension::from_dir(&c).unwrap_err().contains("namespace"),
-            "cannot forge gabriel.*"
+            "cannot forge package.*"
         );
     }
 }

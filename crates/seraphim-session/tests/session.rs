@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use seraphim_events::{Event, EventBus, Subscription};
+use seraphim_events::{json, Event, EventBus, Subscription};
 use seraphim_session::{Command, Session, SessionConfig, SessionManager};
 
 fn integration_script() -> String {
@@ -216,4 +216,70 @@ fn a_moved_session_publishes_on_its_new_bus() {
     }
     s.write(b"\n").unwrap();
     s.wait_exit(Duration::from_secs(10)).expect("exited");
+}
+
+#[test]
+fn package_manager_commands_become_package_events() {
+    // Shell integration reports `pacman -S a b`; its output says how far
+    // it got.
+    let bus = EventBus::new();
+    let sub = bus.subscribe("package.*", 64);
+    let script = "printf '\\033]133;C;cmdline_url=sudo%%20pacman%%20-S%%20a%%20b\\007'; \
+                  sleep 0.2; printf 'resolving dependencies...\\r\\n(1/2) installing a\\r\\n'; sleep 0.2; \
+                  printf '(2/2) installing b\\r\\n'; sleep 0.2; printf '\\033]133;D;0\\007'; sleep 0.3";
+    let cmd = Command::new("/bin/sh").args(["-c", script]);
+    let s = Session::spawn(3, SessionConfig { command: cmd, ..Default::default() }, &bus).unwrap();
+    let started = wait_event(&sub, "package.install.started");
+    assert_eq!(started.source, "package");
+    assert_eq!(started.data["manager"], "pacman");
+    assert_eq!(started.data["packages"], json!(["a", "b"]));
+    let mut last = None;
+    loop {
+        let e = sub.recv_timeout(Duration::from_secs(10)).expect("events");
+        if e.name == "package.install.progress" {
+            last = Some(e.data["percent"].clone());
+            continue;
+        }
+        assert_eq!(e.name, "package.install.completed");
+        assert_eq!(e.data["exit_code"], 0);
+        assert_eq!(e.data["done"], 2);
+        break;
+    }
+    assert_eq!(last, Some(json!(100)));
+    s.wait_exit(Duration::from_secs(10));
+}
+
+#[test]
+fn package_managers_are_noticed_without_shell_integration() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        return;
+    }
+    // A stand-in `apt` that prints like the real one.
+    let dir = std::env::temp_dir().join(format!("seraphim-fake-apt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let apt = dir.join("apt");
+    std::fs::write(
+        &apt,
+        "#!/bin/sh\nsleep 0.6\necho 'Unpacking htop (3.3) ...'\nsleep 0.4\necho 'Setting up htop (3.3) ...'\nsleep 0.6\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&apt, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bus = EventBus::new();
+    let sub = bus.subscribe("package.*", 64);
+    let cmd = Command::new("/bin/bash").args(["--norc", "--noprofile", "-i"]);
+    let s = Session::spawn(4, SessionConfig { command: cmd, ..Default::default() }, &bus).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    s.write(format!("PS1='$ '; {} install htop; echo done\n", apt.display()).as_bytes()).unwrap();
+    let e = wait_event(&sub, "package.install.started");
+    assert_eq!(
+        (e.data["manager"].clone(), e.data["packages"].clone()),
+        (json!("apt"), json!(["htop"]))
+    );
+    let e = wait_event(&sub, "package.install.completed");
+    assert_eq!(e.data["package"], "htop");
+    assert!(e.data["exit_code"].is_null(), "unknown without shell integration");
+    s.write(b"exit\n").unwrap();
+    s.wait_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(dir);
 }

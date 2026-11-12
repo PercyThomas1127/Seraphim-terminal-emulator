@@ -293,7 +293,7 @@ impl Pty {
     }
 
     /// Process group currently in the foreground of this terminal (e.g. the
-    /// `vim` or `gabriel` started from the shell).
+    /// `vim` or `pacman` started from the shell).
     pub fn foreground_pgid(&self) -> Option<u32> {
         // SAFETY: valid fd.
         let pg = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
@@ -379,6 +379,17 @@ impl ProcessInfo {
                 .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
         });
         Some(ProcessInfo { pid, name, cwd, euid })
+    }
+
+    /// A process's arguments (`/proc/PID/cmdline`).
+    pub fn cmdline(pid: u32) -> Option<Vec<String>> {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        (!args.is_empty()).then_some(args)
     }
 
     pub fn is_root(&self) -> bool {

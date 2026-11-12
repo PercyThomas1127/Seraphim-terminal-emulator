@@ -471,7 +471,7 @@ struct Active {
     panels: std::collections::BTreeMap<u64, crate::panels::PanelState>,
     /// The terminal that has (or last had) focus: typing goes there.
     term_focus: u64,
-    /// Finished commands and Gabriel events, for their panels.
+    /// Finished commands and package manager events, for their panels.
     history: std::collections::VecDeque<crate::panels::HistoryEntry>,
     packages: std::collections::VecDeque<crate::panels::PackageEvent>,
     layouts: Vec<seraphim_config::Layout>,
@@ -968,7 +968,7 @@ impl Win {
                 "terminal.progress".into(),
                 "session.privileged".into(),
                 "command.completed".into(),
-                "gabriel.*".into(),
+                "package.*".into(),
             ]),
             1024,
         );
@@ -2844,27 +2844,66 @@ impl Active {
                 }
                 continue;
             }
-            if let Some(what) = e.name.strip_prefix("gabriel.") {
+            if let Some(what) = e.name.strip_prefix("package.") {
                 let d = &e.data;
-                let detail = ["version", "progress", "message", "error"]
-                    .iter()
-                    .filter_map(|k| match &d[*k] {
-                        serde_json::Value::Null => None,
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        v => Some(v.to_string()),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                self.packages.push_back(crate::panels::PackageEvent {
+                let (operation, phase) = what.split_once('.').unwrap_or((what, ""));
+                let percent = d["percent"].as_u64().map(|p| p.min(100) as u8);
+                let detail = match phase {
+                    "completed" | "failed" => {
+                        let code = d["exit_code"]
+                            .as_i64()
+                            .map(|c| format!("exit {c} · "))
+                            .unwrap_or_default();
+                        format!(
+                            "{code}{}",
+                            crate::panels::duration(d["duration_ms"].as_u64().unwrap_or(0))
+                        )
+                    }
+                    _ => match (d["done"].as_u64(), d["total"].as_u64(), percent) {
+                        (Some(n), Some(t), _) => format!("{n}/{t}"),
+                        (_, _, Some(p)) => format!("{p}%"),
+                        _ => String::new(),
+                    },
+                };
+                let ev = crate::panels::PackageEvent {
                     at: e.timestamp,
-                    what: what.to_owned(),
-                    package: d["package"].as_str().unwrap_or("").to_owned(),
+                    manager: d["manager"].as_str().unwrap_or("").to_owned(),
+                    operation: operation.to_owned(),
+                    phase: phase.to_owned(),
+                    // Under way: the package it is on; done: what was asked.
+                    package: match (phase, d["packages"].as_array()) {
+                        ("completed" | "failed", Some(l)) if !l.is_empty() => {
+                            l.iter().filter_map(|p| p.as_str()).collect::<Vec<_>>().join(" ")
+                        }
+                        _ => d["package"].as_str().unwrap_or("").to_owned(),
+                    },
                     detail,
-                });
+                    percent,
+                    session: e.session,
+                };
+                // An operation under way keeps one line, updated.
+                let running =
+                    self.packages.iter_mut().rev().find(|p| {
+                        p.running() && p.session == e.session && p.operation == operation
+                    });
+                match running {
+                    Some(r) if phase != "started" => *r = ev,
+                    _ => self.packages.push_back(ev),
+                }
                 if self.packages.len() > 500 {
                     self.packages.pop_front();
                 }
-                changed |= !self.panels.is_empty();
+                // The tab shows its progress, as for OSC 9;4.
+                if let Some(p) = e.session.and_then(|id| self.panes.get_mut(&id)) {
+                    p.progress = match phase {
+                        "started" | "progress" => Some(match percent {
+                            Some(v) => crate::tabbar::Progress::Normal(v),
+                            None => crate::tabbar::Progress::Indeterminate,
+                        }),
+                        _ => None,
+                    };
+                }
+                changed = true;
                 continue;
             }
             let Some(p) = e.session.and_then(|id| self.panes.get_mut(&id)) else { continue };

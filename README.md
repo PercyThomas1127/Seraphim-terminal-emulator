@@ -308,7 +308,7 @@ pane = { split = "right", ratio = 0.6, first = { cwd = "~/src" }, second = { spl
 ![An extension flashing the window on ERROR, another one's notice](docs/images/scripting.png)
 
 Extensions are Lua 5.4 programs that react to events (output, commands,
-prompts, focus, metrics, Gabriel installs…) and change layers, colors and
+prompts, focus, metrics, package installs…) and change layers, colors and
 animations, bind properties to live values, add menu commands and
 shortcuts, and more, within the permissions you grant them. Put a folder
 with an `extension.toml` and `init.lua` in `~/.config/seraphim/extensions/`,
@@ -331,7 +331,7 @@ only change what Seraphim shows. A root shell never gives an extension more
 rights, and nothing can type into a root session. See
 **[docs/scripting.md](docs/scripting.md)** for the guide and API reference,
 and [`examples/`](examples/) for complete extensions: an error flash,
-Gabriel install effects, exit-code colors, CPU-driven intensity, a git
+package install effects, exit-code colors, CPU-driven intensity, a git
 status panel, and a clock.
 
 ### Images
@@ -406,12 +406,15 @@ prints the final screen and every published event. This example emits by
 hand the same sequences the shell integration sends around a command:
 
 ```bash
-cargo run -p seraphim -- run --cols 40 --rows 4 --events -- sh -c 'printf "\033]133;C;cmdline_url=gabriel%%20bestow%%20firefox\a"; sleep 0.3; printf "installing...\n\033]133;D;0\a"'
+cargo run -p seraphim -- run --cols 40 --rows 4 --events -- sh -c 'printf "\033]133;C;cmdline_url=pacman%%20-S%%20firefox\a"; sleep 0.3; printf "(1/1) installing firefox\r\n\033]133;D;0\a"'
 ```
 
 ```text
-event command.started    session=Some(1) {"command":"gabriel bestow firefox"}
-event command.completed  session=Some(1) {"command":"gabriel bestow firefox","duration_ms":301,"exit_code":0}
+event command.started    session=Some(1) {"command":"pacman -S firefox"}
+event package.install.started session=Some(1) {"manager":"pacman","operation":"install","package":"firefox","packages":["firefox"],…}
+event package.install.progress session=Some(1) {"done":1,"total":1,"percent":100,…}
+event package.install.completed session=Some(1) {"exit_code":0,"duration_ms":301,…}
+event command.completed  session=Some(1) {"command":"pacman -S firefox","duration_ms":301,"exit_code":0}
 ```
 
 `seraphim replay FILE` feeds a recorded byte stream (e.g. from
@@ -428,5 +431,17 @@ Add to your shell's rc file:
 
 This lets Seraphim publish `shell.prompt`, `command.started`,
 `command.completed` (with exit code and duration) and `session.cwd.changed`
-without modifying any program it runs. The Gabriel reactions in spec §5.3
+without modifying any program it runs. The package manager reactions
 build on these events.
+
+## Package managers
+
+Seraphim recognizes package managers at work: emerge (Portage), pacman,
+paru, yay, apt, nala, dnf, yum, zypper, xbps, apk, eopkg, nix, flatpak,
+snap and brew, through `sudo`, `doas`, `run0` or `pkexec`. It follows
+their progress in their own output, and shows it in the tab and in the
+Package Activity panel. It also publishes `package.<operation>.<phase>`
+events (`package.install.started`, `package.upgrade.progress`,
+`package.remove.failed`, …) for rules and extensions. The `heavens`
+preset reacts to installs and upgrades. Shell integration adds exit
+codes; without it, Seraphim watches the foreground process.

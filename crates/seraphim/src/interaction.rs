@@ -292,13 +292,12 @@ mod tests {
         };
         assert_eq!(fire("session.privileged", json!({"root": true})), [("alert", 1.0)]);
         assert_eq!(fire("session.privileged", json!({"root": false})), [("alert", 0.0)]);
-        assert_eq!(
-            fire("command.started", json!({"command": "sudo apt install ripgrep"})),
-            [("install", 1.0)]
-        );
-        assert_eq!(fire("command.started", json!({"command": "gabriel bestow firefox"})).len(), 1);
+        // Package managers' installs and upgrades (the session recognizes
+        // them and publishes package.*).
+        let apt = json!({"manager": "apt", "packages": ["ripgrep"]});
+        assert_eq!(fire("package.install.started", apt.clone()), [("install", 1.0)]);
+        assert_eq!(fire("package.upgrade.started", json!({"manager": "pacman"})).len(), 1);
+        assert!(fire("package.remove.started", apt).is_empty());
         assert!(fire("command.started", json!({"command": "ls -la"})).is_empty());
-        assert!(fire("command.started", json!({"command": null})).is_empty());
-        assert_eq!(fire("gabriel.install.started", json!({"package": "x"})).len(), 1);
     }
 }

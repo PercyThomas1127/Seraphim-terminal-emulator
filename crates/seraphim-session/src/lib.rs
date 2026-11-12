@@ -30,6 +30,8 @@
 //! | `command.completed`      | `{command?, exit_code?, duration_ms}`       |
 //! | `clipboard.requested`    | `{selection, op}` — not applied here        |
 
+pub mod packages;
+
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -187,6 +189,11 @@ impl Session {
             command: None,
             root: None,
             notify: config.notify,
+            pkg: None,
+            pkg_from_process: false,
+            integrated: false,
+            last_fg_check: Instant::now(),
+            last_progress: Instant::now(),
         };
         let io_thread = std::thread::Builder::new()
             .name(format!("seraphim-session-{id}"))
@@ -372,6 +379,15 @@ struct IoLoop {
     command: Option<(Option<String>, Instant)>,
     root: Option<bool>,
     notify: Option<Notifier>,
+    /// A package manager command running, followed through its output.
+    pkg: Option<packages::Tracker>,
+    /// It was recognized from the foreground process (no shell
+    /// integration), so its end is when the shell is back in front.
+    pkg_from_process: bool,
+    /// The shell reports commands (OSC 133); no need to watch processes.
+    integrated: bool,
+    last_fg_check: Instant,
+    last_progress: Instant,
 }
 
 impl IoLoop {
@@ -404,7 +420,8 @@ impl IoLoop {
             // and semantic shell events (below). The costly ones are built
             // only when someone listens.
             let p = &self.publisher();
-            let want_text = p.wants("terminal.output") || p.wants("command.output");
+            let want_text =
+                p.wants("terminal.output") || p.wants("command.output") || self.pkg.is_some();
             let want_cursor = p.wants("terminal.cursor.moved");
             let (events, responses, text, cursor) = {
                 let mut term = self.terminal.lock().unwrap();
@@ -432,6 +449,12 @@ impl IoLoop {
                     json!({"command": command, "text": text}),
                 );
             }
+            if !text.is_empty() {
+                self.pkg_output(&text);
+            }
+            if !self.integrated {
+                self.watch_foreground();
+            }
             if p.wants("terminal.text.changed") {
                 p.publish("terminal.text.changed", Some(self.id), json!({}));
             }
@@ -445,6 +468,9 @@ impl IoLoop {
             for ev in events {
                 self.handle(ev);
             }
+        }
+        if self.pkg.is_some() {
+            self.pkg_finish(None);
         }
         let status = self.pty.lock().unwrap().wait().ok();
         use std::os::unix::process::ExitStatusExt;
@@ -482,16 +508,24 @@ impl IoLoop {
                 p.publish("terminal.progress", id, json!({"state": state, "percent": percent}));
             }
             TerminalEvent::PromptStarted => {
+                self.integrated = true;
                 p.publish("shell.prompt", id, json!({}));
                 self.check_privilege();
             }
             TerminalEvent::CommandInputStarted | TerminalEvent::ModeChanged => {}
             TerminalEvent::CommandExecuted { command } => {
                 p.publish("command.started", id, json!({"command": command}));
+                self.integrated = true;
+                if let Some(c) = command.as_deref().and_then(packages::parse) {
+                    self.pkg_start(c, false);
+                }
                 self.command = Some((command, Instant::now()));
                 self.check_privilege();
             }
             TerminalEvent::CommandFinished { exit_code } => {
+                if self.pkg.is_some() && !self.pkg_from_process {
+                    self.pkg_finish(exit_code);
+                }
                 // A D without a preceding C (e.g. empty prompt) is not a command.
                 if let Some((command, start)) = self.command.take() {
                     p.publish(
@@ -518,6 +552,85 @@ impl IoLoop {
             TerminalEvent::ClipboardLoad { selection } => {
                 p.publish("clipboard.requested", id, json!({"selection": selection, "op": "load"}));
                 self.queue_clipboard(ClipboardRequest::Load { selection });
+            }
+        }
+    }
+
+    fn pkg_start(&mut self, c: packages::PkgCommand, from_process: bool) {
+        let t = packages::Tracker::new(c);
+        self.pkg_publish("started", &t, json!({}));
+        self.pkg = Some(t);
+        self.pkg_from_process = from_process;
+    }
+
+    fn pkg_output(&mut self, text: &str) {
+        let Some(t) = &mut self.pkg else { return };
+        if !t.feed(text) {
+            return;
+        }
+        // At most ten progress events a second, but always the last step.
+        let now = Instant::now();
+        let last = t.total.is_some_and(|n| t.done >= n);
+        if now - self.last_progress < Duration::from_millis(100) && !last {
+            return;
+        }
+        self.last_progress = now;
+        let t = self.pkg.take().expect("tracker");
+        self.pkg_publish("progress", &t, json!({}));
+        self.pkg = Some(t);
+    }
+
+    fn pkg_finish(&mut self, exit_code: Option<i32>) {
+        let Some(t) = self.pkg.take() else { return };
+        let failed = exit_code.is_some_and(|c| c != 0);
+        let phase = if failed { "failed" } else { "completed" };
+        let extra = json!({
+            "exit_code": exit_code,
+            "duration_ms": t.started.elapsed().as_millis() as u64,
+        });
+        self.pkg_publish(phase, &t, extra);
+    }
+
+    /// `package.<operation>.<phase>`, from the trusted `package` source.
+    fn pkg_publish(&self, phase: &str, t: &packages::Tracker, extra: seraphim_events::Value) {
+        let c = &t.command;
+        let mut data = json!({
+            "manager": c.manager,
+            "operation": c.op.name(),
+            "packages": c.packages,
+            // The package it is working on, else the first one asked for.
+            "package": t.package.clone().or_else(|| c.packages.first().cloned()),
+            "done": t.done,
+            "total": t.total,
+            "percent": t.progress(),
+        });
+        if let (Some(d), Some(e)) = (data.as_object_mut(), extra.as_object()) {
+            d.extend(e.clone());
+        }
+        let name = format!("package.{}.{phase}", c.op.name());
+        self.publisher().with_source("package").publish(name, Some(self.id), data);
+    }
+
+    /// Without shell integration: notice a package manager in the
+    /// foreground, and the shell coming back after it.
+    fn watch_foreground(&mut self) {
+        let now = Instant::now();
+        if now - self.last_fg_check < Duration::from_millis(250) {
+            return;
+        }
+        self.last_fg_check = now;
+        let pgid = self.pty.lock().unwrap().foreground_pgid();
+        let in_shell = pgid.is_none_or(|g| g == self.shell_pid);
+        if in_shell {
+            if self.pkg_from_process {
+                self.pkg_finish(None);
+            }
+            return;
+        }
+        if self.pkg.is_none() {
+            let argv = pgid.and_then(ProcessInfo::cmdline).unwrap_or_default();
+            if let Some(c) = packages::parse_argv(&argv) {
+                self.pkg_start(c, true);
             }
         }
     }

@@ -1,6 +1,6 @@
 //! Every example extension in `examples/` starts without errors when given
-//! the permissions it asks for, and the spec's Gabriel example reacts to
-//! install events.
+//! the permissions it asks for, and the package example reacts to package
+//! manager events.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ fn examples_start_cleanly() {
     let names: Vec<_> = found.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(
         names,
-        ["cpu-glow", "error-flash", "exit-color", "gabriel-glow", "git-panel", "clock"]
+        ["cpu-glow", "error-flash", "exit-color", "git-panel", "package-glow", "clock"]
     );
     let bus = EventBus::new();
     let data = std::env::temp_dir().join(format!("seraphim-examples-{}", std::process::id()));
@@ -54,23 +54,25 @@ fn examples_start_cleanly() {
     assert!(got.iter().any(|c| matches!(c, Command::Bind { ext, .. } if ext == "exit-color")));
     assert!(got.iter().any(|c| matches!(c, Command::RegisterKey { ext, .. } if ext == "clock")));
 
-    // The spec's §8.3 example.
-    let gabriel = bus.publisher("gabriel");
-    gabriel.publish("gabriel.install.started", None, json!({ "package": "firefox" }));
+    // The spec's §8.3 example, for any package manager.
+    let pkg = bus.publisher("package");
+    let firefox = json!({ "manager": "pacman", "operation": "install", "package": "firefox" });
+    pkg.publish("package.install.started", None, firefox.clone());
     let got = collect(&rt, |c| c.iter().any(|c| matches!(c, Command::Notify { .. })));
     assert!(got.iter().any(|c| matches!(c, Command::SetParam { param, value, .. } if param == "install" && *value == 1.0)), "{got:?}");
     assert!(
-        got.iter()
-            .any(|c| matches!(c, Command::Notify { text, .. } if text == "Installing firefox…")),
+        got.iter().any(
+            |c| matches!(c, Command::Notify { text, .. } if text == "pacman: installing firefox…")
+        ),
         "{got:?}"
     );
-    gabriel.publish("gabriel.install.completed", None, json!({ "package": "firefox" }));
+    pkg.publish("package.install.completed", None, firefox);
     // The success animation ends after 2.3 s, then says so.
     let got = collect(&rt, |c| {
-        c.iter().any(|c| matches!(c, Command::Notify { text, .. } if text == "Installed."))
+        c.iter().any(|c| matches!(c, Command::Notify { text, .. } if text == "Done."))
     });
     assert!(
-        got.iter().any(|c| matches!(c, Command::Notify { text, .. } if text == "Installed.")),
+        got.iter().any(|c| matches!(c, Command::Notify { text, .. } if text == "Done.")),
         "{got:?}"
     );
 }

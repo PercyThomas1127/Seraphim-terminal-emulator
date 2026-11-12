@@ -10,7 +10,7 @@
 //!   rendering"). Each subscription has a bounded queue; when it is full the
 //!   event is dropped *for that subscriber only* and counted.
 //! * **Filtering at the source.** Subscribers declare a [`Pattern`]
-//!   (`"gabriel.install.*"`, `"*"`, or an exact name) so they never see
+//!   (`"package.install.*"`, `"*"`, or an exact name) so they never see
 //!   events they did not ask for.
 //! * **Trusted provenance.** `source` is set by the publisher handle, not by
 //!   event payloads, so extensions cannot spoof e.g. `session.privileged`.
@@ -31,7 +31,7 @@ pub struct Event {
     /// Dotted name, e.g. `command.completed`.
     pub name: String,
     pub timestamp: SystemTime,
-    /// Publishing subsystem, e.g. `terminal`, `gabriel`. Set by [`Publisher`].
+    /// Publishing subsystem, e.g. `terminal`, `package`. Set by [`Publisher`].
     pub source: String,
     /// Session the event concerns, if any.
     pub session: Option<u64>,
@@ -171,6 +171,11 @@ pub struct Publisher {
 }
 
 impl Publisher {
+    /// A publisher on the same bus for another (trusted) subsystem.
+    pub fn with_source(&self, source: &str) -> Publisher {
+        Publisher { bus: self.bus.clone(), source: source.to_owned() }
+    }
+
     pub fn publish(&self, name: impl Into<String>, session: Option<u64>, data: Value) -> usize {
         self.bus.publish(Event {
             name: name.into(),
@@ -259,11 +264,11 @@ mod tests {
 
     #[test]
     fn patterns() {
-        let p = Pattern::parse("gabriel.install.*");
-        assert!(p.matches("gabriel.install.started"));
-        assert!(p.matches("gabriel.install.progress.detail"));
-        assert!(!p.matches("gabriel.installer"));
-        assert!(!p.matches("gabriel.remove.started"));
+        let p = Pattern::parse("package.install.*");
+        assert!(p.matches("package.install.started"));
+        assert!(p.matches("package.install.progress.detail"));
+        assert!(!p.matches("package.installer"));
+        assert!(!p.matches("package.remove.started"));
         assert!(Pattern::parse("*").matches("anything"));
         assert!(Pattern::parse("command.completed").matches("command.completed"));
         assert!(!Pattern::parse("command.completed").matches("command.completed.x"));
@@ -273,14 +278,14 @@ mod tests {
     fn filtered_delivery_and_source_stamping() {
         let bus = EventBus::new();
         let all = bus.subscribe("*", 16);
-        let gabriel = bus.subscribe("gabriel.*", 16);
-        let p = bus.publisher("gabriel");
-        assert_eq!(p.publish("gabriel.install.started", None, json!({"package": "firefox"})), 2);
+        let pkgs = bus.subscribe("package.*", 16);
+        let p = bus.publisher("package");
+        assert_eq!(p.publish("package.install.started", None, json!({"package": "firefox"})), 2);
         bus.publisher("terminal").publish("terminal.bell", Some(1), Value::Null);
 
-        let g = gabriel.drain();
+        let g = pkgs.drain();
         assert_eq!(g.len(), 1);
-        assert_eq!(g[0].source, "gabriel");
+        assert_eq!(g[0].source, "package");
         assert_eq!(g[0].data["package"], "firefox");
         assert_eq!(all.drain().len(), 2);
     }

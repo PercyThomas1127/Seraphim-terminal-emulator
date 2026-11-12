@@ -183,7 +183,10 @@ selection_fade_ms = 90
 # ease-in-out, ease-out-expo, ease-out-back, spring or instant.
 # Events include session.privileged {root}, command.started {command},
 # command.completed {exit_code, duration_ms}, terminal.bell, shell.prompt,
-# session.cwd.changed {cwd} and terminal.title.changed {title}.
+# session.cwd.changed {cwd}, terminal.title.changed {title}, and
+# package.<install|remove|upgrade|sync>.<started|progress|completed|failed>
+# {manager, packages, package, percent, exit_code} when a package
+# manager (emerge, pacman, apt, dnf, zypper, xbps, apk, flatpak, …) runs.
 #
 # [[on]]
 # event = "terminal.bell"

@@ -237,7 +237,7 @@ fn title_cwd_and_semantic_prompts() {
         10,
         2,
         "\x1b]2;hello;world\x07\x1b]7;file://host/home/me/My%20Dir\x1b\\\
-         \x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C;cmdline_url=gabriel%20bestow%20firefox\x07\x1b]133;D;2\x07",
+         \x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C;cmdline_url=pacman%20-S%20firefox\x07\x1b]133;D;2\x07",
     );
     assert_eq!(t.title(), "hello;world");
     assert_eq!(t.cwd(), Some("/home/me/My Dir"));
@@ -248,7 +248,7 @@ fn title_cwd_and_semantic_prompts() {
             TerminalEvent::CwdChanged("/home/me/My Dir".into()),
             TerminalEvent::PromptStarted,
             TerminalEvent::CommandInputStarted,
-            TerminalEvent::CommandExecuted { command: Some("gabriel bestow firefox".into()) },
+            TerminalEvent::CommandExecuted { command: Some("pacman -S firefox".into()) },
             TerminalEvent::CommandFinished { exit_code: Some(2) },
         ]
     );

@@ -98,8 +98,45 @@ Add one line to your shell's rc file:
 There are `.zsh` and `.fish` versions too in `shell-integration/`. It
 lets Seraphim know when a prompt appears, when a command starts and
 finishes (with exit code and duration), and when the directory changes.
-The command history panel, reactions to failed commands and the Gabriel
-effects all depend on it.
+The command history panel, reactions to failed commands and the exit codes of package manager
+commands depend on it (package managers are still recognized without it).
+
+### Package managers
+
+Seraphim notices when a package manager installs, removes or upgrades
+packages, or syncs its package lists, and follows its progress in its
+output. It recognizes these managers:
+
+| Distribution family | Managers |
+|---|---|
+| Gentoo | `emerge` (Portage), `emaint sync`, `eix-sync` |
+| Arch | `pacman`, `paru`, `yay`, `pikaur` |
+| Debian, Ubuntu | `apt`, `apt-get`, `aptitude`, `nala` |
+| Fedora, RHEL | `dnf`, `dnf5`, `yum`, `microdnf` |
+| openSUSE | `zypper` |
+| Void | `xbps-install`, `xbps-remove` |
+| Alpine | `apk` |
+| Solus | `eopkg` |
+| Any | `nix-env`, `nix profile`, `flatpak`, `snap`, `brew` |
+
+They are recognized through `sudo`, `doas`, `run0` and `pkexec`, after
+`env VAR=value`, and in lines like `apt update && apt upgrade`.
+
+- **With shell integration:** Seraphim reads the command line and gets
+  the exit code, so it can tell success from failure.
+- **Without it:** Seraphim watches the program in the foreground, and
+  the end is when your shell is back.
+
+What it does with them:
+
+- While one runs, its tab shows the progress.
+- The Package Activity panel (View menu) lists each operation, with a
+  gauge for the ones under way.
+- The `heavens` preset sends a wave of light up the window for installs
+  and upgrades.
+- Rules, bindings and extensions can react to the `package.*` events,
+  for example `event = "package.install.completed"` in an `[[on]]` rule.
+  The events are listed in the [scripting guide](scripting.md#events).
 
 ## 3. Images in the terminal
 
@@ -331,7 +368,8 @@ Panels open as panes from the View menu:
 - **System Monitor:** CPU, memory and load.
 - **Sessions:** your open terminals.
 - **Command History:** Enter types the selected command again.
-- **Package Activity:** Gabriel installs.
+- **Package Activity:** installs, removals, upgrades and syncs by your
+  package manager, with progress for the ones under way.
 
 Extensions can add their own (see [section 6](#6-extensions-lua)). In a
 panel, Up and Down move, Enter or a click chooses, and Escape closes it.
@@ -427,7 +465,7 @@ end)
 
 | Area | Functions |
 |---|---|
-| Events | `seraphim.on(...)` for output, commands, prompts, focus, tabs, progress, Gabriel installs and custom events; timers; storage that persists; publishing their own events |
+| Events | `seraphim.on(...)` for output, commands, prompts, focus, tabs, progress, package manager activity and custom events; timers; storage that persists; publishing their own events |
 | Visuals | Add or remove layers; set parameters, colours and opacity; tweens and animations; bind properties to live values; switch profiles |
 | Interface | Notices; commands in the Extensions menu; shortcuts (`ui.key`); built-in actions; panels (`ui.panel`); opening layouts |
 | Terminal | Read the screen, cursor, title, directory and last command; type into the terminal (never into a root shell) |
@@ -455,7 +493,7 @@ separator.
 - `disabled = true` in `[extensions.NAME]` turns one off.
 
 Examples in [`examples/extensions/`](../examples/extensions): error-flash,
-exit-color, cpu-glow, gabriel-glow and git-panel. The full reference is
+exit-color, cpu-glow, package-glow and git-panel. The full reference is
 [scripting.md](scripting.md).
 
 ## 7. Tools without a window

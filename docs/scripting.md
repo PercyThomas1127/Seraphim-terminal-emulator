@@ -46,14 +46,14 @@ come from shell integration (see the README).
   appear in the corner of the window with their file and line.
 
 The examples in [`examples/`](../examples) are complete extensions: an
-error flash (spec §8.4), Gabriel install reactions (§8.3), exit-code
+error flash (spec §8.4), package install reactions (§8.3), exit-code
 colors and CPU-driven intensity (§11.4), and a one-file clock.
 
 ## The manifest
 
 | Field | Meaning |
 |---|---|
-| `name` | Lowercase letters, digits, `-`, `_`. It can't be a built-in event namespace such as `terminal` or `gabriel`. Default: the folder name. |
+| `name` | Lowercase letters, digits, `-`, `_`. It can't be a built-in event namespace such as `terminal` or `package`. Default: the folder name. |
 | `version`, `description`, `authors` | For people. |
 | `api` | The scripting API version it was written for. This Seraphim provides `1`. |
 | `permissions` | What it asks for (below). |
@@ -160,7 +160,7 @@ end, { priority = 10, throttle = 100 })
 | `terminal.progress` | `{state, percent}`: OSC 9;4 (0 clear, 1 normal, 2 error, 3 indeterminate, 4 paused) |
 | `visual.profile.changed` | `{profile}` |
 | `animation.completed` | `{name, extension}` |
-| `gabriel.install.*` | From the Gabriel package manager integration |
+| `package.<op>.started`, `.progress`, `.completed`, `.failed` | A package manager at work. `<op>` is `install`, `remove`, `upgrade` or `sync`. Data: `{manager, operation, packages, package, done, total, percent}`, plus `{exit_code, duration_ms}` at the end (`exit_code` is `nil` without shell integration). Managers: emerge (Portage), pacman, paru, yay, pikaur, apt, apt-get, aptitude, nala, dnf, yum, zypper, xbps, apk, eopkg, nix, flatpak, snap, brew |
 | `<extension>.*` | Custom events from extensions |
 
 The output and cursor events are only produced while someone listens for

@@ -63,10 +63,22 @@ pub struct HistoryEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackageEvent {
     pub at: SystemTime,
-    /// `install.started`, …
-    pub what: String,
+    /// `pacman`, `portage`, `apt`, …
+    pub manager: String,
+    /// `install`, `remove`, `upgrade`, `sync`.
+    pub operation: String,
+    /// `started`, `progress`, `completed`, `failed`.
+    pub phase: String,
     pub package: String,
     pub detail: String,
+    pub percent: Option<u8>,
+    pub session: Option<u64>,
+}
+
+impl PackageEvent {
+    pub fn running(&self) -> bool {
+        matches!(self.phase.as_str(), "started" | "progress")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,7 +159,7 @@ fn ago(t: SystemTime) -> String {
     }
 }
 
-fn duration(ms: u64) -> String {
+pub fn duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms < 60_000 {
@@ -333,30 +345,51 @@ impl PanelState {
             Kind::Packages => {
                 if ctx.packages.is_empty() {
                     return vec![Widget::Text {
-                        text: "No package activity yet (gabriel.* events).".into(),
+                        text: "No package activity yet. Installs, removals, upgrades and syncs \
+                               by emerge, pacman, paru, yay, apt, dnf, zypper, xbps, apk, \
+                               eopkg, nix, flatpak, snap and brew show here."
+                            .into(),
                         style: Style::Dim,
                     }];
+                }
+                let mut out = Vec::new();
+                // Operations under way, with how far they got.
+                for p in ctx.packages.iter().filter(|p| p.running()) {
+                    out.push(Widget::Gauge {
+                        label: format!("{} {}", p.manager, p.operation),
+                        value: p.percent.unwrap_or(0) as f32 / 100.0,
+                        text: Some(if p.package.is_empty() {
+                            p.detail.clone()
+                        } else {
+                            format!("{} {}", p.package, p.detail)
+                        }),
+                        style: Style::Accent,
+                    });
+                }
+                if !out.is_empty() {
+                    out.push(Widget::Separator);
                 }
                 let items = ctx
                     .packages
                     .iter()
                     .rev()
                     .map(|p| {
-                        let style = if p.what.ends_with("failed") {
-                            Style::Alert
-                        } else if p.what.ends_with("completed") {
-                            Style::Good
-                        } else {
-                            Style::Accent
+                        let style = match p.phase.as_str() {
+                            "failed" => Style::Alert,
+                            "completed" => Style::Good,
+                            _ => Style::Accent,
                         };
+                        let what =
+                            if p.package.is_empty() { "system".into() } else { p.package.clone() };
                         Item {
-                            text: format!("{} {}", p.package, p.what),
+                            text: format!("{} {} {what}", p.manager, p.operation),
                             detail: format!("{} {}", p.detail, ago(p.at)),
                             style,
                         }
                     })
                     .collect();
-                vec![Widget::List { items }]
+                out.push(Widget::List { items });
+                out
             }
             Kind::Settings => {
                 let items = ctx
