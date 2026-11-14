@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>yc9941@stanford.edu</email>
+	</maintainer>
+	<upstream>
+		<remote-id type="github">PercyThomas1127/Seraphim-terminal-emulator</remote-id>
+	</upstream>
+</pkgmetadata>
