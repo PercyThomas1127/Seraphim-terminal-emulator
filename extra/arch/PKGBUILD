@@ -1,0 +1,79 @@
+# Maintainer: Seraphim Dev <yc9941@stanford.edu>
+
+pkgname=seraphim
+pkgver=0.1.1
+pkgrel=1
+pkgdesc='GPU-accelerated, programmable terminal with animated, event-driven backgrounds'
+arch=('x86_64' 'aarch64')
+url='https://github.com/PercyThomas1127/Seraphim-terminal-emulator'
+license=('MIT')
+# winit, wgpu and the clipboard load these with dlopen at run time, so they
+# are not linked and makepkg cannot detect them.
+depends=(
+  'gcc-libs'
+  'glibc'
+  'libglvnd'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'libxrandr'
+  'vulkan-icd-loader'
+  'wayland'
+)
+makedepends=('cargo')
+optdepends=(
+  'ffmpeg: video backgrounds and audio-reactive visuals'
+  'libpulse: audio capture for audio-reactive visuals'
+  'libnotify: desktop notifications'
+  'glib2: desktop notifications without libnotify'
+)
+install=seraphim.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # filled in after the v0.1.1 tag exists
+
+_srcdir="Seraphim-terminal-emulator-$pkgver"
+
+prepare() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --package seraphim
+}
+
+check() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd "$_srcdir"
+  install -Dm755 target/release/seraphim -t "$pkgdir/usr/bin"
+
+  install -Dm644 extra/linux/seraphim.desktop -t "$pkgdir/usr/share/applications"
+  local size
+  for size in 32 48 64 128 256 512; do
+    install -Dm644 "extra/icons/hicolor/${size}x${size}/apps/seraphim.png" \
+      -t "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
+  done
+
+  install -dm755 "$pkgdir/usr/share/terminfo"
+  tic -x -o "$pkgdir/usr/share/terminfo" extra/terminfo/xterm-seraphim.terminfo
+
+  install -Dm644 shell-integration/seraphim.{bash,fish,zsh} \
+    -t "$pkgdir/usr/share/seraphim/shell-integration"
+
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
+  cp -r docs "$pkgdir/usr/share/doc/$pkgname/"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+}

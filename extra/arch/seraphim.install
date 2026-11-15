@@ -1,0 +1,6 @@
+post_install() {
+  echo 'For prompt marks, exit codes and command events, source the shell'
+  echo 'integration from your shell rc file, e.g. in ~/.bashrc:'
+  echo '  [[ $TERM_PROGRAM == seraphim ]] && source /usr/share/seraphim/shell-integration/seraphim.bash'
+  echo '(.zsh and .fish versions are in the same directory)'
+}
