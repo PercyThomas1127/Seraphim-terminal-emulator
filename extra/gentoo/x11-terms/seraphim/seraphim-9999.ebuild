@@ -19,7 +19,7 @@ LICENSE+="
 	Unicode-3.0 ZLIB
 "
 SLOT="0"
-IUSE="wayland X"
+IUSE="+wayland +X"
 REQUIRED_USE="|| ( wayland X )"
 
 # winit, wgpu and the clipboard load every system library with dlopen at

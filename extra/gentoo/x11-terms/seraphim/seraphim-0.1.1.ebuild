@@ -397,7 +397,7 @@ LICENSE+="
 "
 SLOT="0"
 KEYWORDS="~amd64 ~arm64"
-IUSE="wayland X"
+IUSE="+wayland +X"
 REQUIRED_USE="|| ( wayland X )"
 
 # winit, wgpu and the clipboard load every system library with dlopen at
