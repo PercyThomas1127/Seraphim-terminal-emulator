@@ -389,7 +389,7 @@ SRC_URI="
 "
 S="${WORKDIR}/Seraphim-terminal-emulator-${PV}"
 
-LICENSE="|| ( Apache-2.0 MIT )"
+LICENSE="MIT"
 # Dependent crate licenses
 LICENSE+="
 	Apache-2.0 BSD-2 BSD Boost-1.0 CDLA-Permissive-2.0 ISC MIT

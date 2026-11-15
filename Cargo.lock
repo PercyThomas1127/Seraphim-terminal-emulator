@@ -2187,7 +2187,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "seraphim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "libc",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "seraphim-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "toml",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "seraphim-conformance"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "seraphim-pty",
@@ -2232,14 +2232,14 @@ dependencies = [
 
 [[package]]
 name = "seraphim-events"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "seraphim-pty"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "nix",
@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "seraphim-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "fontdb",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "seraphim-script"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "mlua",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "seraphim-session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "seraphim-events",
  "seraphim-pty",
@@ -2284,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "seraphim-terminal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "seraphim-visual"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "image",
