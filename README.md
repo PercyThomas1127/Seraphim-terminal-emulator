@@ -66,6 +66,40 @@ cargo run --release -p seraphim-render --example frame_time
 
 ## Install
 
+### Arch Linux
+
+The PKGBUILD is in [`extra/arch`](extra/arch) (an AUR package is coming):
+
+```bash
+git clone https://github.com/PercyThomas1127/Seraphim-terminal-emulator.git
+cd Seraphim-terminal-emulator/extra/arch
+makepkg -si
+```
+
+This builds the latest release, runs the test suite and installs
+`seraphim` system-wide with its menu entry, icons, terminfo and shell
+integration (in `/usr/share/seraphim/shell-integration`). Remove it with
+`sudo pacman -R seraphim`.
+
+### Gentoo
+
+[`extra/gentoo`](extra/gentoo) is an overlay with `x11-terms/seraphim`.
+Add it as a repository and emerge:
+
+```bash
+sudo git clone https://github.com/PercyThomas1127/Seraphim-terminal-emulator.git /var/db/repos/seraphim-src
+printf '[seraphim]\nlocation = /var/db/repos/seraphim-src/extra/gentoo\n' | sudo tee /etc/portage/repos.conf/seraphim.conf
+echo 'x11-terms/seraphim ~amd64' | sudo tee /etc/portage/package.accept_keywords/seraphim   # ~arm64 on ARM
+sudo emerge --ask x11-terms/seraphim
+```
+
+For the development version from git main, accept `=x11-terms/seraphim-9999 **`
+instead and emerge `=x11-terms/seraphim-9999`. Update the overlay with
+`sudo git -C /var/db/repos/seraphim-src pull`. The `wayland` and `X` USE
+flags (both on by default) choose which display libraries are pulled in.
+
+### From source (any Linux)
+
 ```bash
 cargo install --path crates/seraphim --profile dist --locked --root ~/.local
 seraphim --install-desktop    # menu entry and icon (KDE, GNOME, …)
