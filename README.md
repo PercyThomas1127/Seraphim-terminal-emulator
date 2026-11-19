@@ -98,6 +98,25 @@ instead and emerge `=x11-terms/seraphim-9999`. Update the overlay with
 `sudo git -C /var/db/repos/seraphim-src pull`. The `wayland` and `X` USE
 flags (both on by default) choose which display libraries are pulled in.
 
+### Fedora and other dnf distributions
+
+[`extra/rpm/seraphim.spec`](extra/rpm/seraphim.spec) builds an RPM of the
+latest release:
+
+```bash
+git clone https://github.com/PercyThomas1127/Seraphim-terminal-emulator.git
+cd Seraphim-terminal-emulator
+sudo dnf install rpm-build rpmdevtools dnf-plugins-core
+sudo dnf builddep extra/rpm/seraphim.spec
+spectool -g -R extra/rpm/seraphim.spec
+rpmbuild -ba extra/rpm/seraphim.spec
+sudo dnf install ~/rpmbuild/RPMS/$(uname -m)/seraphim-*.rpm
+```
+
+`spectool` downloads the release archive and its crate bundle, so the build
+itself runs offline. The build runs the test suite. Remove the package with
+`sudo dnf remove seraphim`.
+
 ### From source (any Linux)
 
 ```bash

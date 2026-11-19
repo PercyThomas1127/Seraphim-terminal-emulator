@@ -1,12 +1,13 @@
 pkgbase = seraphim
 	pkgdesc = GPU-accelerated, programmable terminal with animated, event-driven backgrounds
-	pkgver = 0.1.1
+	pkgver = 0.2.1
 	pkgrel = 1
 	url = https://github.com/PercyThomas1127/Seraphim-terminal-emulator
 	install = seraphim.install
 	arch = x86_64
 	arch = aarch64
 	license = MIT
+	license = OFL-1.1
 	makedepends = cargo
 	depends = gcc-libs
 	depends = glibc
@@ -23,7 +24,7 @@ pkgbase = seraphim
 	optdepends = libpulse: audio capture for audio-reactive visuals
 	optdepends = libnotify: desktop notifications
 	optdepends = glib2: desktop notifications without libnotify
-	source = seraphim-0.1.1.tar.gz::https://github.com/PercyThomas1127/Seraphim-terminal-emulator/archive/refs/tags/v0.1.1.tar.gz
-	sha256sums = e993b6b392636571bfe8095af520c80ad18ac9d86dafae0a83565367d9e74727
+	source = seraphim-0.2.1.tar.gz::https://github.com/PercyThomas1127/Seraphim-terminal-emulator/archive/refs/tags/v0.2.1.tar.gz
+	sha256sums = SKIP
 
 pkgname = seraphim
