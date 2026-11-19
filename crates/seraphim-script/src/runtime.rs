@@ -64,7 +64,7 @@ pub struct Runtime {
     commands: Receiver<Command>,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
-    forwarder: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    forwarder: Option<(Arc<AtomicBool>, seraphim_events::PatternHandle, JoinHandle<()>)>,
 }
 
 impl Runtime {
@@ -81,6 +81,7 @@ impl Runtime {
         let queued = Arc::new(AtomicUsize::new(0));
         let sub = bus.subscribe(Pattern::Any(Vec::new()), 4096);
         let patterns = sub.pattern_handle();
+        let closer = sub.pattern_handle();
         let shared = Arc::new(Shared {
             snapshot: RwLock::new(TerminalSnapshot::default()),
             tracked: Mutex::new(Default::default()),
@@ -98,8 +99,12 @@ impl Runtime {
             std::thread::Builder::new()
                 .name("seraphim-script-bus".into())
                 .spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let Ok(e) = sub.recv_timeout(Duration::from_millis(200)) else { continue };
+                    // Blocks until an event arrives; `Drop` closes the
+                    // subscription, which ends `recv` with `None`.
+                    while let Some(e) = sub.recv() {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
                         while queued.load(Ordering::Relaxed) >= MAX_QUEUED {
                             if stop.load(Ordering::Relaxed) {
                                 return;
@@ -136,7 +141,7 @@ impl Runtime {
             commands,
             shared,
             thread: Some(thread),
-            forwarder: Some((stop, forwarder)),
+            forwarder: Some((stop, closer, forwarder)),
         }
     }
 
@@ -175,8 +180,9 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _ = self.inbox.send(Inbox::Shutdown);
-        if let Some((stop, h)) = self.forwarder.take() {
+        if let Some((stop, closer, h)) = self.forwarder.take() {
             stop.store(true, Ordering::Relaxed);
+            closer.close();
             let _ = h.join();
         }
         if let Some(h) = self.thread.take() {

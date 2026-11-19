@@ -241,6 +241,14 @@ pub struct PatternHandle {
 }
 
 impl PatternHandle {
+    /// End the subscription from any thread: it gets no more events, and a
+    /// thread blocked in [`Subscription::recv`] on it wakes with `None`.
+    pub fn close(&self) {
+        if let Some(inner) = self.bus.upgrade() {
+            inner.subs.write().unwrap().retain(|s| s.id != self.id);
+        }
+    }
+
     pub fn set(&self, pattern: Pattern) {
         if let Some(inner) = self.bus.upgrade() {
             if let Some(s) = inner.subs.write().unwrap().iter_mut().find(|s| s.id == self.id) {

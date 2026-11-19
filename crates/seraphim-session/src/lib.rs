@@ -131,6 +131,11 @@ struct Shared {
     /// Bumped whenever terminal state changes; renderers poll/compare this
     /// to decide whether a frame is needed.
     generation: AtomicU64,
+    /// Bumped by everything that can change what the terminal looks like:
+    /// output and resizes (as `generation`) and any mutable access through
+    /// [`Session::terminal`] (selection, scrolling the view, local input).
+    /// `generation` stays output-only, as it also marks activity.
+    render_generation: AtomicU64,
     /// Whether the session runs as root, as last published.
     root: Mutex<Option<bool>>,
 }
@@ -145,7 +150,21 @@ pub struct Session {
     publisher: Arc<Mutex<Publisher>>,
     io_thread: Option<JoinHandle<()>>,
     cell_pixels: Mutex<Option<(f32, f32)>>,
+    /// The last [`Session::foreground_process`] result.
+    foreground: Mutex<Option<Foreground>>,
 }
+
+/// A foreground process read from `/proc`, and what it depends on.
+struct Foreground {
+    pgid: u32,
+    generation: u64,
+    at: Instant,
+    info: Option<ProcessInfo>,
+}
+
+/// How long a [`Session::foreground_process`] result is reused while the
+/// foreground process group and the terminal output stay the same.
+const FOREGROUND_TTL: Duration = Duration::from_secs(1);
 
 impl Session {
     pub fn spawn(id: SessionId, config: SessionConfig, bus: &EventBus) -> io::Result<Session> {
@@ -208,6 +227,7 @@ impl Session {
             publisher,
             io_thread: Some(io_thread),
             cell_pixels: Mutex::new(config.cell_pixels),
+            foreground: Mutex::new(None),
         })
     }
 
@@ -229,12 +249,25 @@ impl Session {
             }
             h.borrow_mut().push(key);
         });
-        TerminalGuard { guard: self.terminal.lock().unwrap(), key }
+        TerminalGuard {
+            guard: self.terminal.lock().unwrap(),
+            key,
+            render: &self.shared.render_generation,
+            mutated: false,
+        }
     }
 
     /// Monotonic counter incremented on every state change.
     pub fn generation(&self) -> u64 {
         self.shared.generation.load(Ordering::Acquire)
+    }
+
+    /// Monotonic counter incremented whenever what the terminal looks like
+    /// may have changed: output, resizes, and any mutable access through
+    /// [`Session::terminal`]. A renderer that drew this value can skip the
+    /// next frame's work for this session if it is unchanged.
+    pub fn render_generation(&self) -> u64 {
+        self.shared.render_generation.load(Ordering::Acquire)
     }
 
     /// Send raw bytes (already-encoded input) to the application.
@@ -258,6 +291,7 @@ impl Session {
             t.resize(cols as usize, rows as usize);
         }
         self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.render_generation.fetch_add(1, Ordering::Release);
         let cell = *self.cell_pixels.lock().unwrap();
         self.pty.lock().unwrap().resize(pty_size(cols, rows, cell))
     }
@@ -305,6 +339,7 @@ impl Session {
             p.publish("session.cwd.changed", Some(self.id), json!({"cwd": cwd}));
         }
         self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.render_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Info on the shell (the session's first process).
@@ -313,9 +348,23 @@ impl Session {
     }
 
     /// Info on the process in the terminal's foreground (from `/proc`).
+    ///
+    /// Reading `/proc` costs several syscalls, and tab labels ask every
+    /// frame, so a result is reused for up to [`FOREGROUND_TTL`] while the
+    /// foreground process group is the same and no output arrived (a `cd`
+    /// or a new program prints, which refreshes it).
     pub fn foreground_process(&self) -> Option<ProcessInfo> {
         let pgid = self.pty.lock().unwrap().foreground_pgid()?;
-        ProcessInfo::read(pgid)
+        let generation = self.generation();
+        let mut cache = self.foreground.lock().unwrap();
+        if let Some(c) = &*cache {
+            if c.pgid == pgid && c.generation == generation && c.at.elapsed() < FOREGROUND_TTL {
+                return c.info.clone();
+            }
+        }
+        let info = ProcessInfo::read(pgid);
+        *cache = Some(Foreground { pgid, generation, at: Instant::now(), info: info.clone() });
+        info
     }
 }
 
@@ -345,6 +394,9 @@ thread_local! {
 pub struct TerminalGuard<'a> {
     guard: MutexGuard<'a, Terminal>,
     key: usize,
+    render: &'a AtomicU64,
+    /// Borrowed mutably: bump the render generation when released.
+    mutated: bool,
 }
 
 impl std::ops::Deref for TerminalGuard<'_> {
@@ -356,12 +408,16 @@ impl std::ops::Deref for TerminalGuard<'_> {
 
 impl std::ops::DerefMut for TerminalGuard<'_> {
     fn deref_mut(&mut self) -> &mut Terminal {
+        self.mutated = true;
         &mut self.guard
     }
 }
 
 impl Drop for TerminalGuard<'_> {
     fn drop(&mut self) {
+        if self.mutated {
+            self.render.fetch_add(1, Ordering::Release);
+        }
         let key = self.key;
         HELD.with(|h| h.borrow_mut().retain(|&k| k != key));
     }
@@ -398,6 +454,7 @@ impl IoLoop {
 
     fn changed(&self) {
         self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.render_generation.fetch_add(1, Ordering::Release);
         if let Some(n) = &self.notify {
             (n.0)();
         }
@@ -441,7 +498,9 @@ impl IoLoop {
                 let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
                 p.publish("terminal.output.raw", Some(self.id), json!({"bytes": n, "data": raw}));
             }
-            p.publish("terminal.output", Some(self.id), json!({"bytes": n, "text": text}));
+            if p.wants("terminal.output") {
+                p.publish("terminal.output", Some(self.id), json!({"bytes": n, "text": text}));
+            }
             if let (Some((command, _)), false) = (&self.command, text.is_empty()) {
                 p.publish(
                     "command.output",
