@@ -26,7 +26,10 @@ use seraphim_terminal::{Attrs, CursorShape, Flags, Point, SelectionRange, Termin
 
 use atlas::{Atlas, AtlasRect, ATLAS_SIZE};
 use font::{is_emoji_cluster, is_ignorable, is_private_use, GlyphKey, ShapedGlyph};
-pub use font::{CellMetrics, FontConfig, FontError, FontStyle, Fonts};
+pub use font::{
+    load_system_fonts_in_background, rescan_system_fonts, CellMetrics, FontConfig, FontError,
+    FontStyle, Fonts, BUILTIN_FAMILY,
+};
 use theme::to_f32;
 pub use theme::{Rgb, Theme};
 use unicode_normalization::UnicodeNormalization;
@@ -538,6 +541,19 @@ impl Renderer {
         self.shaped.clear();
         self.atlas.clear();
         self.clear_row_caches();
+    }
+
+    /// Call when the background system font scan has finished (see
+    /// [`load_system_fonts_in_background`]). Returns whether characters were
+    /// left blank while it ran, in which case the next frame redraws every
+    /// row with the fallback fonts now available.
+    pub fn system_fonts_ready(&mut self) -> bool {
+        if !self.fonts.take_early_misses() {
+            return false;
+        }
+        self.shaped.clear();
+        self.clear_row_caches();
+        true
     }
 
     pub fn fonts(&self) -> &Fonts {

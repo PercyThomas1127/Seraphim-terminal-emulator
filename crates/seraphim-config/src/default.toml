@@ -26,9 +26,11 @@ live_reload = true
 restore_session = false
 
 [font]
-# Family name; when unset, the first installed of JetBrains Mono, Fira Code,
-# DejaVu Sans Mono, Liberation Mono, Noto Sans Mono is used.
-# family = "JetBrains Mono"
+# Family name of an installed font. When unset (or not installed), the
+# JetBrains Mono built into Seraphim is used. Unset also opens the window
+# fastest: the installed fonts are then only needed for characters the
+# built-in font lacks (CJK, emoji, icons), and are found in the background.
+# family = "Fira Code"
 # Size in points.
 size = 11.0
 
