@@ -328,6 +328,8 @@ enum UserEvent {
     ConfigChanged(u64, Vec<std::path::PathBuf>),
     /// A window's scripts queued commands.
     Script(u64),
+    /// The background system font scan finished.
+    FontsReady,
 }
 
 /// Pane ids are unique in the process, so a pane keeps its id (and its
@@ -692,6 +694,12 @@ pub fn run(options: WindowOptions) -> Result<i32, String> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|e| format!("cannot open a window: {e}"))?;
+    // Find the installed fonts while the window and GPU come up; the
+    // built-in font draws the first frame without them.
+    let fonts_proxy = event_loop.create_proxy();
+    seraphim_render::load_system_fonts_in_background(move || {
+        let _ = fonts_proxy.send_event(UserEvent::FontsReady);
+    });
     let mut app = App {
         proxy: event_loop.create_proxy(),
         options,
@@ -844,6 +852,11 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Wake => {
                 for w in &mut self.wins {
                     w.user_event(event_loop, UserEvent::Wake);
+                }
+            }
+            UserEvent::FontsReady => {
+                for w in &mut self.wins {
+                    w.fonts_ready();
                 }
             }
         }
@@ -1429,6 +1442,8 @@ impl Win {
         self.options = o;
         let _ = scale;
         if font_changed {
+            // The new family may have just been installed.
+            seraphim_render::rescan_system_fonts();
             self.refresh_fonts();
         } else if bar_changed {
             self.resize_grid();
@@ -1458,6 +1473,18 @@ impl Win {
         // The tab bar may have appeared or gone (tabs.bar).
         a.apply_layout();
         a.window.request_redraw();
+    }
+
+    /// The system font list is in: redraw text that was left blank while
+    /// it loaded.
+    fn fonts_ready(&mut self) {
+        if let Some(a) = &mut self.active {
+            let main = a.renderer.system_fonts_ready();
+            let overlay = a.overlay.system_fonts_ready();
+            if main || overlay {
+                a.window.request_redraw();
+            }
+        }
     }
 
     fn fonts_for(&self, scale: f64) -> Result<Fonts, String> {
