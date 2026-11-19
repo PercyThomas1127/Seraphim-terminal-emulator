@@ -1,11 +1,12 @@
 Name:           seraphim
-Version:        0.1.1
+Version:        0.2.1
 Release:        1%{?dist}
 Summary:        GPU-accelerated, programmable terminal with animated, event-driven backgrounds
 
-# Seraphim is MIT. The rest are the crates compiled into the binary
+# Seraphim is MIT and its built-in JetBrains Mono font OFL-1.1. The rest are
+# the crates compiled into the binary
 # (cargo tree -p seraphim -e normal,build --format '{l}' on Linux targets).
-License:        MIT AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND CDLA-Permissive-2.0 AND ISC AND Unicode-3.0 AND Zlib AND (0BSD OR MIT OR Apache-2.0) AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND (BSD-3-Clause OR Apache-2.0) AND (MIT OR Apache-2.0 OR Zlib) AND (Unlicense OR MIT)
+License:        MIT AND OFL-1.1 AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND CDLA-Permissive-2.0 AND ISC AND Unicode-3.0 AND Zlib AND (0BSD OR MIT OR Apache-2.0) AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND (BSD-3-Clause OR Apache-2.0) AND (MIT OR Apache-2.0 OR Zlib) AND (Unlicense OR MIT)
 URL:            https://github.com/PercyThomas1127/Seraphim-terminal-emulator
 Source0:        %{url}/archive/refs/tags/v%{version}/Seraphim-terminal-emulator-%{version}.tar.gz
 # Every crate from Cargo.lock, so the build runs offline.
@@ -83,6 +84,7 @@ cargo test --frozen --release --workspace
 
 %files
 %license LICENSE
+%license crates/seraphim-render/fonts/OFL.txt
 %doc README.md docs
 %{_bindir}/seraphim
 %{_datadir}/applications/seraphim.desktop
@@ -91,5 +93,8 @@ cargo test --frozen --release --workspace
 %{_datadir}/seraphim/
 
 %changelog
+* Wed Nov 18 2026 Seraphim Dev <yc9941@stanford.edu> - 0.2.1-1
+- Update to 0.2.1: built-in JetBrains Mono font, faster startup
+
 * Sun Nov 15 2026 Seraphim Dev <yc9941@stanford.edu> - 0.1.1-1
 - First RPM package

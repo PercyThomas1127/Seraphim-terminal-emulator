@@ -1,12 +1,13 @@
 # Maintainer: Seraphim Dev <yc9941@stanford.edu>
 
 pkgname=seraphim
-pkgver=0.1.1
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='GPU-accelerated, programmable terminal with animated, event-driven backgrounds'
 arch=('x86_64' 'aarch64')
 url='https://github.com/PercyThomas1127/Seraphim-terminal-emulator'
-license=('MIT')
+# OFL-1.1: the built-in JetBrains Mono font.
+license=('MIT' 'OFL-1.1')
 # winit, wgpu and the clipboard load these with dlopen at run time, so they
 # are not linked and makepkg cannot detect them.
 depends=(
@@ -31,7 +32,7 @@ optdepends=(
 )
 install=seraphim.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('e993b6b392636571bfe8095af520c80ad18ac9d86dafae0a83565367d9e74727')
+sha256sums=('SKIP')  # filled in after the v0.2.1 tag exists
 
 _srcdir="Seraphim-terminal-emulator-$pkgver"
 
@@ -76,4 +77,6 @@ package() {
   cp -r docs "$pkgdir/usr/share/doc/$pkgname/"
 
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm644 crates/seraphim-render/fonts/OFL.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/OFL-JetBrainsMono.txt"
 }

@@ -2,10 +2,10 @@
 # Build seraphim-VERSION-vendor.tar.xz, the crate bundle seraphim.spec uses
 # as Source1, from the release archive of tag vVERSION.
 #
-#   extra/rpm/make-vendor-tarball.sh 0.1.1 [OUTDIR]
+#   extra/rpm/make-vendor-tarball.sh 0.2.1 [OUTDIR]
 #
 # Attach the result to the GitHub release:
-#   gh release upload v0.1.1 seraphim-0.1.1-vendor.tar.xz
+#   gh release upload v0.2.1 seraphim-0.2.1-vendor.tar.xz
 set -euo pipefail
 
 version=${1:?usage: $0 VERSION [OUTDIR]}
