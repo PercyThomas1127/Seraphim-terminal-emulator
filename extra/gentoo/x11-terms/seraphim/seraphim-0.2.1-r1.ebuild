@@ -421,8 +421,15 @@ BDEPEND="sys-libs/ncurses"
 
 DOCS=( README.md )
 
+# cargo.eclass always builds the release profile; give it the dist
+# profile's whole-program optimization (fat LTO, one codegen unit) for
+# the installed binary. Tests keep the faster plain release build.
+seraphim_lto() {
+	CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 "$@"
+}
+
 src_compile() {
-	cargo_src_compile --package seraphim
+	seraphim_lto cargo_src_compile --package seraphim
 }
 
 src_test() {
@@ -433,7 +440,7 @@ src_test() {
 }
 
 src_install() {
-	cargo_src_install --path crates/seraphim
+	seraphim_lto cargo_src_install --path crates/seraphim
 
 	domenu extra/linux/seraphim.desktop
 	local size

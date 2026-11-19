@@ -42,8 +42,13 @@ debug = "line-tables-only"
 
 # For installing and packaging: the release build without its line tables
 # (122 MB -> about 25 MB). Function names stay, so backtraces still say
-# where a crash happened.
+# where a crash happened. Whole-program optimization (fat LTO, one codegen
+# unit) removes duplicate generic code across crates: a smaller binary that
+# runs at least as fast, at the cost of a longer build. Panics still unwind,
+# so a failing Lua callback or worker thread doesn't take the terminal down.
 [profile.dist]
 inherits = "release"
 debug = false
 strip = "debuginfo"
+lto = "fat"
+codegen-units = 1

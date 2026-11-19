@@ -2,7 +2,7 @@
 
 pkgname=seraphim
 pkgver=0.2.1
-pkgrel=1
+pkgrel=2
 pkgdesc='GPU-accelerated, programmable terminal with animated, event-driven backgrounds'
 arch=('x86_64' 'aarch64')
 url='https://github.com/PercyThomas1127/Seraphim-terminal-emulator'
@@ -46,7 +46,8 @@ build() {
   cd "$_srcdir"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release --package seraphim
+  # The dist profile: release with whole-program optimization (fat LTO).
+  cargo build --frozen --profile dist --package seraphim
 }
 
 check() {
@@ -58,7 +59,7 @@ check() {
 
 package() {
   cd "$_srcdir"
-  install -Dm755 target/release/seraphim -t "$pkgdir/usr/bin"
+  install -Dm755 target/dist/seraphim -t "$pkgdir/usr/bin"
 
   install -Dm644 extra/linux/seraphim.desktop -t "$pkgdir/usr/share/applications"
   local size

@@ -1,7 +1,7 @@
 pkgbase = seraphim
 	pkgdesc = GPU-accelerated, programmable terminal with animated, event-driven backgrounds
 	pkgver = 0.2.1
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/PercyThomas1127/Seraphim-terminal-emulator
 	install = seraphim.install
 	arch = x86_64
