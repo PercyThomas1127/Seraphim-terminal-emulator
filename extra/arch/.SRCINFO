@@ -25,6 +25,6 @@ pkgbase = seraphim
 	optdepends = libnotify: desktop notifications
 	optdepends = glib2: desktop notifications without libnotify
 	source = seraphim-0.2.1.tar.gz::https://github.com/PercyThomas1127/Seraphim-terminal-emulator/archive/refs/tags/v0.2.1.tar.gz
-	sha256sums = SKIP
+	sha256sums = dfca44076d2e36b577a8d03275c13187a9beb4200a4c794d66cf2b43dc7dc803
 
 pkgname = seraphim

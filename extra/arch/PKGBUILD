@@ -32,7 +32,7 @@ optdepends=(
 )
 install=seraphim.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # filled in after the v0.2.1 tag exists
+sha256sums=('dfca44076d2e36b577a8d03275c13187a9beb4200a4c794d66cf2b43dc7dc803')
 
 _srcdir="Seraphim-terminal-emulator-$pkgver"
 
