@@ -726,6 +726,9 @@ static WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn run(options: WindowOptions) -> Result<i32, String> {
+    // First, while this is the only thread: keep the software Vulkan driver
+    // (and LLVM) out of the process if a real GPU is there.
+    seraphim_render::gpu::hide_software_vulkan();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|e| format!("cannot open a window: {e}"))?;

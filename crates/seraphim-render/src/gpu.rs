@@ -13,6 +13,52 @@
 /// Environment variable naming the GPU to use.
 pub const ENV: &str = "SERAPHIM_GPU";
 
+/// Keep Mesa's software Vulkan driver (lavapipe) out of the process when a
+/// hardware Vulkan GPU exists.
+///
+/// Choosing an adapter makes the Vulkan loader start every installed
+/// driver, and lavapipe loads all of LLVM to do so: about 25 MB of memory
+/// and some milliseconds of startup, for an adapter that is never picked
+/// over real hardware. This hides it with the loader's own
+/// `VK_LOADER_DRIVERS_DISABLE`, but only after checking that a hardware
+/// adapter is there without it; otherwise everything stays as it was, so a
+/// machine without a GPU driver still renders with lavapipe.
+///
+/// Does nothing when the user steers drivers or adapters themselves
+/// (`VK_LOADER_DRIVERS_SELECT`/`_DISABLE`, `VK_ICD_FILENAMES`,
+/// `VK_DRIVER_FILES`, `VK_ADD_DRIVER_FILES`, `WGPU_BACKEND`,
+/// `SERAPHIM_GPU`). Returns whether lavapipe was hidden.
+///
+/// Must run before the process starts any other thread: it changes the
+/// environment, which isn't safe while other threads may read it.
+pub fn hide_software_vulkan() -> bool {
+    const VAR: &str = "VK_LOADER_DRIVERS_DISABLE";
+    let steered = [
+        "VK_LOADER_DRIVERS_SELECT",
+        VAR,
+        "VK_ICD_FILENAMES",
+        "VK_DRIVER_FILES",
+        "VK_ADD_DRIVER_FILES",
+        "WGPU_BACKEND",
+        ENV,
+    ]
+    .iter()
+    .any(|v| std::env::var_os(v).is_some());
+    if steered || !cfg!(target_os = "linux") {
+        return false;
+    }
+    std::env::set_var(VAR, "*lvp*");
+    let instance = headless_instance(wgpu::Backends::VULKAN);
+    let hardware = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+        .iter()
+        .any(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+    drop(instance);
+    if !hardware {
+        std::env::remove_var(VAR);
+    }
+    hardware
+}
+
 /// `SERAPHIM_GPU`, if set.
 pub fn from_env() -> Option<String> {
     std::env::var(ENV).ok().filter(|v| !v.trim().is_empty())
