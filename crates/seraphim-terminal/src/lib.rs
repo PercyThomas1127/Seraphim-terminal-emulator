@@ -30,7 +30,7 @@ mod selection;
 mod sixel;
 mod state;
 
-pub use cell::{Attrs, Cell, Color, Flags};
+pub use cell::{Attrs, Cell, Color, Extra, Flags};
 pub use grid::{Grid, Row};
 pub use selection::{Point, Selection, SelectionKind, SelectionRange, WORD_SEPARATORS};
 pub use state::{
@@ -144,6 +144,30 @@ impl Terminal {
     /// Working directory reported by the shell via OSC 7, if any.
     pub fn cwd(&self) -> Option<&str> {
         self.state.cwd.as_deref()
+    }
+
+    /// The underline color of cells with `attrs` (SGR 58).
+    pub fn underline_color(&self, attrs: &Attrs) -> Color {
+        self.state.extras.get(attrs.extra).0
+    }
+
+    /// The hyperlink id of cells with `attrs` (0: none); resolve it with
+    /// [`Terminal::hyperlink`].
+    pub fn link(&self, attrs: &Attrs) -> u32 {
+        self.state.extras.get(attrs.extra).1
+    }
+
+    /// Changes when [`Extra`] indexes are renumbered (rarely): cells kept
+    /// from before (e.g. in a renderer's cache) must be read again.
+    pub fn extras_generation(&self) -> u64 {
+        self.state.extras.generation
+    }
+
+    /// Free the memory of blank cells past the content of up to `max`
+    /// scrollback rows (cheap; meant for idle time, a batch at a time).
+    /// Returns whether rows are left to trim. Changes nothing shown.
+    pub fn trim_scrollback(&mut self, max: usize) -> bool {
+        self.state.trim_scrollback(max)
     }
 
     pub fn hyperlink(&self, id: u32) -> Option<&Hyperlink> {

@@ -241,6 +241,18 @@ impl Session {
     /// # Panics
     /// If this thread already holds this session's terminal. The mutex is
     /// not re-entrant, so that would otherwise deadlock silently.
+    /// Trim a batch of scrollback rows (see
+    /// [`Terminal::trim_scrollback`]) if the terminal is free right now;
+    /// never waits for it, and changes nothing shown (no redraw). Returns
+    /// whether rows are left to trim (or the terminal was busy).
+    pub fn trim_scrollback(&self, max: usize) -> bool {
+        match self.terminal.try_lock() {
+            Ok(mut t) => t.trim_scrollback(max),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+        }
+    }
+
     pub fn terminal(&self) -> TerminalGuard<'_> {
         let key = Arc::as_ptr(&self.terminal) as usize;
         HELD.with(|h| {

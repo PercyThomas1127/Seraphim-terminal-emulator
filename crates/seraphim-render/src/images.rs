@@ -439,7 +439,7 @@ fn placeholder_cells(term: &Terminal) -> Vec<PlaceholderCell> {
             if let Some(Some(high)) = vals.get(2) {
                 image |= high << 24;
             }
-            let placement = color_id(cell.attrs.underline_color);
+            let placement = color_id(term.underline_color(&cell.attrs));
             let continues = |p: &PlaceholderCell| p.image == image && p.placement == placement;
             let (prow, pcol) = match prev.filter(continues) {
                 Some(p) => (Some(p.row), Some(p.col + 1)),

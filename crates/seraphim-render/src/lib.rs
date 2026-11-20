@@ -143,7 +143,7 @@ pub struct Renderer {
     /// cursor on it changed.
     rows_cache: Vec<RowCache>,
     /// Cell size, padding and columns the cache was built for.
-    cache_key: Option<[u32; 4]>,
+    cache_key: Option<[u32; 5]>,
     /// The instances the GPU buffer holds.
     uploaded: Vec<Instance>,
     /// What the selected slot's instances were last prepared from; see
@@ -182,7 +182,7 @@ struct Slot {
     theme: Theme,
     applied_overrides: seraphim_terminal::palette::ColorOverrides,
     rows_cache: Vec<RowCache>,
-    cache_key: Option<[u32; 4]>,
+    cache_key: Option<[u32; 5]>,
     uploaded: Vec<Instance>,
     stamp: Option<Stamp>,
     plain: bool,
@@ -800,7 +800,14 @@ impl Renderer {
         let (cw, ch) = (m.width, m.height);
         let pad = view.padding.round();
         let (rows, cols) = (term.rows(), term.cols());
-        let key = [cw.to_bits(), ch.to_bits(), pad.to_bits(), cols as u32];
+        // Cached rows hold extras indexes: renumbering them invalidates.
+        let key = [
+            cw.to_bits(),
+            ch.to_bits(),
+            pad.to_bits(),
+            cols as u32,
+            term.extras_generation() as u32,
+        ];
         if self.cache_key != Some(key) {
             self.rows_cache.clear();
             self.cache_key = Some(key);
@@ -846,9 +853,9 @@ impl Renderer {
         let mut shift: isize = 0;
         for r in 0..rows {
             let row = term.visible_row(r);
-            let n = row.cells.len().min(cols);
+            // Every column: a trimmed scrollback row may be shorter.
             let mut sel: Vec<bool> = if selection.is_some() {
-                (0..n).map(|c| selected(r, c)).collect()
+                (0..cols).map(|c| selected(r, c)).collect()
             } else {
                 Vec::new()
             };
@@ -1035,8 +1042,12 @@ impl Renderer {
         let row = term.visible_row(r);
         let y = pad + r as f32 * ch;
         let mut run: Option<(usize, Rgb, bool)> = None;
-        let n = row.cells.len().min(cols);
-        for (c, cell) in row.cells[..n].iter().enumerate() {
+        // Every column: cells past the end of a trimmed scrollback row are
+        // blank, and may be selected.
+        let blank = seraphim_terminal::Cell::default();
+        let n = cols;
+        for c in 0..n {
+            let cell = row.cells.get(c).unwrap_or(&blank);
             let sel = selected(r, c);
             let (_, bg) = self.colors(&cell.attrs, sel);
             match (run, bg) {
@@ -1105,9 +1116,9 @@ impl Renderer {
                     self.push_cluster(queue, &text, style, x, y, width, fg)
                 } else if is_private_use(cell.ch) {
                     // Nerd Font icons may spill into a following blank.
-                    let next_blank = c + 1 < n
-                        && row.cells[c + 1].ch == ' '
-                        && !row.cells[c + 1].is_wide_spacer()
+                    // (Past the end of a trimmed scrollback row is blank.)
+                    let next_blank = c + 1 < cols
+                        && row.cells.get(c + 1).is_none_or(|n| n.ch == ' ' && !n.is_wide_spacer())
                         && row.combining(c + 1).is_empty();
                     // Powerline separators (U+E0A0-E0D7) must stay one
                     // cell wide so segment edges meet their backgrounds.
@@ -1126,7 +1137,7 @@ impl Renderer {
             }
             let stroke = m.stroke;
             if flags.intersects(Flags::ALL_UNDERLINES) {
-                let uc = self.theme.underline_color(&cell.attrs, fg);
+                let uc = self.theme.underline_color(term.underline_color(&cell.attrs), fg);
                 let uy = y + m.underline_y;
                 // Patterns are aligned to absolute x so they continue
                 // seamlessly across cells.

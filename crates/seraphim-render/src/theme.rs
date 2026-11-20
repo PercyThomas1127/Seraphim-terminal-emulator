@@ -126,8 +126,10 @@ impl Theme {
         (fg, bg)
     }
 
-    pub fn underline_color(&self, a: &Attrs, fg: Rgb) -> Rgb {
-        match a.underline_color {
+    /// `underline` (from [`seraphim_terminal::Terminal::underline_color`])
+    /// resolved, or the text color `fg` by default.
+    pub fn underline_color(&self, underline: Color, fg: Rgb) -> Rgb {
+        match underline {
             Color::Default => fg,
             c => self.resolve(c, fg, false),
         }

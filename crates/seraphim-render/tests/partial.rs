@@ -78,3 +78,34 @@ fn unchanged_rows_are_reused() {
         h.renderer.stats().rows_rebuilt
     );
 }
+
+#[test]
+fn trimmed_history_draws_the_same() {
+    let Ok(fonts) = Fonts::new(&FontConfig { family: None, size_px: 14.0 }) else { return };
+    let Ok(mut h) = Headless::new(fonts, Theme::default()) else { return };
+    let make = || {
+        let mut t = Terminal::with_scrollback(40, 8, 100);
+        // Short lines, a colored fill, an icon at the end of a line (it
+        // spills into the blank after it), a link with an underline color.
+        t.advance(b"short\r\n\x1b[42mgreen fill\r\n\x1b[0micon \xee\x9c\x82\r\n");
+        t.advance(b"\x1b[4;58;5;1m\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\\x1b[0m\r\n");
+        for i in 0..20 {
+            t.advance(format!("row {i}\r\n").as_bytes());
+        }
+        // The top of the history in view, and selected across lines.
+        let first = -(t.scrollback().len() as i64);
+        t.scroll_display(-first);
+        t.start_selection(SelectionKind::Simple, Point::new(first, 2));
+        t.update_selection(Point::new(first + 5, 30));
+        t
+    };
+    let (plain, mut trimmed) = (make(), make());
+    while trimmed.trim_scrollback(4) {}
+    assert!(trimmed.scrollback().iter().any(|r| r.cells.len() < 40));
+    let (w, ht) = h.size_for(&plain, 3.0);
+    let view = View { width: w, height: ht, padding: 3.0, focused: true, cursor_on: true };
+    let rect = [0.0, 0.0, w as f32, ht as f32];
+    let a = h.render_panes(w, ht, &[(0, &plain, view, rect)]);
+    let b = h.render_panes(w, ht, &[(1, &trimmed, view, rect)]);
+    assert!(a.rgba == b.rgba, "trimmed history draws differently");
+}
