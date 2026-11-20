@@ -168,6 +168,38 @@ pub struct CellMetrics {
     pub strike_y: f32,
 }
 
+/// Font files read into memory, shared by every [`Fonts`] in the process
+/// (the terminal and overlay renderers, zoom rebuilds, a face used twice as
+/// regular and synthetic bold) and freed when none uses them any more.
+/// Files are read rather than memory-mapped: a font file overwritten in
+/// place while mapped would crash the process.
+static FILE_DATA: Mutex<Option<HashMap<std::path::PathBuf, std::sync::Weak<Vec<u8>>>>> =
+    Mutex::new(None);
+
+/// The data of face `id`'s file (shared through [`FILE_DATA`] when it is a
+/// file) and the face's index in it.
+fn shared_face_data(db: &Database, id: ID) -> Result<(Arc<Vec<u8>>, u32), FontError> {
+    let path = db.face(id).and_then(|f| match &f.source {
+        fontdb::Source::File(p) => Some(p.clone()),
+        _ => None,
+    });
+    let read = || {
+        db.with_face_data(id, |data, index| (Arc::new(data.to_vec()), index))
+            .ok_or_else(|| FontError("could not read font data".into()))
+    };
+    let Some(path) = path else { return read() };
+    let index = db.face(id).map_or(0, |f| f.index);
+    let mut cache = FILE_DATA.lock().unwrap_or_else(|e| e.into_inner());
+    let files = cache.get_or_insert_with(HashMap::new);
+    if let Some(data) = files.get(&path).and_then(|w| w.upgrade()) {
+        return Ok((data, index));
+    }
+    let (data, index) = read()?;
+    files.retain(|_, w| w.strong_count() > 0);
+    files.insert(path, Arc::downgrade(&data));
+    Ok((data, index))
+}
+
 #[derive(Clone)]
 enum FaceData {
     /// Read from a system font file.
@@ -416,18 +448,11 @@ impl Fonts {
                 return Ok(i);
             }
         }
-        let (data, index) = db
-            .with_face_data(id, |data, index| (data.to_vec(), index))
-            .ok_or_else(|| FontError("could not read font data".into()))?;
+        let (data, index) = shared_face_data(db, id)?;
         let font = FontRef::from_index(&data, index as usize)
             .ok_or_else(|| FontError("unsupported font file".into()))?;
         let (offset, key) = (font.offset, font.key);
-        self.faces.push(Face {
-            data: FaceData::Owned(Arc::new(data)),
-            offset,
-            key,
-            synthetic_bold,
-        });
+        self.faces.push(Face { data: FaceData::Owned(data), offset, key, synthetic_bold });
         let i = (self.faces.len() - 1) as u16;
         if !synthetic_bold {
             self.face_ids.insert(id, i);
@@ -768,6 +793,25 @@ mod tests {
             return;
         };
         assert_eq!(fonts(Some(&name)).family_name, name);
+    }
+
+    #[test]
+    fn font_files_are_read_once_per_process() {
+        let db = system_fonts().wait().clone();
+        let Some(name) = db
+            .faces()
+            .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+            .find(|n| n != BUILTIN_FAMILY)
+        else {
+            return;
+        };
+        let (a, b) = (fonts(Some(&name)), fonts(Some(&name)));
+        let data = |f: &Fonts| match &f.faces[0].data {
+            FaceData::Owned(d) => Some(d.clone()),
+            FaceData::Builtin(_) => None,
+        };
+        let (Some(da), Some(db)) = (data(&a), data(&b)) else { return };
+        assert!(Arc::ptr_eq(&da, &db), "both Fonts use one copy of {name}");
     }
 
     #[test]
