@@ -620,8 +620,7 @@ impl Active {
             let alert = theme.ansi[9];
             // The window buttons may share the row.
             let buttons = self.buttons_row() == Some(ButtonsRow::Tabs);
-            let tab_cols =
-                if buttons { cols.saturating_sub(crate::decor::BUTTONS) } else { cols };
+            let tab_cols = if buttons { cols.saturating_sub(crate::decor::BUTTONS) } else { cols };
             let (mut bytes, hits) = crate::tabbar::paint(
                 &self.tab_infos(),
                 tab_cols,

@@ -224,8 +224,9 @@ impl Renderer {
         let mask_texture =
             atlas_texture(device, "glyph atlas", ATLAS_SIZE, wgpu::TextureFormat::R8Unorm);
         let mask_view = mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let color_view = atlas_texture(device, "no color glyphs", 1, wgpu::TextureFormat::Rgba8Unorm)
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let color_view =
+            atlas_texture(device, "no color glyphs", 1, wgpu::TextureFormat::Rgba8Unorm)
+                .create_view(&wgpu::TextureViewDescriptor::default());
         // Glyphs are placed on whole pixels at 1:1 scale, so nearest
         // sampling is exact and never blurs text.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -435,8 +436,11 @@ impl Renderer {
         self.color_texture = Some(texture);
         let device = self.device.clone();
         self.bind_group = self.bind_group_for(&device, &self.globals);
-        let groups: Vec<(u64, wgpu::BindGroup)> =
-            self.slots.iter().map(|(&id, s)| (id, self.bind_group_for(&device, &s.globals))).collect();
+        let groups: Vec<(u64, wgpu::BindGroup)> = self
+            .slots
+            .iter()
+            .map(|(&id, s)| (id, self.bind_group_for(&device, &s.globals)))
+            .collect();
         for (id, g) in groups {
             if let Some(s) = self.slots.get_mut(&id) {
                 s.bind_group = g;
@@ -1424,7 +1428,14 @@ impl Renderer {
             },
             wgpu::Extent3d { width: rect.w, height: rect.h, depth_or_array_layers: 1 },
         );
-        Some(Some(CachedGlyph { rect, w, h, left: raster.left, top: raster.top, color: raster.color }))
+        Some(Some(CachedGlyph {
+            rect,
+            w,
+            h,
+            left: raster.left,
+            top: raster.top,
+            color: raster.color,
+        }))
     }
 }
 
@@ -1464,7 +1475,10 @@ fn cells_bind_group(
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mask) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(nearest) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(linear) },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(color) },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(color),
+            },
         ],
     })
 }
@@ -1509,7 +1523,13 @@ fn shrink_rgba(src: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
                 }
             }
             let alpha = acc[3] / area.max(f32::EPSILON);
-            let c = |v: f32| if acc[3] > 0.0 { (v / acc[3]).round().clamp(0.0, 255.0) as u8 } else { 0 };
+            let c = |v: f32| {
+                if acc[3] > 0.0 {
+                    (v / acc[3]).round().clamp(0.0, 255.0) as u8
+                } else {
+                    0
+                }
+            };
             out.extend([c(acc[0]), c(acc[1]), c(acc[2]), alpha.round().clamp(0.0, 255.0) as u8]);
         }
     }
@@ -1532,7 +1552,8 @@ mod tests {
         assert_eq!(shrink_rgba(&src, 3, 1, 2, 1), [30, 30, 30, 255, 150, 150, 150, 255]);
         // Same size: unchanged.
         let src: Vec<u8> = (0..36).collect();
-        let opaque: Vec<u8> = src.iter().enumerate().map(|(i, &v)| if i % 4 == 3 { 255 } else { v }).collect();
+        let opaque: Vec<u8> =
+            src.iter().enumerate().map(|(i, &v)| if i % 4 == 3 { 255 } else { v }).collect();
         assert_eq!(shrink_rgba(&opaque, 3, 3, 3, 3), opaque);
     }
 }
