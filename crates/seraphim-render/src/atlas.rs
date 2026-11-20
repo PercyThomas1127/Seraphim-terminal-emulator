@@ -1,6 +1,10 @@
-//! Shelf-packed glyph atlas backed by one RGBA8 texture.
+//! Shelf-packed glyph atlas: places rectangles in a square texture.
 
+/// Side of the coverage-mask atlas (one byte per texel: 4 MiB).
 pub const ATLAS_SIZE: u32 = 2048;
+/// Side of the color glyph atlas (RGBA: 4 MiB). Color glyphs are no taller
+/// than a cell when uploaded, so this holds about a thousand emoji.
+pub const COLOR_ATLAS_SIZE: u32 = 1024;
 const PAD: u32 = 1;
 
 /// Location of a glyph in the atlas, in texels.
