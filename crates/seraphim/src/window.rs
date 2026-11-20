@@ -87,7 +87,7 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
 }
 
 impl Timing {
-    fn report(&self) {
+    fn report(&self, device: &wgpu::Device) {
         let mut v = self.samples.clone();
         if !v.is_empty() {
             v.sort_by(|a, b| a.total_cmp(b));
@@ -112,6 +112,14 @@ impl Timing {
                 quantile(&d, 0.5),
                 quantile(&d, 0.95),
                 d[d.len() - 1]
+            );
+        }
+        if let Some(r) = device.generate_allocator_report() {
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "seraphim: timing: GPU memory: {:.1} MiB in use, {:.1} MiB reserved from the driver",
+                mib(r.total_allocated_bytes),
+                mib(r.total_reserved_bytes)
             );
         }
     }
@@ -147,10 +155,13 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(80);
 
 /// Renderer slot for pane dividers and dimming.
 const DECOR_SLOT: u64 = u64::MAX;
-/// Overlay slot for the tab bar (slot 0 is the menu bar).
-const TAB_BAR_SLOT: u64 = 1;
+/// Renderer slot for the menu bar, open menus, panels and notices, drawn
+/// over everything else. Pane ids count up from 1, so they never get here.
+const MENU_SLOT: u64 = 1 << 62;
+/// Renderer slot for the tab bar.
+const TAB_BAR_SLOT: u64 = MENU_SLOT + 1;
 /// Seraphim's title bar (`window.decorations = "seraphim"`).
-const TITLE_SLOT: u64 = 2;
+const TITLE_SLOT: u64 = MENU_SLOT + 2;
 use crate::menu::{self, Command as MenuCommand, Hit, MenuBar, MenuKey, Outcome};
 
 #[derive(Clone, Debug)]
@@ -553,8 +564,6 @@ struct Active {
     /// A profile switch or reload requested by a shortcut; applied by `App`,
     /// which owns the configuration.
     pending: Option<Request>,
-    /// Draws the menu bar overlay (a separate text renderer on top).
-    overlay: Renderer,
     menu: MenuBar,
     /// The bar is pinned (reserves a row); otherwise it only appears
     /// while a menu is open.
@@ -598,6 +607,91 @@ struct Active {
 }
 
 impl Active {
+    /// Prepare the title bar, the tab bar and the menu layer (menu bar,
+    /// open menus, panels, notices) for a frame `size` large.
+    fn prepare_overlays(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        let theme = self.renderer.theme().clone();
+        // The tab bar, below the menu bar.
+        if self.tab_bar_visible() {
+            let m = self.renderer.cell_metrics();
+            let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
+            let palette = menu::Palette::from_theme(&theme);
+            let design = crate::tabbar::Design::new(&self.tabs_cfg, &palette);
+            let alert = theme.ansi[9];
+            // The window buttons may share the row.
+            let buttons = self.buttons_row() == Some(ButtonsRow::Tabs);
+            let tab_cols =
+                if buttons { cols.saturating_sub(crate::decor::BUTTONS) } else { cols };
+            let (mut bytes, hits) = crate::tabbar::paint(
+                &self.tab_infos(),
+                tab_cols,
+                alert,
+                self.renaming.as_deref(),
+                &design,
+            );
+            if buttons {
+                let c = self.decor_colors();
+                let max = self.window.is_maximized();
+                bytes.extend(crate::decor::paint_buttons(cols, self.decor_hover, max, &c));
+            }
+            self.tab_hits = hits;
+            let view = View {
+                width: size.width,
+                height: m.height.ceil() as u32,
+                padding: 0.0,
+                focused: true,
+                cursor_on: false,
+            };
+            self.renderer.select_plain(&self.gpu.device, TAB_BAR_SLOT);
+            prepare_bar(&mut self.renderer, &self.gpu, cols, &bytes, view);
+        }
+        // Seraphim's title bar.
+        if self.title_bar_height() > 0 {
+            let m = self.renderer.cell_metrics();
+            let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
+            let title = if self.title.is_empty() { "Seraphim" } else { self.title.as_str() };
+            let c = self.decor_colors();
+            let bytes = crate::decor::paint_title(
+                title,
+                cols,
+                self.focused,
+                self.decor_hover,
+                self.window.is_maximized(),
+                &c,
+            );
+            let view = View {
+                width: size.width,
+                height: self.title_bar_height(),
+                padding: 0.0,
+                focused: true,
+                cursor_on: false,
+            };
+            self.renderer.select_plain(&self.gpu.device, TITLE_SLOT);
+            prepare_bar(&mut self.renderer, &self.gpu, cols, &bytes, view);
+        }
+        if self.overlay_visible() {
+            let (cols, rows, _, _) = self.overlay_grid();
+            let palette = menu::Palette::from_theme(self.renderer.theme());
+            let mut t = seraphim_terminal::Terminal::with_scrollback(cols, rows, 0);
+            self.menu.toast = self.toast.as_ref().map(|t| t.0.clone());
+            t.advance(&self.menu.paint(cols, rows, self.menu_pinned, &palette));
+            if self.buttons_row() == Some(ButtonsRow::Menu) {
+                let c = self.decor_colors();
+                let max = self.window.is_maximized();
+                t.advance(&crate::decor::paint_buttons(cols, self.decor_hover, max, &c));
+            }
+            let view = View {
+                width: size.width,
+                height: size.height,
+                padding: 0.0,
+                focused: true,
+                cursor_on: false,
+            };
+            self.renderer.select_plain(&self.gpu.device, MENU_SLOT);
+            self.renderer.prepare(&self.gpu.device, &self.gpu.queue, &t, view);
+        }
+    }
+
     /// The animation clock runs only while someone can see it.
     fn update_pause(&mut self) {
         let unfocused = !self.focused && !self.visual_cfg.animate_unfocused;
@@ -1013,8 +1107,6 @@ impl Win {
             renderer.set_fonts(self.fonts_for(scale)?);
         }
         renderer.set_cursor_effects(o.cursor_effects());
-        let overlay =
-            Renderer::new(&gpu.device, gpu.config.format, self.fonts_for(scale)?, o.theme.clone());
         let inner = window.inner_size();
         let pad = (o.padding as f64 * scale).round() as f32;
         let bar = if o.menu_bar { renderer.cell_metrics().height.ceil() as u32 } else { 0 };
@@ -1127,7 +1219,6 @@ impl Win {
             last_frame: Instant::now(),
             settings_cache: None,
             pending: None,
-            overlay,
             menu: MenuBar::default(),
             menu_pinned: o.menu_bar,
             decorations: o.decorations.clone(),
@@ -1307,18 +1398,17 @@ impl Win {
     /// Rebuild fonts at the configured size plus zoom, keeping the window.
     fn refresh_fonts(&mut self) {
         let Some(scale) = self.active.as_ref().map(|a| a.scale) else { return };
-        match (self.fonts_for(scale), self.fonts_for(scale)) {
-            (Ok(f), Ok(g)) => {
+        match self.fonts_for(scale) {
+            Ok(f) => {
                 let a = self.active.as_mut().unwrap();
                 a.renderer.set_fonts(f);
-                a.overlay.set_fonts(g);
                 let m = a.renderer.cell_metrics();
                 for p in a.panes.values() {
                     let _ = p.session.set_cell_pixels(m.width, m.height);
                 }
                 self.resize_grid();
             }
-            (Err(e), _) | (_, Err(e)) => eprintln!("seraphim: {e}"),
+            Err(e) => eprintln!("seraphim: {e}"),
         }
     }
 
@@ -1401,7 +1491,6 @@ impl Win {
             self.options.visual.window_opacity < 1.0,
         );
         a.renderer.set_cursor_effects(o.cursor_effects());
-        a.overlay.set_theme(o.theme.clone());
         a.menu.close();
         a.menu_src = (o.menus.clone(), o.config_path.clone(), o.profile.clone());
         let bar_changed = o.menu_bar != self.options.menu_bar && o.menu_bar != a.menu_pinned;
@@ -1525,9 +1614,7 @@ impl Win {
     /// it loaded.
     fn fonts_ready(&mut self) {
         if let Some(a) = &mut self.active {
-            let main = a.renderer.system_fonts_ready();
-            let overlay = a.overlay.system_fonts_ready();
-            if main || overlay {
+            if a.renderer.system_fonts_ready() {
                 a.window.request_redraw();
             }
         }
@@ -1612,6 +1699,11 @@ fn init_gpu(
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("seraphim"),
         required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+        // GPU memory is taken from the driver in blocks, which are memory
+        // used whether filled or not: 64-256 MiB by default, for a window
+        // that needs about 5. Smaller blocks only mean more requests to the
+        // driver when textures are created, never per frame.
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
         ..Default::default()
     }))
     .map_err(|e| e.to_string())?;
@@ -1918,7 +2010,7 @@ impl Active {
 
     fn tab_bar_height(&self) -> u32 {
         if self.tab_bar_visible() {
-            self.overlay.cell_metrics().height.ceil() as u32
+            self.renderer.cell_metrics().height.ceil() as u32
         } else {
             0
         }
@@ -1942,7 +2034,7 @@ impl Active {
 
     fn title_bar_height(&self) -> u32 {
         match self.buttons_row() {
-            Some(ButtonsRow::Title) => self.overlay.cell_metrics().height.ceil() as u32,
+            Some(ButtonsRow::Title) => self.renderer.cell_metrics().height.ceil() as u32,
             _ => 0,
         }
     }
@@ -2635,7 +2727,7 @@ impl Active {
 
     fn tab_bar_click(&mut self, button: WButton) {
         use crate::tabbar::Hit;
-        let col = (self.mouse.pos.0 / self.overlay.cell_metrics().width as f64).max(0.0) as usize;
+        let col = (self.mouse.pos.0 / self.renderer.cell_metrics().width as f64).max(0.0) as usize;
         match (self.tab_hits.at(col), button) {
             (Hit::Tab(i), WButton::Left) => {
                 self.tab_drag = Some(i);
@@ -3325,7 +3417,7 @@ impl Active {
 
     /// Overlay grid size and the overlay cell under the pointer.
     fn overlay_grid(&self) -> (usize, usize, usize, usize) {
-        let m = self.overlay.cell_metrics();
+        let m = self.renderer.cell_metrics();
         let size = self.window.inner_size();
         let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
         let rows = (size.height as f32 / m.height).floor().max(1.0) as usize;
@@ -3660,7 +3752,7 @@ impl Active {
                 return;
             }
             let col =
-                (self.mouse.pos.0 / self.overlay.cell_metrics().width as f64).max(0.0) as usize;
+                (self.mouse.pos.0 / self.renderer.cell_metrics().width as f64).max(0.0) as usize;
             if let crate::tabbar::Hit::Tab(to) | crate::tabbar::Hit::Close(to) =
                 self.tab_hits.at(col)
             {
@@ -4220,9 +4312,8 @@ impl Win {
                     family: self.options.font_family.clone(),
                     size_px: font_px(self.options.font_size + self.zoom, scale_factor),
                 };
-                if let (Ok(f), Ok(g)) = (Fonts::new(&config), Fonts::new(&config)) {
+                if let Ok(f) = Fonts::new(&config) {
                     a.renderer.set_fonts(f);
-                    a.overlay.set_fonts(g);
                     let m = a.renderer.cell_metrics();
                     for p in a.panes.values() {
                         let _ = p.session.set_cell_pixels(m.width, m.height);
@@ -4326,6 +4417,9 @@ impl Win {
                         a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
                         a.renderer.mark_prepared(version, view);
                     }
+                    // Bars and menus share the glyph atlas: a reset there
+                    // also sends the panes round again.
+                    a.prepare_overlays(size);
                     if a.renderer.epoch() == epoch {
                         break;
                     }
@@ -4396,86 +4490,6 @@ impl Win {
                 }
                 a.renderer.select(&a.gpu.device, focus);
                 a.drawn = rects;
-                // The tab bar, below the menu bar.
-                if a.tab_bar_visible() {
-                    let m = a.overlay.cell_metrics();
-                    let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
-                    let palette = menu::Palette::from_theme(&theme);
-                    let design = crate::tabbar::Design::new(&a.tabs_cfg, &palette);
-                    let alert = theme.ansi[9];
-                    // The window buttons may share the row.
-                    let buttons = a.buttons_row() == Some(ButtonsRow::Tabs);
-                    let tab_cols =
-                        if buttons { cols.saturating_sub(crate::decor::BUTTONS) } else { cols };
-                    let (mut bytes, hits) = crate::tabbar::paint(
-                        &a.tab_infos(),
-                        tab_cols,
-                        alert,
-                        a.renaming.as_deref(),
-                        &design,
-                    );
-                    if buttons {
-                        let c = a.decor_colors();
-                        let max = a.window.is_maximized();
-                        bytes.extend(crate::decor::paint_buttons(cols, a.decor_hover, max, &c));
-                    }
-                    a.tab_hits = hits;
-                    let view = View {
-                        width: size.width,
-                        height: m.height.ceil() as u32,
-                        padding: 0.0,
-                        focused: true,
-                        cursor_on: false,
-                    };
-                    a.overlay.select(&a.gpu.device, TAB_BAR_SLOT);
-                    prepare_bar(&mut a.overlay, &a.gpu, cols, &bytes, view);
-                    a.overlay.select(&a.gpu.device, 0);
-                }
-                // Seraphim's title bar.
-                if a.title_bar_height() > 0 {
-                    let m = a.overlay.cell_metrics();
-                    let cols = (size.width as f32 / m.width).floor().max(1.0) as usize;
-                    let title = if a.title.is_empty() { "Seraphim" } else { a.title.as_str() };
-                    let c = a.decor_colors();
-                    let bytes = crate::decor::paint_title(
-                        title,
-                        cols,
-                        a.focused,
-                        a.decor_hover,
-                        a.window.is_maximized(),
-                        &c,
-                    );
-                    let view = View {
-                        width: size.width,
-                        height: a.title_bar_height(),
-                        padding: 0.0,
-                        focused: true,
-                        cursor_on: false,
-                    };
-                    a.overlay.select(&a.gpu.device, TITLE_SLOT);
-                    prepare_bar(&mut a.overlay, &a.gpu, cols, &bytes, view);
-                    a.overlay.select(&a.gpu.device, 0);
-                }
-                if a.overlay_visible() {
-                    let (cols, rows, _, _) = a.overlay_grid();
-                    let palette = menu::Palette::from_theme(a.renderer.theme());
-                    let mut t = seraphim_terminal::Terminal::with_scrollback(cols, rows, 0);
-                    a.menu.toast = a.toast.as_ref().map(|t| t.0.clone());
-                    t.advance(&a.menu.paint(cols, rows, a.menu_pinned, &palette));
-                    if a.buttons_row() == Some(ButtonsRow::Menu) {
-                        let c = a.decor_colors();
-                        let max = a.window.is_maximized();
-                        t.advance(&crate::decor::paint_buttons(cols, a.decor_hover, max, &c));
-                    }
-                    let view = View {
-                        width: size.width,
-                        height: size.height,
-                        padding: 0.0,
-                        focused: true,
-                        cursor_on: false,
-                    };
-                    a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
-                }
                 a.last_frame = Instant::now();
                 a.visual_due = None;
                 draw(a);
@@ -4699,8 +4713,10 @@ impl Win {
     }
 
     fn exiting(&mut self) {
-        if let Some(t) = self.active.as_ref().and_then(|a| a.timing.as_ref()) {
-            t.report();
+        if let Some(a) = &self.active {
+            if let Some(t) = &a.timing {
+                t.report(&a.gpu.device);
+            }
         }
         // Dropping the session hangs up the shell (SIGHUP to its group).
         self.active = None;
@@ -4784,24 +4800,25 @@ fn draw(a: &mut Active) {
         let tb = a.title_bar_height() as f32;
         if tb > 0.0 && tb <= h as f32 {
             pass.set_viewport(0.0, 0.0, w as f32, tb, 0.0, 1.0);
-            a.overlay.select(&a.gpu.device, TITLE_SLOT);
-            a.overlay.render(&mut pass);
-            a.overlay.select(&a.gpu.device, 0);
+            a.renderer.select(&a.gpu.device, TITLE_SLOT);
+            a.renderer.render(&mut pass);
         }
         if a.tab_bar_visible() {
             let top = a.tab_bar_top() as f32;
             let th = a.tab_bar_height() as f32;
             if top + th <= h as f32 {
                 pass.set_viewport(0.0, top, w as f32, th, 0.0, 1.0);
-                a.overlay.select(&a.gpu.device, TAB_BAR_SLOT);
-                a.overlay.render(&mut pass);
-                a.overlay.select(&a.gpu.device, 0);
+                a.renderer.select(&a.gpu.device, TAB_BAR_SLOT);
+                a.renderer.render(&mut pass);
             }
         }
         if a.overlay_visible() {
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
-            a.overlay.render(&mut pass);
+            a.renderer.select(&a.gpu.device, MENU_SLOT);
+            a.renderer.render(&mut pass);
         }
+        // Typing ripples go to the selected slot.
+        a.renderer.select(&a.gpu.device, focus);
     }
     a.gpu.queue.submit([encoder.finish()]);
     a.window.pre_present_notify();

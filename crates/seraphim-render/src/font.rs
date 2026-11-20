@@ -283,8 +283,9 @@ pub struct RasterGlyph {
     pub height: u32,
     /// True for color (emoji) bitmaps; false for coverage masks.
     pub color: bool,
-    /// RGBA8; masks are stored as white with coverage in alpha.
-    pub rgba: Vec<u8>,
+    /// Masks: one coverage byte per pixel. Color glyphs: RGBA8, straight
+    /// alpha.
+    pub pixels: Vec<u8>,
 }
 
 /// Identifies a glyph in a specific face.
@@ -731,19 +732,14 @@ impl Fonts {
                 width: 0,
                 height: 0,
                 color: false,
-                rgba: Vec::new(),
+                pixels: Vec::new(),
             });
         }
-        let (color, rgba) = match image.content {
-            Content::Mask => (false, image.data.iter().flat_map(|&a| [255, 255, 255, a]).collect()),
-            Content::SubpixelMask => (
-                false,
-                image
-                    .data
-                    .chunks_exact(4)
-                    .flat_map(|p| [255, 255, 255, p[0].max(p[1]).max(p[2])])
-                    .collect(),
-            ),
+        let (color, pixels) = match image.content {
+            Content::Mask => (false, image.data),
+            Content::SubpixelMask => {
+                (false, image.data.chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2])).collect())
+            }
             Content::Color => (true, image.data),
         };
         Some(RasterGlyph {
@@ -752,7 +748,7 @@ impl Fonts {
             width: w,
             height: h,
             color,
-            rgba,
+            pixels,
         })
     }
 }

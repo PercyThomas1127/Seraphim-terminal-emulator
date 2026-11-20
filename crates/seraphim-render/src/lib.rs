@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use seraphim_terminal::{Attrs, CursorShape, Flags, Point, SelectionRange, Terminal};
 
-use atlas::{Atlas, AtlasRect, ATLAS_SIZE};
+use atlas::{Atlas, AtlasRect, ATLAS_SIZE, COLOR_ATLAS_SIZE};
 use font::{is_emoji_cluster, is_ignorable, is_private_use, GlyphKey, ShapedGlyph};
 pub use font::{
     load_system_fonts_in_background, rescan_system_fonts, CellMetrics, FontConfig, FontError,
@@ -63,6 +63,8 @@ const KIND_RING: u32 = 4;
 struct Globals {
     screen: [f32; 2],
     atlas: [f32; 2],
+    color_atlas: [f32; 2],
+    _pad: [f32; 2],
 }
 unsafe impl bytemuck::Zeroable for Globals {}
 unsafe impl bytemuck::Pod for Globals {}
@@ -82,7 +84,12 @@ pub struct View {
 
 #[derive(Clone, Copy)]
 struct CachedGlyph {
+    /// Where the pixels are (in the mask atlas, or the color atlas).
     rect: AtlasRect,
+    /// Size of the glyph as rasterized, which placement uses. Larger than
+    /// `rect` for color bitmaps shrunk before upload.
+    w: u32,
+    h: u32,
     left: i32,
     top: i32,
     color: bool,
@@ -104,11 +111,17 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     globals: wgpu::Buffer,
-    atlas_texture: wgpu::Texture,
+    /// Coverage masks (one byte per texel).
+    mask_texture: wgpu::Texture,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     instance_count: u32,
     atlas: Atlas,
+    /// Color glyphs (emoji), created when the first one is drawn; until
+    /// then a 1x1 placeholder is bound in its place.
+    color_texture: Option<wgpu::Texture>,
+    color_atlas: Atlas,
+    device: wgpu::Device,
     glyphs: HashMap<GlyphKey, Option<CachedGlyph>>,
     /// Shaping results per (face, cluster text).
     shaped: HashMap<(u16, String), Vec<ShapedGlyph>>,
@@ -136,10 +149,14 @@ pub struct Renderer {
     /// What the selected slot's instances were last prepared from; see
     /// [`Renderer::is_prepared`].
     stamp: Option<Stamp>,
+    /// The selected slot draws without cursor and selection effects (see
+    /// [`Renderer::select_plain`]).
+    plain: bool,
     /// What new slots need.
     format: wgpu::TextureFormat,
     layout: wgpu::BindGroupLayout,
-    atlas_view: wgpu::TextureView,
+    mask_view: wgpu::TextureView,
+    color_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
     /// Bumped whenever prepared instances may no longer match what a fresh
@@ -168,6 +185,7 @@ struct Slot {
     cache_key: Option<[u32; 4]>,
     uploaded: Vec<Instance>,
     stamp: Option<Stamp>,
+    plain: bool,
 }
 
 /// A caller's content version, the view, and the renderer epoch that a
@@ -203,21 +221,11 @@ impl Renderer {
             label: Some("seraphim cells"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph atlas"),
-            size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_texture =
+            atlas_texture(device, "glyph atlas", ATLAS_SIZE, wgpu::TextureFormat::R8Unorm);
+        let mask_view = mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_view = atlas_texture(device, "no color glyphs", 1, wgpu::TextureFormat::Rgba8Unorm)
+            .create_view(&wgpu::TextureViewDescriptor::default());
         // Glyphs are placed on whole pixels at 1:1 scale, so nearest
         // sampling is exact and never blurs text.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -273,7 +281,7 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                // The atlas once more, for the linear sampler (see shader.wgsl).
+                // Color glyphs, read through the linear sampler.
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -286,29 +294,13 @@ impl Renderer {
                 },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cells"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&linear_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-            ],
-        });
+        let bind_group = cells_bind_group(
+            device,
+            &layout,
+            &globals,
+            [&mask_view, &color_view],
+            [&sampler, &linear_sampler],
+        );
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cells"),
             bind_group_layouts: &[Some(&layout)],
@@ -354,11 +346,14 @@ impl Renderer {
             pipeline,
             bind_group,
             globals,
-            atlas_texture,
+            mask_texture,
             instance_buffer,
             instance_capacity,
             instance_count: 0,
             atlas: Atlas::new(ATLAS_SIZE),
+            color_texture: None,
+            color_atlas: Atlas::new(COLOR_ATLAS_SIZE),
+            device: device.clone(),
             glyphs: HashMap::new(),
             shaped: HashMap::new(),
             fonts,
@@ -374,9 +369,11 @@ impl Renderer {
             cache_key: None,
             uploaded: Vec::new(),
             stamp: None,
+            plain: false,
             format,
             layout,
-            atlas_view,
+            mask_view,
+            color_view,
             sampler,
             linear_sampler,
             epoch: 0,
@@ -392,29 +389,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cells"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self.atlas_view),
-                },
-            ],
-        });
+        let bind_group = self.bind_group_for(device, &globals);
         let images = images::Images::new(device, self.format, &globals);
         let mut fx = cursorfx::Fx::default();
         fx.cfg = self.fx.cfg;
@@ -434,6 +409,38 @@ impl Renderer {
             cache_key: None,
             uploaded: Vec::new(),
             stamp: None,
+            plain: false,
+        }
+    }
+
+    fn bind_group_for(&self, device: &wgpu::Device, globals: &wgpu::Buffer) -> wgpu::BindGroup {
+        cells_bind_group(
+            device,
+            &self.layout,
+            globals,
+            [&self.mask_view, &self.color_view],
+            [&self.sampler, &self.linear_sampler],
+        )
+    }
+
+    /// Create the color glyph atlas and bind it in every slot.
+    fn create_color_atlas(&mut self) {
+        let texture = atlas_texture(
+            &self.device,
+            "color glyph atlas",
+            COLOR_ATLAS_SIZE,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        self.color_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.color_texture = Some(texture);
+        let device = self.device.clone();
+        self.bind_group = self.bind_group_for(&device, &self.globals);
+        let groups: Vec<(u64, wgpu::BindGroup)> =
+            self.slots.iter().map(|(&id, s)| (id, self.bind_group_for(&device, &s.globals))).collect();
+        for (id, g) in groups {
+            if let Some(s) = self.slots.get_mut(&id) {
+                s.bind_group = g;
+            }
         }
     }
 
@@ -462,6 +469,7 @@ impl Renderer {
         std::mem::swap(&mut self.cache_key, &mut slot.cache_key);
         std::mem::swap(&mut self.uploaded, &mut slot.uploaded);
         std::mem::swap(&mut self.stamp, &mut slot.stamp);
+        std::mem::swap(&mut self.plain, &mut slot.plain);
     }
 
     /// Draw state for pane `id` from now on (created on first use). A
@@ -469,12 +477,30 @@ impl Renderer {
     /// [`Renderer::prepare`] and [`Renderer::render`]; panes share the
     /// glyph atlas and fonts. Slot 0 exists from the start.
     pub fn select(&mut self, device: &wgpu::Device, id: u64) {
+        self.select_slot(device, id, false);
+    }
+
+    /// Like [`Renderer::select`], for a slot that never draws cursor or
+    /// selection effects, whatever [`Renderer::set_cursor_effects`] sets
+    /// (menus, bars and other interface text).
+    pub fn select_plain(&mut self, device: &wgpu::Device, id: u64) {
+        self.select_slot(device, id, true);
+    }
+
+    fn select_slot(&mut self, device: &wgpu::Device, id: u64, plain: bool) {
         if id == self.current {
             return;
         }
         let mut target = match self.slots.remove(&id) {
             Some(s) => s,
-            None => self.new_slot(device),
+            None => {
+                let mut s = self.new_slot(device);
+                if plain {
+                    s.fx.cfg = Default::default();
+                    s.plain = true;
+                }
+                s
+            }
         };
         self.swap_slot(&mut target);
         // `target` now holds the previously selected slot's state.
@@ -504,8 +530,10 @@ impl Renderer {
     /// Cursor and selection effects (none by default).
     pub fn set_cursor_effects(&mut self, fx: cursorfx::CursorEffects) {
         self.epoch += 1;
-        self.fx.cfg = fx;
-        for s in self.slots.values_mut() {
+        if !self.plain {
+            self.fx.cfg = fx;
+        }
+        for s in self.slots.values_mut().filter(|s| !s.plain) {
             s.fx.cfg = fx;
         }
     }
@@ -582,6 +610,7 @@ impl Renderer {
         self.glyphs.clear();
         self.shaped.clear();
         self.atlas.clear();
+        self.color_atlas.clear();
         self.clear_row_caches();
     }
 
@@ -663,6 +692,8 @@ impl Renderer {
         let globals = Globals {
             screen: [view.width.max(1) as f32, view.height.max(1) as f32],
             atlas: [ATLAS_SIZE as f32, ATLAS_SIZE as f32],
+            color_atlas: [COLOR_ATLAS_SIZE as f32, COLOR_ATLAS_SIZE as f32],
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         let m = self.fonts.metrics();
@@ -698,6 +729,8 @@ impl Renderer {
         let globals = Globals {
             screen: [width.max(1) as f32, height.max(1) as f32],
             atlas: [ATLAS_SIZE as f32, ATLAS_SIZE as f32],
+            color_atlas: [COLOR_ATLAS_SIZE as f32, COLOR_ATLAS_SIZE as f32],
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         self.instance_count = self.instances.len() as u32;
@@ -739,6 +772,7 @@ impl Renderer {
             }
             self.glyphs.clear();
             self.atlas.clear();
+            self.color_atlas.clear();
             // Cached rows point into the old atlas (in every pane).
             self.clear_row_caches();
             self.stats.atlas_resets += 1;
@@ -1210,7 +1244,7 @@ impl Renderer {
         let Ok(glyph) = self.cached(queue, key) else { return false };
         let Some(g) = glyph else { return true };
         let m = self.fonts.metrics();
-        let (mut w, mut h) = (g.rect.w as f32, g.rect.h as f32);
+        let (mut w, mut h) = (g.w as f32, g.h as f32);
         let (mut gx, mut gy) =
             ((x + dx).round() + g.left as f32, (y + m.baseline - dy).round() - g.top as f32);
         if g.color && (h > m.height || w > cell_w) {
@@ -1297,7 +1331,7 @@ impl Renderer {
         let Ok(base) = self.cached(queue, key) else { return false };
         let Some(b) = base else { return true };
         let m = self.fonts.metrics();
-        let (w, h) = (b.rect.w as f32, b.rect.h as f32);
+        let (w, h) = (b.w as f32, b.h as f32);
         // Powerline glyphs fill the full cell height (no margin) so they join
         // seamlessly with the rows of a segmented prompt.
         let powerline = matches!(ch as u32, 0xE0A0..=0xE0D7);
@@ -1319,7 +1353,7 @@ impl Renderer {
         };
         let Ok(glyph) = self.cached(queue, key) else { return false };
         let Some(g) = glyph else { return true };
-        let (w, h) = (g.rect.w as f32, g.rect.h as f32);
+        let (w, h) = (g.w as f32, g.h as f32);
         let rect = if separator {
             [x, y, box_w, m.height]
         } else {
@@ -1327,7 +1361,7 @@ impl Renderer {
         };
         self.instances.push(Instance {
             rect,
-            uv: [g.rect.x as f32, g.rect.y as f32, w, h],
+            uv: [g.rect.x as f32, g.rect.y as f32, g.rect.w as f32, g.rect.h as f32],
             color: to_f32(fg, 1.0),
             kind: if g.color { KIND_COLOR } else { KIND_MASK },
             params: [0.0; 3],
@@ -1343,22 +1377,162 @@ impl Renderer {
         if raster.width == 0 || raster.height == 0 {
             return Some(None);
         }
-        let rect = self.atlas.allocate(raster.width, raster.height)?;
+        let (w, h) = (raster.width, raster.height);
+        let (rect, texture, bytes_per_pixel, pixels);
+        if raster.color {
+            // Color glyphs taller than the cell are drawn fitted to it (see
+            // push_key). swash already scales bitmap strikes to the font
+            // size, but a glyph that still comes out too tall is shrunk to
+            // the cell height here, averaging every source pixel: the GPU
+            // then draws it at about 1:1, and it takes no more of the
+            // (smaller) color atlas than it needs.
+            let fit = self.fonts.metrics().height / h as f32;
+            let (sw, sh) = if fit < 1.0 {
+                (((w as f32 * fit).round() as u32).max(1), ((h as f32 * fit).round() as u32).max(1))
+            } else {
+                (w, h)
+            };
+            pixels = if (sw, sh) != (w, h) {
+                std::borrow::Cow::Owned(shrink_rgba(&raster.pixels, w, h, sw, sh))
+            } else {
+                std::borrow::Cow::Borrowed(&raster.pixels[..])
+            };
+            if self.color_texture.is_none() {
+                self.create_color_atlas();
+            }
+            rect = self.color_atlas.allocate(sw, sh)?;
+            texture = self.color_texture.as_ref().expect("created above");
+            bytes_per_pixel = 4;
+        } else {
+            rect = self.atlas.allocate(w, h)?;
+            texture = &self.mask_texture;
+            bytes_per_pixel = 1;
+            pixels = std::borrow::Cow::Borrowed(&raster.pixels[..]);
+        }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas_texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: rect.x, y: rect.y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
-            &raster.rgba,
+            &pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * raster.width),
-                rows_per_image: Some(raster.height),
+                bytes_per_row: Some(bytes_per_pixel * rect.w),
+                rows_per_image: Some(rect.h),
             },
-            wgpu::Extent3d { width: raster.width, height: raster.height, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: rect.w, height: rect.h, depth_or_array_layers: 1 },
         );
-        Some(Some(CachedGlyph { rect, left: raster.left, top: raster.top, color: raster.color }))
+        Some(Some(CachedGlyph { rect, w, h, left: raster.left, top: raster.top, color: raster.color }))
+    }
+}
+
+/// A square glyph atlas texture.
+fn atlas_texture(
+    device: &wgpu::Device,
+    label: &str,
+    size: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// The cell pipeline's bind group: globals, the mask and color atlases and
+/// their samplers (see shader.wgsl).
+fn cells_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    [mask, color]: [&wgpu::TextureView; 2],
+    [nearest, linear]: [&wgpu::Sampler; 2],
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cells"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mask) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(nearest) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(linear) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(color) },
+        ],
+    })
+}
+
+/// Shrink a straight-alpha RGBA image from `w` x `h` to `nw` x `nh` (each no
+/// larger), each output pixel the area-weighted average of the source
+/// pixels it covers. Colors are averaged weighted by alpha, so transparent
+/// pixels don't darken the edges.
+fn shrink_rgba(src: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
+    // Source spans (first pixel, weights) covered by each output column/row.
+    fn spans(n: u32, out: u32) -> Vec<(usize, Vec<f32>)> {
+        let step = n as f32 / out as f32;
+        (0..out)
+            .map(|o| {
+                let (a, b) = (o as f32 * step, ((o + 1) as f32 * step).min(n as f32));
+                let first = a.floor() as usize;
+                let last = (b.ceil() as usize).min(n as usize);
+                let weights = (first..last)
+                    .map(|i| (b.min(i as f32 + 1.0) - a.max(i as f32)).max(0.0))
+                    .collect();
+                (first, weights)
+            })
+            .collect()
+    }
+    let (xs, ys) = (spans(w, nw), spans(h, nh));
+    let mut out = Vec::with_capacity((nw * nh * 4) as usize);
+    for (y0, wy) in &ys {
+        for (x0, wx) in &xs {
+            let mut acc = [0.0f32; 4];
+            let mut area = 0.0;
+            for (dy, &fy) in wy.iter().enumerate() {
+                let row = (y0 + dy) * w as usize;
+                for (dx, &fx) in wx.iter().enumerate() {
+                    let p = &src[(row + x0 + dx) * 4..][..4];
+                    let f = fx * fy;
+                    let a = p[3] as f32 * f;
+                    acc[0] += p[0] as f32 * a;
+                    acc[1] += p[1] as f32 * a;
+                    acc[2] += p[2] as f32 * a;
+                    acc[3] += a;
+                    area += f;
+                }
+            }
+            let alpha = acc[3] / area.max(f32::EPSILON);
+            let c = |v: f32| if acc[3] > 0.0 { (v / acc[3]).round().clamp(0.0, 255.0) as u8 } else { 0 };
+            out.extend([c(acc[0]), c(acc[1]), c(acc[2]), alpha.round().clamp(0.0, 255.0) as u8]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shrink_rgba;
+
+    #[test]
+    fn shrinking_averages_by_area_and_alpha() {
+        // 2x2 -> 1x1: one opaque red pixel and three transparent ones give
+        // pure red at a quarter of the alpha (no darkening from the
+        // transparent pixels' black).
+        let src = [255, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(shrink_rgba(&src, 2, 2, 1, 1), [255, 0, 0, 64]);
+        // 3x1 -> 2x1: each output pixel covers 1.5 source pixels.
+        let src = [0, 0, 0, 255, 90, 90, 90, 255, 180, 180, 180, 255];
+        assert_eq!(shrink_rgba(&src, 3, 1, 2, 1), [30, 30, 30, 255, 150, 150, 150, 255]);
+        // Same size: unchanged.
+        let src: Vec<u8> = (0..36).collect();
+        let opaque: Vec<u8> = src.iter().enumerate().map(|(i, &v)| if i % 4 == 3 { 255 } else { v }).collect();
+        assert_eq!(shrink_rgba(&opaque, 3, 3, 3, 3), opaque);
     }
 }
