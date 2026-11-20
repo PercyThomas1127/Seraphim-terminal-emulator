@@ -1,6 +1,6 @@
 Name:           seraphim
 Version:        0.2.1
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        GPU-accelerated, programmable terminal with animated, event-driven backgrounds
 
 # Seraphim is MIT and its built-in JetBrains Mono font OFL-1.1. The rest are
@@ -63,10 +63,11 @@ EOF
 
 %build
 export RUSTFLAGS="%{?build_rustflags}"
-cargo build --frozen --release --package seraphim
+# The dist profile: release with whole-program optimization (fat LTO).
+cargo build --frozen --profile dist --package seraphim
 
 %install
-install -Dpm0755 target/release/seraphim %{buildroot}%{_bindir}/seraphim
+install -Dpm0755 target/dist/seraphim %{buildroot}%{_bindir}/seraphim
 install -Dpm0644 extra/linux/seraphim.desktop %{buildroot}%{_datadir}/applications/seraphim.desktop
 for size in 32 48 64 128 256 512; do
   install -Dpm0644 extra/icons/hicolor/${size}x${size}/apps/seraphim.png \
@@ -93,6 +94,9 @@ cargo test --frozen --release --workspace
 %{_datadir}/seraphim/
 
 %changelog
+* Thu Nov 19 2026 Seraphim Dev <yc9941@stanford.edu> - 0.2.1-2
+- Build with the dist profile (fat LTO from the next release on)
+
 * Wed Nov 18 2026 Seraphim Dev <yc9941@stanford.edu> - 0.2.1-1
 - Update to 0.2.1: built-in JetBrains Mono font, faster startup
 
