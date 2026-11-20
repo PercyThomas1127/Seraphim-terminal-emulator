@@ -245,7 +245,7 @@ impl Grid {
     pub fn row(&self, i: usize) -> &Row {
         &self.lines[i]
     }
-    pub fn rows_iter(&self) -> impl Iterator<Item = &Row> {
+    pub fn rows_iter(&self) -> impl DoubleEndedIterator<Item = &Row> {
         self.lines.iter()
     }
     pub fn cell(&self, row: usize, col: usize) -> &Cell {

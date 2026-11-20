@@ -23,6 +23,104 @@ pub struct Frame {
 
 /// Load a picture; animations come back as several frames.
 pub fn load(path: &Path, blur: f32) -> Result<Vec<Frame>, String> {
+    load_within(path, blur, None).map(|(frames, _)| frames)
+}
+
+/// Like [`load`], shrinking the picture (keeping its shape) to the smallest
+/// size that still covers `max` (a screen size) when it is larger: a
+/// picture scaled to fit a window no larger than `max` then never shows
+/// fewer pixels than the screen has. `blur` scales along, so the picture
+/// looks the same. Also returns whether it was shrunk.
+pub fn load_within(
+    path: &Path,
+    blur: f32,
+    max: Option<(u32, u32)>,
+) -> Result<(Vec<Frame>, bool), String> {
+    let mut frames = decode(path)?;
+    let mut blur = blur;
+    let mut shrunk = false;
+    if let (Some((mw, mh)), Some(f)) = (max, frames.first()) {
+        let k = (mw as f32 / f.width as f32).max(mh as f32 / f.height as f32);
+        if k < 1.0 {
+            frames = frames
+                .into_iter()
+                .map(|f| {
+                    let w = ((f.width as f32 * k).ceil() as u32).clamp(1, f.width);
+                    let h = ((f.height as f32 * k).ceil() as u32).clamp(1, f.height);
+                    Frame {
+                        width: w,
+                        height: h,
+                        rgba: shrink(&f.rgba, f.width, f.height, w, h),
+                        ..f
+                    }
+                })
+                .collect();
+            blur *= k;
+            shrunk = true;
+        }
+    }
+    let frames =
+        frames.into_iter().map(|f| if blur > 0.0 { blurred(f, blur) } else { f }).collect();
+    Ok((frames, shrunk))
+}
+
+/// Shrink straight-alpha RGBA from `w` x `h` to `nw` x `nh` (no larger):
+/// each output pixel is the area-weighted average of the source pixels it
+/// covers, colors weighted by alpha so transparent pixels don't darken
+/// edges. Works one output row at a time (one row of scratch memory).
+fn shrink(src: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
+    // Source spans (first index, weights) covered by each output index.
+    fn spans(n: u32, out: u32) -> Vec<(usize, Vec<f32>)> {
+        let step = n as f32 / out as f32;
+        (0..out)
+            .map(|o| {
+                let (a, b) = (o as f32 * step, ((o + 1) as f32 * step).min(n as f32));
+                let first = a.floor() as usize;
+                let last = (b.ceil() as usize).min(n as usize);
+                let weights = (first..last)
+                    .map(|i| (b.min(i as f32 + 1.0) - a.max(i as f32)).max(0.0))
+                    .collect();
+                (first, weights)
+            })
+            .collect()
+    }
+    let (w, nw_us) = (w as usize, nw as usize);
+    let (xs, ys) = (spans(w as u32, nw), spans(h, nh));
+    let mut out = Vec::with_capacity(nw_us * nh as usize * 4);
+    // Per source column: color * alpha (3) and alpha, summed over the rows.
+    let mut acc = vec![0.0f32; w * 4];
+    for (y0, wy) in &ys {
+        acc.fill(0.0);
+        for (dy, &fy) in wy.iter().enumerate() {
+            let row = &src[(y0 + dy) * w * 4..][..w * 4];
+            for i in (0..w * 4).step_by(4) {
+                let alpha = row[i + 3] as f32 * fy;
+                acc[i] += row[i] as f32 * alpha;
+                acc[i + 1] += row[i + 1] as f32 * alpha;
+                acc[i + 2] += row[i + 2] as f32 * alpha;
+                acc[i + 3] += alpha;
+            }
+        }
+        let fy_sum: f32 = wy.iter().sum();
+        for (x0, wx) in &xs {
+            let mut c = [0.0f32; 4];
+            for (dx, &fx) in wx.iter().enumerate() {
+                let a = &acc[(x0 + dx) * 4..][..4];
+                for i in 0..4 {
+                    c[i] += a[i] * fx;
+                }
+            }
+            let area = fy_sum * wx.iter().sum::<f32>();
+            let alpha = c[3] / area.max(f32::EPSILON);
+            let ch =
+                |v: f32| if c[3] > 0.0 { (v / c[3]).round().clamp(0.0, 255.0) as u8 } else { 0 };
+            out.extend([ch(c[0]), ch(c[1]), ch(c[2]), alpha.round().clamp(0.0, 255.0) as u8]);
+        }
+    }
+    out
+}
+
+fn decode(path: &Path) -> Result<Vec<Frame>, String> {
     let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
     let reader = image::ImageReader::open(path)
         .map_err(|e| err(&e))?
@@ -62,7 +160,7 @@ pub fn load(path: &Path, blur: f32) -> Result<Vec<Frame>, String> {
     if frames.is_empty() {
         return Err(format!("{}: no frames", path.display()));
     }
-    Ok(frames.into_iter().map(|f| if blur > 0.0 { blurred(f, blur) } else { f }).collect())
+    Ok(frames)
 }
 
 fn still(img: RgbaImage) -> Vec<Frame> {
@@ -187,6 +285,34 @@ mod tests {
         let d = std::env::temp_dir().join(format!("seraphim-picture-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn shrinking_averages_by_area_and_alpha() {
+        // One opaque red pixel among transparent ones: red, quarter alpha.
+        let src = [255, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(shrink(&src, 2, 2, 1, 1), [255, 0, 0, 64]);
+        // 3 -> 2: each output pixel covers 1.5 source pixels.
+        let src = [0, 0, 0, 255, 90, 90, 90, 255, 180, 180, 180, 255];
+        assert_eq!(shrink(&src, 3, 1, 2, 1), [30, 30, 30, 255, 150, 150, 150, 255]);
+    }
+
+    #[test]
+    fn pictures_shrink_to_cover_the_screen() {
+        let d = dir();
+        let png = d.join("big.png");
+        RgbaImage::from_fn(400, 100, |x, _| image::Rgba([(x % 256) as u8, 0, 0, 255]))
+            .save(&png)
+            .unwrap();
+        // Covering 100x50 needs 200x50: the height decides.
+        let (f, shrunk) = load_within(&png, 0.0, Some((100, 50))).unwrap();
+        assert!(shrunk);
+        assert_eq!((f[0].width, f[0].height), (200, 50));
+        // Already small enough: untouched.
+        let (f, shrunk) = load_within(&png, 0.0, Some((800, 600))).unwrap();
+        assert!(!shrunk);
+        assert_eq!((f[0].width, f[0].height), (400, 100));
+        assert_eq!(f[0].rgba, load(&png, 0.0).unwrap()[0].rgba);
     }
 
     #[test]

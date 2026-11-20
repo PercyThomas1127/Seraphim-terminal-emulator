@@ -264,6 +264,28 @@ fn hyperlinks() {
 }
 
 #[test]
+fn repeated_hyperlinks_share_an_entry() {
+    let link = |id: &str, uri: &str| format!("\x1b]8;{id};{uri}\x1b\\x\x1b]8;;\x1b\\");
+    let s = [
+        link("", "file:///a"),
+        link("", "file:///b"),
+        link("", "file:///a"),
+        link("id=1", "file:///a"),
+        link("id=2", "file:///a"),
+        link("id=1", "file:///a"),
+    ]
+    .concat();
+    let t = term(10, 1, &s);
+    let ids: Vec<u32> = (0..6).map(|c| t.screen().cell(0, c).attrs.link).collect();
+    // Same URI without an id: one entry; an id makes a separate one.
+    assert_eq!(ids[0], ids[2]);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(ids[3], ids[5]);
+    assert!(ids[3] != ids[0] && ids[3] != ids[4] && ids[4] != ids[0]);
+    assert_eq!(t.hyperlink(ids[4]).unwrap().id.as_deref(), Some("2"));
+}
+
+#[test]
 fn clipboard_is_reported_not_applied() {
     let mut t = term(5, 1, "\x1b]52;c;aGk=\x07\x1b]52;c;?\x07");
     assert_eq!(

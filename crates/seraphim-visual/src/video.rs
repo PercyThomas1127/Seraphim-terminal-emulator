@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Duration;
 
 /// Videos wider or taller than this are scaled down while decoding.
@@ -19,6 +19,9 @@ pub struct Stream {
     pub height: u32,
     pub fps: f64,
     frames: Receiver<Vec<u8>>,
+    /// Frames already shown go back to the reader to be filled again, so a
+    /// playing video doesn't allocate (and fault in) a frame per frame.
+    spent: SyncSender<Vec<u8>>,
     child: Child,
     /// Index of the frame on screen (0-based, counting loops).
     pub shown: u64,
@@ -102,11 +105,12 @@ impl Stream {
         let mut child = cmd.spawn().map_err(|e| format!("video needs ffmpeg on PATH ({e})"))?;
         let mut out = child.stdout.take().expect("piped");
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
+        let (spent, reuse) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
         let size = (w * h * 4) as usize;
         std::thread::Builder::new()
             .name("seraphim-video".into())
             .spawn(move || loop {
-                let mut frame = vec![0u8; size];
+                let mut frame = reuse.try_recv().unwrap_or_else(|_| vec![0u8; size]);
                 if out.read_exact(&mut frame).is_err() || tx.send(frame).is_err() {
                     return; // ffmpeg ended or the layer is gone
                 }
@@ -115,7 +119,7 @@ impl Stream {
         let first = rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| format!("{}: ffmpeg produced no frames", path.display()))?;
-        Ok((Stream { width: w, height: h, fps, frames: rx, child, shown: 0 }, first))
+        Ok((Stream { width: w, height: h, fps, frames: rx, spent, child, shown: 0 }, first))
     }
 
     /// The newest frame due by `t` seconds of play, if a new one is due
@@ -133,12 +137,19 @@ impl Stream {
             match next {
                 Some(f) => {
                     self.shown += 1;
-                    latest = Some(f);
+                    if let Some(skipped) = latest.replace(f) {
+                        self.recycle(skipped);
+                    }
                 }
                 None => break,
             }
         }
         latest
+    }
+
+    /// Hand a frame from [`Stream::frame_for`] back once it is uploaded.
+    pub fn recycle(&self, frame: Vec<u8>) {
+        let _ = self.spent.try_send(frame);
     }
 
     /// Seconds until the next frame is due at time `t`.

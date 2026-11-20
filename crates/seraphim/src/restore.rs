@@ -85,6 +85,17 @@ pub fn save(windows: &[Saved]) -> Result<(), String> {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
     let text = serde_json::to_string(&s).map_err(|e| e.to_string())?;
+    // Saved every 30 s: skip the write when nothing changed since the last.
+    static LAST: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+    let hash = {
+        use std::hash::BuildHasher;
+        std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+            .hash_one(&text)
+    };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last == Some(hash) && p.exists() {
+        return Ok(());
+    }
     let tmp = p.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
     // Screen text can be private: only the user reads it.
@@ -93,7 +104,9 @@ pub fn save(windows: &[Saved]) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+    *last = Some(hash);
+    Ok(())
 }
 
 /// The saved windows (none: start fresh).

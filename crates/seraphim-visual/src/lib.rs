@@ -256,6 +256,9 @@ struct GpuLayer {
     shown: f32,
     /// A playing video: its stream, texture, and start time.
     video: Option<(video::Stream, wgpu::Texture, f64)>,
+    /// A picture shrunk to cover this size, and its spec, to load it
+    /// again larger if the window outgrows that size.
+    fitted: Option<((u32, u32), LayerSpec)>,
 }
 
 /// Engine clock: seconds since creation, minus time spent paused.
@@ -311,6 +314,9 @@ pub struct VisualEngine {
     size: (u32, u32),
     /// This frame goes through the compositor.
     composing: bool,
+    /// Pictures scaled to the window are shrunk to cover this size (the
+    /// largest screen); see [`VisualEngine::set_picture_limit`].
+    picture_limit: Option<(u32, u32)>,
 }
 
 impl VisualEngine {
@@ -380,6 +386,7 @@ impl VisualEngine {
             compositor: None,
             size: (1, 1),
             composing: false,
+            picture_limit: None,
         }
     }
 
@@ -400,6 +407,16 @@ impl VisualEngine {
         }
         self.style = style;
         Ok(())
+    }
+
+    /// The largest size the window can take (e.g. the largest screen's, in
+    /// pixels). Background pictures scaled to the window (`cover`,
+    /// `contain`, `stretch`) larger than that are shrunk to just cover it
+    /// when loaded, which saves their memory without changing what shows;
+    /// a window that grows larger still loads them again. Applies to
+    /// layers built afterwards.
+    pub fn set_picture_limit(&mut self, size: Option<(u32, u32)>) {
+        self.picture_limit = size;
     }
 
     /// Current time on the engine clock, in seconds.
@@ -600,6 +617,20 @@ impl VisualEngine {
     /// it moves continuously (draw at the frame-rate cap), the time to the
     /// next animated-image frame, or `None` when it is still.
     pub fn next_frame_in(&self) -> Option<f64> {
+        if self.composing {
+            // The last frame was composed: once a transition has ended or a
+            // blur faded out, one more frame draws without the compositor
+            // and frees its targets (see prepare).
+            let now = self.time();
+            let transition = !self.outgoing.is_empty() && self.progress.active(now);
+            let blur = self
+                .layers
+                .iter()
+                .any(|l| l.blur && (l.opacity.active(now) || l.opacity.target() > 0.0));
+            if !transition && !blur {
+                return Some(0.0);
+            }
+        }
         if self.fixed_time.is_none() && (self.paused || self.reduced_motion) {
             // A paused clock: nothing moves (transitions are instant).
             return None;
@@ -655,6 +686,7 @@ impl VisualEngine {
         let now = self.time();
         self.drop_finished(now);
         self.size = (width.max(1), height.max(1));
+        self.refit_pictures();
         let shader_time = now as f32;
         let global = self.global_opacity;
         for l in self.layers.iter_mut().chain(self.outgoing.iter_mut()) {
@@ -681,6 +713,7 @@ impl VisualEngine {
             if let Some((stream, tex, start)) = &mut l.video {
                 if let Some(frame) = stream.frame_for(now - *start, self.fixed_time.is_some()) {
                     write_texture(&self.queue, tex, stream.width, stream.height, &frame);
+                    stream.recycle(frame);
                 }
             }
             if l.period > 0.0 {
@@ -699,6 +732,41 @@ impl VisualEngine {
         }
         self.composing =
             !self.outgoing.is_empty() || self.layers.iter().any(|l| l.blur && l.shown > 0.0);
+        // Window-sized targets are only needed while composing: free them
+        // on the first frame without (a transition's end draws one).
+        if !self.composing {
+            if let Some(c) = self.compositor.as_mut() {
+                c.release_targets();
+            }
+        }
+    }
+
+    /// Load pictures shrunk for a smaller size than the window now has
+    /// again, at the window's size.
+    fn refit_pictures(&mut self) {
+        let (w, h) = self.size;
+        let outgrown = |l: &GpuLayer| {
+            !l.leaving && l.fitted.as_ref().is_some_and(|((fw, fh), _)| w > *fw || h > *fh)
+        };
+        if !self.layers.iter().any(outgrown) {
+            return;
+        }
+        let (lw, lh) = self.picture_limit.unwrap_or((0, 0));
+        self.picture_limit = Some((lw.max(w), lh.max(h)));
+        for i in 0..self.layers.len() {
+            if !outgrown(&self.layers[i]) {
+                continue;
+            }
+            let spec = self.layers[i].fitted.take().expect("outgrown").1;
+            if let Ok(new) = self.build(&spec) {
+                let l = &mut self.layers[i];
+                l.pipeline = new.pipeline;
+                l.frames = new.frames;
+                l.uniforms = new.uniforms;
+                l.static_data.image = new.static_data.image;
+                l.fitted = new.fitted;
+            }
+        }
     }
 
     /// Offscreen work for this frame (blur layers, styled transitions).
@@ -714,6 +782,9 @@ impl VisualEngine {
         self.compositor();
         let mut comp = self.compositor.take().expect("created above");
         comp.begin_frame();
+        if !two {
+            comp.a = None; // the outgoing scene, after a transition
+        }
         comp.ensure_targets(&device, size, two);
         if two {
             Self::render_scene(&mut comp, &device, &queue, encoder, &self.outgoing, true);
@@ -804,6 +875,7 @@ impl VisualEngine {
         let mut time_params: Vec<usize> = Vec::new();
         let mut blur = false;
         let mut video = None;
+        let mut fitted = None;
         let mut params: Vec<(String, f32)> = Vec::new();
         let mut colors: Vec<(String, Rgba)> = Vec::new();
         let mut color_names: Vec<String> = Vec::new();
@@ -832,7 +904,9 @@ impl VisualEngine {
                 include_str!("shaders/gradient.wgsl").into()
             }
             LayerKind::Image { path, fit, blur } => {
-                let frames = picture::load(path, *blur)?;
+                let limit = self.picture_limit.filter(|_| *fit != Fit::Tile);
+                let (frames, shrunk) = picture::load_within(path, *blur, limit)?;
+                fitted = limit.filter(|_| shrunk).map(|l| (l, spec.clone()));
                 let max = self.device.limits().max_texture_dimension_2d;
                 let (w, h) = (frames[0].width, frames[0].height);
                 if w > max || h > max {
@@ -1015,6 +1089,7 @@ impl VisualEngine {
             time_params,
             static_data: data,
             leaving: false,
+            fitted,
         })
     }
 }

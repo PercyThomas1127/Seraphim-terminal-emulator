@@ -155,7 +155,7 @@ pub struct CursorState {
     pub shape: CursorShape,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Hyperlink {
     pub id: Option<String>,
     pub uri: String,
@@ -206,6 +206,9 @@ pub(crate) struct State {
     pub title: String,
     pub cwd: Option<String>,
     pub hyperlinks: Vec<Hyperlink>,
+    /// Position in `hyperlinks` by the link's hash, so a link repeated on
+    /// every line of output (ls --hyperlink, grep) is found without a scan.
+    hyperlink_index: std::collections::HashMap<u64, usize>,
     pub events: Vec<TerminalEvent>,
     /// OSC 99 notifications arriving in parts (`d=0`), by id: title, body.
     notify_parts: Vec<(String, String, String)>,
@@ -268,6 +271,7 @@ impl State {
             title: String::new(),
             cwd: None,
             hyperlinks: Vec::new(),
+            hyperlink_index: Default::default(),
             events: Vec::new(),
             notify_parts: Vec::new(),
             text: None,
@@ -1380,12 +1384,22 @@ impl State {
                         let id = text(1)
                             .split(':')
                             .find_map(|kv| kv.strip_prefix("id=").map(str::to_owned));
+                        // The same id and URI, or the same URI when neither
+                        // has an id, is the same link.
                         let link = Hyperlink { id, uri };
-                        let existing = self.hyperlinks.iter().position(|h| {
-                            *h == link && link.id.is_some()
-                                || (link.id.is_none() && h.id.is_none() && h.uri == link.uri)
-                        });
-                        let idx = existing.unwrap_or_else(|| {
+                        let hash = {
+                            use std::hash::{BuildHasher, BuildHasherDefault};
+                            BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+                                .hash_one(&link)
+                        };
+                        let found = match self.hyperlink_index.get(&hash) {
+                            Some(&i) if self.hyperlinks[i] == link => Some(i),
+                            // Another link with the same hash (rare).
+                            Some(_) => self.hyperlinks.iter().position(|h| *h == link),
+                            None => None,
+                        };
+                        let idx = found.unwrap_or_else(|| {
+                            self.hyperlink_index.entry(hash).or_insert(self.hyperlinks.len());
                             self.hyperlinks.push(link);
                             self.hyperlinks.len() - 1
                         });
