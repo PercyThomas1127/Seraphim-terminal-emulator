@@ -343,6 +343,14 @@ impl Compositor {
         }
     }
 
+    /// Free the scene and blur targets (they are made again when needed);
+    /// compiled transitions stay.
+    pub fn release_targets(&mut self) {
+        self.a = None;
+        self.b = None;
+        self.scratch.clear();
+    }
+
     pub fn begin_frame(&mut self) {
         self.next_slot.set(0);
     }

@@ -1148,6 +1148,12 @@ impl Win {
 
         let mut visual = VisualEngine::new(&gpu.device, &gpu.queue, gpu.config.format);
         visual.set_reduced_motion(o.visual.reduced_motion);
+        // Background pictures need no more pixels than the largest screen.
+        let screens = window.available_monitors().map(|m| m.size()).fold(None, |acc, s| {
+            let (w, h) = acc.unwrap_or((0, 0));
+            Some((s.width.max(w), s.height.max(h)))
+        });
+        visual.set_picture_limit(screens.filter(|&(w, h)| w > 0 && h > 0));
         visual.set_global_opacity(o.visual.window_opacity);
         if let Err(e) = o.transition.clone().and_then(|t| visual.set_transition_style(t)) {
             eprintln!("seraphim: {e}; using fade");
@@ -2411,15 +2417,22 @@ impl Active {
                 for id in t.root.panes() {
                     if let Some(p) = self.panes.get(&id) {
                         let (cwd, text) = {
+                            // The last LINES lines, ignoring blank ones at
+                            // the end: read from the bottom up, so a long
+                            // scrollback costs nothing extra.
                             let term = p.session.terminal();
-                            let mut lines: Vec<String> =
-                                term.scrollback().iter().map(|r| r.text()).collect();
-                            lines.extend(term.screen().rows_iter().map(|r| r.text()));
-                            while lines.last().is_some_and(|l| l.trim().is_empty()) {
-                                lines.pop();
-                            }
-                            let skip = lines.len().saturating_sub(LINES);
-                            (term.cwd().map(str::to_owned), lines.split_off(skip))
+                            let rows = term
+                                .screen()
+                                .rows_iter()
+                                .rev()
+                                .chain(term.scrollback().iter().rev());
+                            let mut lines: Vec<String> = rows
+                                .map(|r| r.text())
+                                .skip_while(|l| l.trim().is_empty())
+                                .take(LINES)
+                                .collect();
+                            lines.reverse();
+                            (term.cwd().map(str::to_owned), lines)
                         };
                         let cwd = cwd.or_else(|| {
                             p.session

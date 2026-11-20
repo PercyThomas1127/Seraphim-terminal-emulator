@@ -23,7 +23,17 @@ unsafe impl bytemuck::Pod for Quad {}
 struct Texture {
     bind_group: wgpu::BindGroup,
     _texture: wgpu::Texture,
+    bytes: usize,
+    last_drawn: std::time::Instant,
 }
+
+/// GPU memory for one pane's inline images, beyond which images not drawn
+/// for [`EVICT_AFTER`] are freed (oldest first). The terminal keeps every
+/// image, so one drawn again is simply uploaded again.
+const BUDGET: usize = 128 << 20;
+/// Long enough that a looping animation's frames are never evicted
+/// between one loop and the next.
+const EVICT_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A run of quads that share a texture, in one layer.
 struct Draw {
@@ -197,6 +207,7 @@ impl Images {
         let placeholders =
             if term.graphics().has_virtual() { placeholder_cells(term) } else { Vec::new() };
         if visible.is_empty() && placeholders.is_empty() {
+            self.evict(now);
             return;
         }
         let (cw, ch) = cell;
@@ -250,6 +261,30 @@ impl Images {
                 _ => self.draws.push(Draw { key: *key, layer: *layer, range: i..i + 1 }),
             }
         }
+        self.evict(now);
+    }
+
+    /// Keep textures within [`BUDGET`] (see there).
+    fn evict(&mut self, now: std::time::Instant) {
+        let mut used: usize = self.textures.values().map(|t| t.bytes).sum();
+        if used <= BUDGET {
+            return;
+        }
+        let mut idle: Vec<(std::time::Instant, u64)> = self
+            .textures
+            .iter()
+            .filter(|(_, t)| now.saturating_duration_since(t.last_drawn) >= EVICT_AFTER)
+            .map(|(k, t)| (t.last_drawn, *k))
+            .collect();
+        idle.sort();
+        for (_, k) in idle {
+            if used <= BUDGET {
+                break;
+            }
+            if let Some(t) = self.textures.remove(&k) {
+                used -= t.bytes;
+            }
+        }
     }
 
     /// The texture key for the frame of `img` to show now, uploading it on
@@ -265,9 +300,12 @@ impl Images {
             self.animating = true;
         }
         let (rgba, key) = img.frame(img.frame_at(now));
-        if !self.textures.contains_key(&key) {
-            let t = self.upload(device, queue, img.width, img.height, rgba);
-            self.textures.insert(key, t);
+        match self.textures.get_mut(&key) {
+            Some(t) => t.last_drawn = now,
+            None => {
+                let t = self.upload(device, queue, img.width, img.height, rgba, now);
+                self.textures.insert(key, t);
+            }
         }
         key
     }
@@ -279,6 +317,7 @@ impl Images {
         w: u32,
         h: u32,
         rgba: &[u8],
+        now: std::time::Instant,
     ) -> Texture {
         // Larger than the GPU allows: shrink (nearest) to fit.
         let (w2, h2, data) = if w > self.max_side || h > self.max_side {
@@ -338,7 +377,7 @@ impl Images {
                 },
             ],
         });
-        Texture { bind_group, _texture: texture }
+        Texture { bind_group, _texture: texture, bytes: (w2 * h2 * 4) as usize, last_drawn: now }
     }
 
     /// Draw one layer (0: under backgrounds, 1: under text, 2: over text).
