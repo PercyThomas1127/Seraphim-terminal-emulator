@@ -54,6 +54,9 @@ struct Pane {
     root: bool,
     /// Where it was last laid out (pixels).
     rect: Rect,
+    /// Terminal generation when output was last seen, and when trimming
+    /// the scrollback may start (`None`: nothing left to trim).
+    trim: (u64, Option<Instant>),
 }
 
 /// What new panes run.
@@ -817,6 +820,12 @@ static WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// How often the session is saved while windows are open, so that it
 /// survives a crash.
 const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Scrollback rows are trimmed (see `Terminal::trim_scrollback`) once a
+/// pane has had no output for this long, `TRIM_BATCH` rows (well under a
+/// millisecond) every `TRIM_PAUSE`.
+const TRIM_QUIET: Duration = Duration::from_secs(1);
+const TRIM_BATCH: usize = 2048;
+const TRIM_PAUSE: Duration = Duration::from_millis(10);
 
 pub fn run(options: WindowOptions) -> Result<i32, String> {
     // First, while this is the only thread: keep the software Vulkan driver
@@ -2221,6 +2230,7 @@ impl Active {
             Pane {
                 session,
                 last_generation: u64::MAX,
+                trim: (u64::MAX, None),
                 activity: false,
                 bell: false,
                 progress: None,
@@ -4588,6 +4598,30 @@ impl Win {
                 );
             } else {
                 wake = Some(wake.map_or(due, |w| w.min(due)));
+            }
+        }
+
+        // Scrollback trimming (memory), a batch at a time, in panes that
+        // have been quiet for a moment, so it never competes with output.
+        for p in a.panes.values_mut() {
+            let g = p.session.generation();
+            if g != p.trim.0 {
+                p.trim = (g, Some(now + TRIM_QUIET));
+            }
+            if let Some(due) = p.trim.1 {
+                let due = if now >= due {
+                    if p.session.trim_scrollback(TRIM_BATCH) {
+                        Some(now + TRIM_PAUSE)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(due)
+                };
+                p.trim.1 = due;
+                if let Some(d) = due {
+                    wake = Some(wake.map_or(d, |w| w.min(d)));
+                }
             }
         }
 

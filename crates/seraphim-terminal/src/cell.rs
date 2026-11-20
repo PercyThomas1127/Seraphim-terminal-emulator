@@ -78,16 +78,81 @@ impl std::ops::BitOr for Flags {
     }
 }
 
+/// The underline color and hyperlink of a cell, which few cells have:
+/// an index into a table the terminal keeps, so that a cell is 16 bytes
+/// instead of 24. Read them with [`crate::Terminal::underline_color`] and
+/// [`crate::Terminal::link`]. The default means neither. Equal attributes
+/// have equal indexes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+pub struct Extra(pub(crate) u16);
+
 /// Graphic rendition applied to a cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
 pub struct Attrs {
     pub fg: Color,
     pub bg: Color,
-    pub underline_color: Color,
     pub flags: Flags,
-    /// OSC 8 hyperlink id; 0 means "no link". Resolve with
-    /// [`crate::Terminal::hyperlink`].
-    pub link: u32,
+    /// Underline color and hyperlink.
+    pub extra: Extra,
+}
+
+/// The table behind [`Extra`]: entry 0 is (no color, no link).
+#[derive(Clone, Debug)]
+pub(crate) struct Extras {
+    table: Vec<(Color, u32)>,
+    index: std::collections::HashMap<(Color, u32), u16>,
+    /// Bumped when entries move (see [`Extras::compact`]).
+    pub generation: u64,
+}
+
+impl Default for Extras {
+    fn default() -> Self {
+        Extras { table: vec![(Color::Default, 0)], index: Default::default(), generation: 0 }
+    }
+}
+
+impl Extras {
+    /// Underline color and hyperlink id of `e`.
+    #[inline]
+    pub fn get(&self, e: Extra) -> (Color, u32) {
+        self.table.get(e.0 as usize).copied().unwrap_or((Color::Default, 0))
+    }
+
+    /// The index for (`underline`, `link`); `None` when the table is full.
+    pub fn intern(&mut self, underline: Color, link: u32) -> Option<Extra> {
+        if (underline, link) == (Color::Default, 0) {
+            return Some(Extra(0));
+        }
+        if let Some(&i) = self.index.get(&(underline, link)) {
+            return Some(Extra(i));
+        }
+        let i = u16::try_from(self.table.len()).ok()?;
+        self.table.push((underline, link));
+        self.index.insert((underline, link), i);
+        Some(Extra(i))
+    }
+
+    /// Keep only the entries `used` marks (indexed like the table) and
+    /// renumber them: returns the new index of each old one.
+    pub fn compact(&mut self, used: &[bool]) -> Vec<u16> {
+        let mut map = vec![0u16; self.table.len()];
+        let old = std::mem::take(&mut self.table);
+        self.table.push((Color::Default, 0));
+        self.index.clear();
+        for (i, entry) in old.into_iter().enumerate().skip(1) {
+            if used.get(i).copied().unwrap_or(false) {
+                map[i] = self.table.len() as u16;
+                self.index.insert(entry, self.table.len() as u16);
+                self.table.push(entry);
+            }
+        }
+        self.generation += 1;
+        map
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
 }
 
 /// One character cell of the grid.
@@ -124,5 +189,32 @@ impl Cell {
 
     pub fn is_wide_padding(&self) -> bool {
         self.attrs.flags.contains(Flags::WIDE_PADDING)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<Cell>(), 16);
+    }
+
+    #[test]
+    fn extras_intern_and_compact() {
+        let mut e = Extras::default();
+        let red = Color::Indexed(1);
+        assert_eq!(e.intern(Color::Default, 0), Some(Extra(0)));
+        let a = e.intern(red, 0).unwrap();
+        let b = e.intern(Color::Default, 7).unwrap();
+        assert_eq!(e.intern(red, 0), Some(a));
+        assert_eq!(e.get(b), (Color::Default, 7));
+        // Drop `a`: `b` moves down.
+        let mut used = vec![false; e.len()];
+        used[b.0 as usize] = true;
+        let map = e.compact(&used);
+        assert_eq!(e.get(Extra(map[b.0 as usize])), (Color::Default, 7));
+        assert_eq!(e.len(), 2);
     }
 }

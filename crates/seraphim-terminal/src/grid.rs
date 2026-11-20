@@ -54,6 +54,11 @@ impl Row {
         Row { cells, wrapped, combining, occ, scroll_fill: false }
     }
 
+    #[inline]
+    pub(crate) fn is_scroll_fill(&self) -> bool {
+        self.scroll_fill
+    }
+
     /// Cells beyond this index are all `Cell::default()`.
     #[inline]
     pub(crate) fn occupied(&self) -> usize {
@@ -131,9 +136,13 @@ impl Row {
         self.combining.iter().find(|(c, _)| *c as usize == col).map_or(&[], |(_, m)| m)
     }
 
-    /// Append the visible text of cell `col` (wide spacers produce nothing).
+    /// Append the visible text of cell `col` (wide spacers produce nothing;
+    /// a cell past the end of a trimmed row is a blank).
     pub fn push_cell_text(&self, col: usize, out: &mut String) {
-        let cell = &self.cells[col];
+        let Some(cell) = self.cells.get(col) else {
+            out.push(' ');
+            return;
+        };
         if cell.is_wide_spacer() || cell.is_wide_padding() {
             return;
         }
@@ -210,6 +219,66 @@ impl Row {
         self.scroll_fill = false;
     }
 
+    /// Drop the blank cells past the content, and their memory: for rows
+    /// in the scrollback, which then may be shorter than the terminal is
+    /// wide (cells past the end are blank). Leaves soft-wrapped rows and
+    /// rows whose blanks are a scroll fill as they are. Returns whether the
+    /// row changed.
+    pub(crate) fn trim(&mut self) -> bool {
+        if self.wrapped || self.scroll_fill {
+            return false;
+        }
+        let marks = self.combining.iter().map(|(c, _)| *c as usize + 1).max().unwrap_or(0);
+        let keep = self.occ.max(marks).min(self.cells.len());
+        if keep == self.cells.len() && self.cells.capacity() == keep {
+            return false;
+        }
+        // A fresh allocation of the exact size, freeing the whole old one
+        // (shrinking in place would leave odd-sized fragments behind; whole
+        // row-sized blocks are what new rows reuse).
+        self.cells = self.cells[..keep].to_vec();
+        true
+    }
+
+    /// A trimmed copy of the row (see [`Row::trim`]) for the scrollback,
+    /// taking its combining marks; the row itself is about to be blanked
+    /// and reused. `spare` (a row leaving the scrollback) lends its buffer
+    /// when that is about the right size, saving an allocation. `None` for
+    /// rows that are not trimmed.
+    pub(crate) fn take_trimmed(&mut self, spare: Option<Row>) -> Option<Row> {
+        if self.wrapped || self.scroll_fill {
+            return None;
+        }
+        let marks = self.combining.iter().map(|(c, _)| *c as usize + 1).max().unwrap_or(0);
+        let keep = self.occ.max(marks).min(self.cells.len());
+        let cells = match spare {
+            // Within 25% (and a few cells) of the size: little waste.
+            Some(mut s)
+                if s.cells.capacity() >= keep && s.cells.capacity() <= keep + keep / 4 + 8 =>
+            {
+                s.cells.clear();
+                s.cells.extend_from_slice(&self.cells[..keep]);
+                s.cells
+            }
+            _ => self.cells[..keep].to_vec(),
+        };
+        Some(Row {
+            cells,
+            wrapped: false,
+            combining: std::mem::take(&mut self.combining),
+            occ: self.occ.min(keep),
+            scroll_fill: false,
+        })
+    }
+
+    /// Narrow the row to `cols` if wider; a narrower (trimmed) row stays as
+    /// it is (see [`Row::trim`]).
+    pub(crate) fn fit(&mut self, cols: usize) {
+        if self.cells.len() > cols {
+            self.resize(cols);
+        }
+    }
+
     pub(crate) fn resize(&mut self, cols: usize) {
         self.cells.resize(cols, Cell::default());
         self.occ = self.occ.min(cols);
@@ -247,6 +316,9 @@ impl Grid {
     }
     pub fn rows_iter(&self) -> impl DoubleEndedIterator<Item = &Row> {
         self.lines.iter()
+    }
+    pub(crate) fn rows_mut(&mut self) -> impl Iterator<Item = &mut Row> {
+        self.lines.iter_mut()
     }
     pub fn cell(&self, row: usize, col: usize) -> &Cell {
         &self.lines[row].cells[col]

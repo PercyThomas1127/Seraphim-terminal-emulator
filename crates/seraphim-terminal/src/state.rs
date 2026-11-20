@@ -6,7 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vte::{Params, Perform};
 
-use crate::cell::{Attrs, Cell, Color, Flags};
+use crate::cell::{Attrs, Cell, Color, Extra, Extras, Flags};
 use crate::grid::{Grid, Row};
 use crate::palette::{format_color, parse_color, xterm_256, ColorOverrides, ColorScheme, Rgb};
 use crate::reflow;
@@ -203,12 +203,17 @@ pub(crate) struct State {
     pub modes: Modes,
     pub scrollback: VecDeque<Row>,
     scrollback_limit: usize,
+    /// Rows at the end of the scrollback not yet trimmed (see
+    /// [`State::trim_scrollback`]).
+    untrimmed: usize,
     pub title: String,
     pub cwd: Option<String>,
     pub hyperlinks: Vec<Hyperlink>,
     /// Position in `hyperlinks` by the link's hash, so a link repeated on
     /// every line of output (ls --hyperlink, grep) is found without a scan.
     hyperlink_index: std::collections::HashMap<u64, usize>,
+    /// Underline colors and hyperlinks of cells (see [`Extra`]).
+    pub extras: Extras,
     pub events: Vec<TerminalEvent>,
     /// OSC 99 notifications arriving in parts (`d=0`), by id: title, body.
     notify_parts: Vec<(String, String, String)>,
@@ -268,10 +273,12 @@ impl State {
             modes: Modes::default(),
             scrollback: VecDeque::new(),
             scrollback_limit,
+            untrimmed: 0,
             title: String::new(),
             cwd: None,
             hyperlinks: Vec::new(),
             hyperlink_index: Default::default(),
+            extras: Extras::default(),
             events: Vec::new(),
             notify_parts: Vec::new(),
             text: None,
@@ -484,6 +491,11 @@ impl State {
         }
         let mut screen: Vec<Row> = lines.split_off(top);
         screen.truncate(rows);
+        for row in &mut screen {
+            if row.cells.len() < cols {
+                row.resize(cols); // a short row from the scrollback
+            }
+        }
         while screen.len() < rows {
             screen.push(Row::new(cols, &Attrs::default()));
         }
@@ -494,6 +506,7 @@ impl State {
         }
         let keep = lines.len().saturating_sub(self.scrollback_limit);
         self.scrollback.extend(lines.drain(keep..));
+        self.untrimmed = self.scrollback.len();
         self.primary.set_lines(cols, screen);
         // Images whose lines fell out of the (shorter) history go too.
         self.graphics.scroll(false, 0, self.scrollback.len());
@@ -528,6 +541,20 @@ impl State {
         self.damage = vec![true; rows];
     }
 
+    /// Trim up to `max` scrollback rows (see [`Row::trim`]), the oldest
+    /// untrimmed first. Returns whether rows are left to trim.
+    pub fn trim_scrollback(&mut self, max: usize) -> bool {
+        let len = self.scrollback.len();
+        self.untrimmed = self.untrimmed.min(len);
+        let n = self.untrimmed.min(max);
+        let start = len - self.untrimmed;
+        for row in self.scrollback.range_mut(start..start + n) {
+            row.trim();
+        }
+        self.untrimmed -= n;
+        self.untrimmed > 0
+    }
+
     // ---- primitive operations -----------------------------------------
 
     fn scroll_up(&mut self, n: usize) {
@@ -540,8 +567,19 @@ impl State {
         let moved = n.min(bottom + 1 - top);
         grid.scroll_up(top, bottom, n, &attrs, |row| {
             if keep {
-                // Recycle the oldest scrollback line's buffer once full.
-                let buf = if scrollback.len() >= limit {
+                let full = scrollback.len() >= limit;
+                // History keeps only a line's content (see `Row::trim`); the
+                // screen keeps the row's full-width buffer.
+                if !row.wrapped && !row.is_scroll_fill() {
+                    let spare = if full { scrollback.pop_front() } else { None };
+                    if let Some(line) = row.take_trimmed(spare) {
+                        scrollback.push_back(line);
+                        return;
+                    }
+                }
+                // Soft-wrapped and fill rows go whole; the screen gets the
+                // oldest history line's buffer once full.
+                let buf = if full {
                     scrollback.pop_front().unwrap_or_else(|| Row::empty(0))
                 } else {
                     Row::empty(row.cells.len())
@@ -1048,17 +1086,25 @@ impl State {
             len += 1;
         }
         let groups = &storage[..len];
+        // SGR 0 keeps the hyperlink (it is not a rendition).
+        let reset = |a: &mut Attrs| *a = Attrs { extra: a.extra, ..Attrs::default() };
         if groups.is_empty() {
-            self.cursor.attrs = Attrs { link: self.cursor.attrs.link, ..Attrs::default() };
+            reset(&mut self.cursor.attrs);
+            self.set_underline_color(Color::Default);
             return;
         }
         let a = &mut self.cursor.attrs;
+        // The underline color lives in the extras table: applied after.
+        let mut underline: Option<Color> = None;
         let mut i = 0;
         while i < groups.len() {
             let g = groups[i];
             let code = g[0];
             match code {
-                0 => *a = Attrs { link: a.link, ..Attrs::default() },
+                0 => {
+                    reset(a);
+                    underline = Some(Color::Default);
+                }
                 1 => a.flags.insert(Flags::BOLD),
                 2 => a.flags.insert(Flags::DIM),
                 3 => a.flags.insert(Flags::ITALIC),
@@ -1094,7 +1140,7 @@ impl State {
                 49 => a.bg = Color::Default,
                 53 => a.flags.insert(Flags::OVERLINE),
                 55 => a.flags.remove(Flags::OVERLINE),
-                59 => a.underline_color = Color::Default,
+                59 => underline = Some(Color::Default),
                 90..=97 => a.fg = Color::Indexed((code - 90 + 8) as u8),
                 100..=107 => a.bg = Color::Indexed((code - 100 + 8) as u8),
                 38 | 48 | 58 => {
@@ -1103,7 +1149,7 @@ impl State {
                         match code {
                             38 => a.fg = color,
                             48 => a.bg = color,
-                            _ => a.underline_color = color,
+                            _ => underline = Some(color),
                         }
                     }
                     i += consumed;
@@ -1113,6 +1159,68 @@ impl State {
             }
             i += 1;
         }
+        if let Some(c) = underline {
+            self.set_underline_color(c);
+        }
+    }
+
+    fn set_underline_color(&mut self, color: Color) {
+        let (old, link) = self.extras.get(self.cursor.attrs.extra);
+        if old != color {
+            self.set_extra(color, link);
+        }
+    }
+
+    fn set_link(&mut self, link: u32) {
+        let (color, old) = self.extras.get(self.cursor.attrs.extra);
+        if old != link {
+            self.set_extra(color, link);
+        }
+    }
+
+    /// Point the pen at (`underline`, `link`) in the extras table,
+    /// compacting the table first if it is full.
+    fn set_extra(&mut self, underline: Color, link: u32) {
+        let extra = match self.extras.intern(underline, link) {
+            Some(e) => e,
+            None => {
+                self.compact_extras();
+                // Still full: 65535 different underline colors and links
+                // all on screen and in the scrollback at once. The new one
+                // is left out.
+                self.extras.intern(underline, link).unwrap_or_default()
+            }
+        };
+        self.cursor.attrs.extra = extra;
+    }
+
+    /// Drop extras no cell, cursor or saved cursor uses any more.
+    fn compact_extras(&mut self) {
+        let mut used = vec![false; self.extras.len()];
+        let mut mark = |a: &Attrs| used[a.extra.0 as usize] = true;
+        for row in
+            self.primary.rows_iter().chain(self.alternate.rows_iter()).chain(&self.scrollback)
+        {
+            row.cells.iter().for_each(|c| mark(&c.attrs));
+        }
+        for a in
+            [&self.cursor.attrs, &self.saved_primary.cursor.attrs, &self.saved_alt.cursor.attrs]
+        {
+            mark(a);
+        }
+        let map = self.extras.compact(&used);
+        let remap = |a: &mut Attrs| a.extra = Extra(map[a.extra.0 as usize]);
+        for row in self
+            .primary
+            .rows_mut()
+            .chain(self.alternate.rows_mut())
+            .chain(self.scrollback.iter_mut())
+        {
+            row.cells.iter_mut().for_each(|c| remap(&mut c.attrs));
+        }
+        remap(&mut self.cursor.attrs);
+        remap(&mut self.saved_primary.cursor.attrs);
+        remap(&mut self.saved_alt.cursor.attrs);
     }
 
     // ---- modes ---------------------------------------------------------
@@ -1403,9 +1511,9 @@ impl State {
                             self.hyperlinks.push(link);
                             self.hyperlinks.len() - 1
                         });
-                        self.cursor.attrs.link = idx as u32 + 1;
+                        self.set_link(idx as u32 + 1);
                     }
-                    _ => self.cursor.attrs.link = 0,
+                    _ => self.set_link(0),
                 }
             }
             b"52" => {
@@ -2156,7 +2264,10 @@ impl State {
     /// Answer a DECRQSS request: `DCS 1 $ r <value> ST` or `DCS 0 $ r ST`.
     fn decrqss(&mut self, req: &[u8]) {
         let value = match req {
-            b"m" => Some(format!("{}m", sgr_string(&self.cursor.attrs))),
+            b"m" => {
+                let underline = self.extras.get(self.cursor.attrs.extra).0;
+                Some(format!("{}m", sgr_string(&self.cursor.attrs, underline)))
+            }
             b" q" => {
                 let blink = self.modes.cursor_blink;
                 let n = match self.modes.cursor_shape {
@@ -2183,7 +2294,7 @@ impl State {
 }
 
 /// SGR parameters that reproduce `a` (for DECRQSS).
-fn sgr_string(a: &Attrs) -> String {
+fn sgr_string(a: &Attrs, underline: Color) -> String {
     let mut parts = vec!["0".to_owned()];
     let f = a.flags;
     for (flag, code) in [
@@ -2216,9 +2327,9 @@ fn sgr_string(a: &Attrs) -> String {
     };
     parts.extend(color(a.fg, 30, 38));
     parts.extend(color(a.bg, 40, 48));
-    if let Color::Rgb(r, g, b) = a.underline_color {
+    if let Color::Rgb(r, g, b) = underline {
         parts.push(format!("58:2::{r}:{g}:{b}"));
-    } else if let Color::Indexed(i) = a.underline_color {
+    } else if let Color::Indexed(i) = underline {
         parts.push(format!("58:5:{i}"));
     }
     parts.join(";")

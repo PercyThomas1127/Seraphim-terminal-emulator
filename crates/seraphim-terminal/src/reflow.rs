@@ -101,8 +101,11 @@ pub(crate) fn reflow(
     let mut input = rows.into_iter().enumerate().peekable();
     while let Some((i, mut row)) = input.next() {
         // Fast path (almost all history): a standalone row whose content
-        // fits the new width, with no anchor past the edge, is resized in
-        // place — no per-cell work, no new allocation.
+        // fits the new width, with no anchor past the edge, is narrowed in
+        // place if wider — no per-cell work, no new allocation. A narrower
+        // row is left short (rows that end up on the screen are widened by
+        // the caller; in the scrollback, short rows are fine: see
+        // `Row::trim`).
         if pending.is_empty()
             && !row.wrapped
             && content_len(&row) <= cols
@@ -113,7 +116,7 @@ pub(crate) fn reflow(
                     mapped[k] = (out.len(), a.col);
                 }
             }
-            row.resize(cols);
+            row.fit(cols);
             out.push(row);
             continue;
         }

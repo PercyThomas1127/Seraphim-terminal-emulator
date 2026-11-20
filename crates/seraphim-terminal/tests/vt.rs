@@ -257,10 +257,31 @@ fn title_cwd_and_semantic_prompts() {
 #[test]
 fn hyperlinks() {
     let t = term(20, 1, "\x1b]8;;https://example.com/a;b\x1b\\link\x1b]8;;\x1b\\ no");
-    let id = t.screen().cell(0, 0).attrs.link;
+    let id = t.link(&t.screen().cell(0, 0).attrs);
     assert_ne!(id, 0);
     assert_eq!(t.hyperlink(id).unwrap().uri, "https://example.com/a;b");
-    assert_eq!(t.screen().cell(0, 5).attrs.link, 0);
+    assert_eq!(t.link(&t.screen().cell(0, 5).attrs), 0);
+}
+
+#[test]
+fn more_links_than_extras_entries_compact_the_table() {
+    // 70,000 links, each on its own line, with an underline color: more
+    // than the 65,535 extras entries, but only a few alive at a time.
+    let mut t = Terminal::with_scrollback(20, 3, 10);
+    t.advance(b"\x1b[58;5;3m");
+    let mut s = String::new();
+    for i in 0..70_000 {
+        s.push_str(&format!("\x1b]8;;u{i}\x1b\\x\x1b]8;;\x1b\\\r\n"));
+    }
+    t.advance(s.as_bytes());
+    // The last link printed (row 1, as the cursor sits on a fresh row).
+    let cell = t.screen().cell(1, 0);
+    assert_eq!(t.hyperlink(t.link(&cell.attrs)).unwrap().uri, "u69999");
+    assert_eq!(t.underline_color(&cell.attrs), Color::Indexed(3));
+    assert!(t.extras_generation() > 0, "the table was compacted");
+    // Earlier rows still in the scrollback kept theirs.
+    let older = &t.scrollback()[t.scrollback().len() - 1];
+    assert_eq!(t.hyperlink(t.link(&older.cells[0].attrs)).unwrap().uri, "u69997");
 }
 
 #[test]
@@ -276,7 +297,7 @@ fn repeated_hyperlinks_share_an_entry() {
     ]
     .concat();
     let t = term(10, 1, &s);
-    let ids: Vec<u32> = (0..6).map(|c| t.screen().cell(0, c).attrs.link).collect();
+    let ids: Vec<u32> = (0..6).map(|c| t.link(&t.screen().cell(0, c).attrs)).collect();
     // Same URI without an id: one entry; an id makes a separate one.
     assert_eq!(ids[0], ids[2]);
     assert_ne!(ids[0], ids[1]);
