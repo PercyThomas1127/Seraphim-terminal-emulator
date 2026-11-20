@@ -64,6 +64,9 @@ EOF
 %build
 export RUSTFLAGS="%{?build_rustflags}"
 # The dist profile: release with whole-program optimization (fat LTO).
+# Cargo.toml says so from the next release on; the 0.2.1 sources need it
+# set here.
+export CARGO_PROFILE_DIST_LTO=fat CARGO_PROFILE_DIST_CODEGEN_UNITS=1
 cargo build --frozen --profile dist --package seraphim
 
 %install
