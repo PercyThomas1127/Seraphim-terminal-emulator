@@ -13,7 +13,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Play a sound file at `volume` (0–1). Never blocks. Returns false if no
 /// player could be started.
@@ -211,23 +211,51 @@ const RATE: u32 = 24000;
 /// Samples per analysed block (about 33 ms).
 const BLOCK: usize = RATE as usize / 30;
 
-/// The latest levels and when they were read.
-type Shared = Arc<Mutex<Option<(Levels, Instant)>>>;
+/// Capture state shared with the capture thread.
+struct State {
+    /// The latest levels and when they were read.
+    latest: Option<(Levels, Instant)>,
+    /// When [`levels`] was last called.
+    asked: Instant,
+    /// A capture thread is running.
+    running: bool,
+    /// No capture tool works: don't keep trying.
+    failed: bool,
+}
+
+type Shared = Arc<Mutex<State>>;
+
+/// A capture nobody has read for this long stops (the recording stream
+/// otherwise keeps the sound server's sink awake); the next read starts
+/// it again.
+const IDLE: Duration = Duration::from_secs(30);
 
 /// The latest levels of the default output, starting capture on first use.
 /// `None` until the first block arrives, or if no capture tool works.
 pub fn levels() -> Option<Levels> {
-    static LATEST: OnceLock<Shared> = OnceLock::new();
-    let latest = LATEST.get_or_init(|| {
-        let latest = Arc::new(Mutex::new(None));
-        let out = latest.clone();
-        let _ =
-            std::thread::Builder::new().name("seraphim-audio".into()).spawn(move || capture(out));
-        latest
+    static STATE: OnceLock<Shared> = OnceLock::new();
+    let state = STATE.get_or_init(|| {
+        Arc::new(Mutex::new(State {
+            latest: None,
+            asked: Instant::now(),
+            running: false,
+            failed: false,
+        }))
     });
+    let mut s = state.lock().unwrap();
+    s.asked = Instant::now();
+    if !s.running && !s.failed {
+        s.running = true;
+        s.latest = None;
+        let out = state.clone();
+        let spawned =
+            std::thread::Builder::new().name("seraphim-audio".into()).spawn(move || capture(out));
+        if spawned.is_err() {
+            s.running = false;
+        }
+    }
     // Stale levels (the capture ended) read as silence gone missing.
-    let l = *latest.lock().unwrap();
-    l.filter(|(_, t)| t.elapsed().as_secs() < 2).map(|(l, _)| l)
+    s.latest.filter(|(_, t)| t.elapsed().as_secs() < 2).map(|(l, _)| l)
 }
 
 fn capture(out: Shared) {
@@ -257,36 +285,57 @@ fn capture(out: Shared) {
             "-",
         ],
     ];
-    for argv in tries {
-        let mut cmd = Command::new(argv[0]);
-        cmd.args(&argv[1..]);
-        if argv[0] == "parec" {
-            cmd.arg(format!("--rate={RATE}"));
+    'restart: loop {
+        for argv in &tries {
+            let mut cmd = Command::new(argv[0]);
+            cmd.args(&argv[1..]);
+            if argv[0] == "parec" {
+                cmd.arg(format!("--rate={RATE}"));
+            }
+            let Ok(mut child) =
+                cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+            else {
+                continue;
+            };
+            let Some(mut stdout) = child.stdout.take() else { continue };
+            let mut an = Analyzer::new(RATE as f32);
+            let mut buf = vec![0u8; BLOCK * 2];
+            let mut got_any = false;
+            while stdout.read_exact(&mut buf).is_ok() {
+                got_any = true;
+                let samples: Vec<i16> =
+                    buf.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+                let l = an.block(&samples);
+                let mut s = out.lock().unwrap();
+                s.latest = Some((l, Instant::now()));
+                if s.asked.elapsed() > IDLE {
+                    // Nobody is listening any more.
+                    s.running = false;
+                    drop(s);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            if got_any {
+                // It worked, then stopped (the sound server restarted): try
+                // again from the top after a pause, unless nobody listens.
+                std::thread::sleep(Duration::from_secs(2));
+                let mut s = out.lock().unwrap();
+                if s.asked.elapsed() > IDLE {
+                    s.running = false;
+                    return;
+                }
+                continue 'restart;
+            }
         }
-        let Ok(mut child) =
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-        else {
-            continue;
-        };
-        let Some(mut stdout) = child.stdout.take() else { continue };
-        let mut an = Analyzer::new(RATE as f32);
-        let mut buf = vec![0u8; BLOCK * 2];
-        let mut got_any = false;
-        while stdout.read_exact(&mut buf).is_ok() {
-            got_any = true;
-            let samples: Vec<i16> =
-                buf.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
-            let l = an.block(&samples);
-            *out.lock().unwrap() = Some((l, Instant::now()));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if got_any {
-            // It worked, then stopped (the sound server restarted): try
-            // again from the top after a pause.
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            return capture(out);
-        }
+        // No tool works.
+        let mut s = out.lock().unwrap();
+        s.running = false;
+        s.failed = true;
+        return;
     }
 }
 

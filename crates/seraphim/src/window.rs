@@ -548,6 +548,8 @@ struct Active {
     visual: VisualEngine,
     visual_cfg: seraphim_config::Visual,
     last_frame: Instant,
+    /// The Settings panel's rows, and what they were read from.
+    settings_cache: Option<(SettingsKey, Vec<(crate::settings::Setting, String)>)>,
     /// A profile switch or reload requested by a shortcut; applied by `App`,
     /// which owns the configuration.
     pending: Option<Request>,
@@ -619,10 +621,38 @@ struct FloatDrag {
     start: Rect,
 }
 
+/// What the Settings panel's rows depend on: the modification times of
+/// config.toml and the themes and presets directories, and the extensions.
+type SettingsKey = (
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+    Vec<(String, String)>,
+);
+
 /// Rect slots of floating panels' frames (one per panel, so that each
 /// frame is drawn under its own panel and over the ones beneath).
 fn frame_slot(id: u64) -> u64 {
     DECOR_SLOT - 1 - id
+}
+
+/// Fill the selected slot of `r` with a one-row bar (tab bar, title bar)
+/// drawn by the escape sequences `bytes` on a `cols`-wide line, unless it
+/// already shows exactly that: the bars are repainted every frame, but
+/// their text rarely changes.
+fn prepare_bar(r: &mut Renderer, gpu: &Gpu, cols: usize, bytes: &[u8], view: View) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (cols, bytes).hash(&mut h);
+    let version = h.finish();
+    if r.is_prepared(version, &view) {
+        return;
+    }
+    let mut t = seraphim_terminal::Terminal::with_scrollback(cols, 1, 0);
+    t.advance(bytes);
+    t.advance(b"\x1b[?25l");
+    r.prepare(&gpu.device, &gpu.queue, &t, view);
+    r.mark_prepared(version, view);
 }
 
 /// Where Seraphim's window buttons are drawn.
@@ -685,6 +715,11 @@ struct App {
     /// When the session was last saved (restore_session).
     saved_at: Instant,
 }
+
+/// A `UserEvent::Wake` is queued and not yet handled. Sessions notify on
+/// every PTY read (thousands per second under heavy output); this keeps it
+/// to one queued event, so the event loop runs once per batch of reads.
+static WAKE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How often the session is saved while windows are open, so that it
 /// survives a crash.
@@ -850,6 +885,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // Session output: any window may own the session.
             UserEvent::Wake => {
+                // Cleared before looking, so output that lands while the
+                // windows check their sessions sends a fresh Wake.
+                WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
                 for w in &mut self.wins {
                     w.user_event(event_loop, UserEvent::Wake);
                 }
@@ -984,7 +1022,11 @@ impl Win {
         let bus = EventBus::new();
         let proxy = self.proxy.clone();
         let notify = Notifier(Arc::new(move || {
-            let _ = proxy.send_event(UserEvent::Wake);
+            // One Wake in the queue covers any number of reads: the event
+            // handler looks at every session's state when it runs.
+            if !WAKE_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let _ = proxy.send_event(UserEvent::Wake);
+            }
         }));
         let command = o.command.clone().unwrap_or_else(Command::default_shell);
         // Subscribe before the first session starts: it reports privilege
@@ -1080,6 +1122,7 @@ impl Win {
             visual,
             visual_cfg: o.visual.clone(),
             last_frame: Instant::now(),
+            settings_cache: None,
             pending: None,
             overlay,
             menu: MenuBar::default(),
@@ -2651,10 +2694,27 @@ impl Active {
             &self.config_path,
         ) {
             (true, Some(path)) => {
+                // Listing themes and presets and parsing config.toml every
+                // frame adds up; their modification times say when to.
                 let dir = path.parent().unwrap_or(std::path::Path::new("."));
-                let all = crate::settings::all(dir, &self.extension_list);
-                let values = crate::settings::values(path, &all);
-                all.into_iter().zip(values).collect()
+                let mtime =
+                    |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                let key = (
+                    mtime(path),
+                    mtime(&dir.join("themes")),
+                    mtime(&dir.join("presets")),
+                    self.extension_list.clone(),
+                );
+                match &self.settings_cache {
+                    Some((k, rows)) if *k == key => rows.clone(),
+                    _ => {
+                        let all = crate::settings::all(dir, &self.extension_list);
+                        let values = crate::settings::values(path, &all);
+                        let rows: Vec<_> = all.into_iter().zip(values).collect();
+                        self.settings_cache = Some((key, rows.clone()));
+                        rows
+                    }
+                }
             }
             _ => Vec::new(),
         };
@@ -4225,26 +4285,47 @@ impl Win {
                 a.paint_panels(&rects, pad);
                 let floats: Vec<(u64, Rect)> = a.floats.iter().map(|f| (f.id, f.rect)).collect();
                 a.paint_panels(&floats, 0.0);
-                for (id, r) in &rects {
-                    let Some(p) = a.panes.get_mut(id) else { continue };
-                    let view = View {
-                        width: r.w.max(1.0) as u32,
-                        height: r.h.max(1.0) as u32,
-                        padding: pad,
-                        focused: a.focused && *id == focus,
-                        cursor_on: a.blink_on || *id != focus,
-                    };
-                    p.rect = *r;
-                    a.renderer.select(&a.gpu.device, *id);
-                    let term = p.session.terminal();
-                    p.last_generation = p.session.generation();
-                    if *id == focus && term.title() != a.title {
-                        a.title = term.title().to_owned();
-                        let t =
-                            if a.title.is_empty() { "Seraphim".into() } else { a.title.clone() };
-                        a.window.set_title(&t);
+                // Panes whose content and view are unchanged keep what they
+                // drew last frame (an animated background redraws often
+                // with idle text). A glyph atlas reset while preparing
+                // invalidates the panes prepared before it: a second pass
+                // prepares those again.
+                for _pass in 0..2 {
+                    let epoch = a.renderer.epoch();
+                    for (id, r) in &rects {
+                        let Some(p) = a.panes.get_mut(id) else { continue };
+                        let view = View {
+                            width: r.w.max(1.0) as u32,
+                            height: r.h.max(1.0) as u32,
+                            padding: pad,
+                            focused: a.focused && *id == focus,
+                            cursor_on: a.blink_on || *id != focus,
+                        };
+                        p.rect = *r;
+                        a.renderer.select(&a.gpu.device, *id);
+                        // Read before locking: output landing in between
+                        // only makes the next frame prepare again.
+                        let version = p.session.render_generation();
+                        if a.renderer.is_prepared(version, &view) {
+                            continue;
+                        }
+                        let term = p.session.terminal();
+                        p.last_generation = p.session.generation();
+                        if *id == focus && term.title() != a.title {
+                            a.title = term.title().to_owned();
+                            let t = if a.title.is_empty() {
+                                "Seraphim".into()
+                            } else {
+                                a.title.clone()
+                            };
+                            a.window.set_title(&t);
+                        }
+                        a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
+                        a.renderer.mark_prepared(version, view);
                     }
-                    a.renderer.prepare(&a.gpu.device, &a.gpu.queue, &term, view);
+                    if a.renderer.epoch() == epoch {
+                        break;
+                    }
                 }
                 // Dividers, and a veil over panes without focus.
                 let theme = a.renderer.theme().clone();
@@ -4323,21 +4404,18 @@ impl Win {
                     let buttons = a.buttons_row() == Some(ButtonsRow::Tabs);
                     let tab_cols =
                         if buttons { cols.saturating_sub(crate::decor::BUTTONS) } else { cols };
-                    let (bytes, hits) = crate::tabbar::paint(
+                    let (mut bytes, hits) = crate::tabbar::paint(
                         &a.tab_infos(),
                         tab_cols,
                         alert,
                         a.renaming.as_deref(),
                         &design,
                     );
-                    let mut t = seraphim_terminal::Terminal::with_scrollback(cols, 1, 0);
-                    t.advance(&bytes);
                     if buttons {
                         let c = a.decor_colors();
                         let max = a.window.is_maximized();
-                        t.advance(&crate::decor::paint_buttons(cols, a.decor_hover, max, &c));
+                        bytes.extend(crate::decor::paint_buttons(cols, a.decor_hover, max, &c));
                     }
-                    t.advance(b"\x1b[?25l");
                     a.tab_hits = hits;
                     let view = View {
                         width: size.width,
@@ -4347,7 +4425,7 @@ impl Win {
                         cursor_on: false,
                     };
                     a.overlay.select(&a.gpu.device, TAB_BAR_SLOT);
-                    a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
+                    prepare_bar(&mut a.overlay, &a.gpu, cols, &bytes, view);
                     a.overlay.select(&a.gpu.device, 0);
                 }
                 // Seraphim's title bar.
@@ -4364,9 +4442,6 @@ impl Win {
                         a.window.is_maximized(),
                         &c,
                     );
-                    let mut t = seraphim_terminal::Terminal::with_scrollback(cols, 1, 0);
-                    t.advance(&bytes);
-                    t.advance(b"\x1b[?25l");
                     let view = View {
                         width: size.width,
                         height: a.title_bar_height(),
@@ -4375,7 +4450,7 @@ impl Win {
                         cursor_on: false,
                     };
                     a.overlay.select(&a.gpu.device, TITLE_SLOT);
-                    a.overlay.prepare(&a.gpu.device, &a.gpu.queue, &t, view);
+                    prepare_bar(&mut a.overlay, &a.gpu, cols, &bytes, view);
                     a.overlay.select(&a.gpu.device, 0);
                 }
                 if a.overlay_visible() {

@@ -68,7 +68,7 @@ unsafe impl bytemuck::Zeroable for Globals {}
 unsafe impl bytemuck::Pod for Globals {}
 
 /// Per-frame view parameters.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
     pub width: u32,
     pub height: u32,
@@ -133,12 +133,18 @@ pub struct Renderer {
     cache_key: Option<[u32; 4]>,
     /// The instances the GPU buffer holds.
     uploaded: Vec<Instance>,
+    /// What the selected slot's instances were last prepared from; see
+    /// [`Renderer::is_prepared`].
+    stamp: Option<Stamp>,
     /// What new slots need.
     format: wgpu::TextureFormat,
     layout: wgpu::BindGroupLayout,
     atlas_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
+    /// Bumped whenever prepared instances may no longer match what a fresh
+    /// prepare would build: atlas resets, theme, font and effect changes.
+    epoch: u64,
     /// The slot whose state is in the fields above, and the others.
     current: u64,
     slots: HashMap<u64, Slot>,
@@ -161,7 +167,12 @@ struct Slot {
     rows_cache: Vec<RowCache>,
     cache_key: Option<[u32; 4]>,
     uploaded: Vec<Instance>,
+    stamp: Option<Stamp>,
 }
+
+/// A caller's content version, the view, and the renderer epoch that a
+/// slot's instances were prepared with.
+type Stamp = (u64, View, u64);
 
 /// What a row's instances depend on besides the global key.
 #[derive(Clone, Debug, PartialEq)]
@@ -362,11 +373,13 @@ impl Renderer {
             rows_cache: Vec::new(),
             cache_key: None,
             uploaded: Vec::new(),
+            stamp: None,
             format,
             layout,
             atlas_view,
             sampler,
             linear_sampler,
+            epoch: 0,
             current: 0,
             slots: HashMap::new(),
         }
@@ -420,11 +433,13 @@ impl Renderer {
             rows_cache: Vec::new(),
             cache_key: None,
             uploaded: Vec::new(),
+            stamp: None,
         }
     }
 
     /// Forget every slot's cached rows (glyph positions or colors moved).
     fn clear_row_caches(&mut self) {
+        self.epoch += 1;
         self.rows_cache.clear();
         for s in self.slots.values_mut() {
             s.rows_cache.clear();
@@ -446,6 +461,7 @@ impl Renderer {
         std::mem::swap(&mut self.rows_cache, &mut slot.rows_cache);
         std::mem::swap(&mut self.cache_key, &mut slot.cache_key);
         std::mem::swap(&mut self.uploaded, &mut slot.uploaded);
+        std::mem::swap(&mut self.stamp, &mut slot.stamp);
     }
 
     /// Draw state for pane `id` from now on (created on first use). A
@@ -487,6 +503,7 @@ impl Renderer {
 
     /// Cursor and selection effects (none by default).
     pub fn set_cursor_effects(&mut self, fx: cursorfx::CursorEffects) {
+        self.epoch += 1;
         self.fx.cfg = fx;
         for s in self.slots.values_mut() {
             s.fx.cfg = fx;
@@ -499,6 +516,31 @@ impl Renderer {
         for s in self.slots.values_mut() {
             s.fx.clock = now;
         }
+    }
+
+    /// Whether the selected slot already holds what [`Renderer::prepare`]
+    /// would build for content `version` (e.g. the session's render
+    /// generation) at `view`: nothing it depends on changed since
+    /// [`Renderer::mark_prepared`] was called with the same arguments, and
+    /// no effect or image animation is running. The caller can then skip
+    /// `prepare` for this frame and draw the slot as it is.
+    pub fn is_prepared(&self, version: u64, view: &View) -> bool {
+        !self.fx.animating()
+            && !self.images.animating
+            && self.stamp == Some((version, *view, self.epoch))
+    }
+
+    /// Record that the selected slot was just prepared from content
+    /// `version` at `view` (see [`Renderer::is_prepared`]).
+    pub fn mark_prepared(&mut self, version: u64, view: View) {
+        self.stamp = Some((version, view, self.epoch));
+    }
+
+    /// Changes whenever slots prepared earlier may be stale (atlas reset,
+    /// theme or font change). A caller preparing several slots in one frame
+    /// compares it before and after, and prepares them again if it moved.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// A key was pressed (for typing ripples).
@@ -586,6 +628,7 @@ impl Renderer {
         term: &Terminal,
         view: View,
     ) {
+        self.stamp = None;
         self.stats = FrameStats::default();
         self.build_instances(queue, term, &view);
         if self.instances.len() > self.instance_capacity {
@@ -640,6 +683,7 @@ impl Renderer {
         height: u32,
         rects: &[([f32; 4], [f32; 4])],
     ) {
+        self.stamp = None;
         self.instances.clear();
         for ([x, y, w, h], c) in rects {
             self.push_rect(*x, *y, *w, *h, *c);

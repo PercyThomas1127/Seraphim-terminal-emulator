@@ -231,13 +231,31 @@ fn drm_cards() -> Vec<std::path::PathBuf> {
 }
 
 /// NVIDIA: `nvidia-smi` prints a line a second in the background; the
-/// latest one is read.
+/// latest one is read. It stops when nobody has asked for 30 s (polling
+/// keeps the discrete GPU of a hybrid laptop from powering down) and
+/// starts again on the next read.
 fn nvidia() -> Gpu {
-    use std::sync::{Mutex, OnceLock};
-    static LATEST: OnceLock<std::sync::Arc<Mutex<Gpu>>> = OnceLock::new();
-    let latest = LATEST.get_or_init(|| {
-        let latest = std::sync::Arc::new(Mutex::new(Gpu::default()));
-        let out = latest.clone();
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    struct State {
+        latest: Gpu,
+        asked: Instant,
+        running: bool,
+        failed: bool,
+    }
+    const IDLE: Duration = Duration::from_secs(30);
+    static STATE: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
+    let state = STATE.get_or_init(|| {
+        Arc::new(Mutex::new(State {
+            latest: Gpu::default(),
+            asked: Instant::now(),
+            running: false,
+            failed: false,
+        }))
+    });
+    let mut s = state.lock().unwrap();
+    s.asked = Instant::now();
+    if !s.running && !s.failed {
         let child = std::process::Command::new("nvidia-smi")
             .args([
                 "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
@@ -248,24 +266,38 @@ fn nvidia() -> Gpu {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn();
-        if let Ok(mut child) = child {
-            let stdout = child.stdout.take();
-            let _ =
-                std::thread::Builder::new().name("seraphim-nvidia-smi".into()).spawn(move || {
-                    use std::io::BufRead;
-                    let Some(stdout) = stdout else { return };
-                    for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
-                        // The first GPU only.
-                        if let Some(g) = parse_nvidia_smi(&line) {
-                            *out.lock().unwrap() = g;
+        match child {
+            Ok(mut child) => {
+                let stdout = child.stdout.take();
+                let out = state.clone();
+                let spawned = std::thread::Builder::new().name("seraphim-nvidia-smi".into()).spawn(
+                    move || {
+                        use std::io::BufRead;
+                        if let Some(stdout) = stdout {
+                            for line in
+                                std::io::BufReader::new(stdout).lines().map_while(Result::ok)
+                            {
+                                let mut s = out.lock().unwrap();
+                                // The first GPU only.
+                                if let Some(g) = parse_nvidia_smi(&line) {
+                                    s.latest = g;
+                                }
+                                if s.asked.elapsed() > IDLE {
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    let _ = child.wait();
-                });
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        out.lock().unwrap().running = false;
+                    },
+                );
+                s.running = spawned.is_ok();
+            }
+            Err(_) => s.failed = true,
         }
-        latest
-    });
-    *latest.lock().unwrap()
+    }
+    s.latest
 }
 
 /// `45, 1024, 8192, 61` (utilization %, memory used and total MiB, °C).
